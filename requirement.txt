@@ -1,0 +1,20 @@
+# Core
+transformers>=4.44
+datasets>=2.20
+tokenizers>=0.19
+accelerate>=0.31
+
+# Logging and evaluation
+wandb>=0.17
+evaluate>=0.4
+
+# Hugging Face Hub integration
+huggingface_hub>=0.24
+
+# Common utilities
+numpy>=1.26
+torch>=2.2
+tqdm>=4.66
+
+# (Optional, for local runs / notebooks)
+jupyter
