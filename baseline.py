@@ -79,10 +79,10 @@ def main():
         gradient_accumulation_steps=4,        # effective batch ~= 32 sequences
         learning_rate=3e-4,
         weight_decay=0.1,
-        warmup_steps=2_000,
-        num_train_epochs=3,
+        warmup_steps=200,
+        num_train_epochs=10,
         lr_scheduler_type="cosine",
-        eval_steps=2_000,
+        eval_steps=500,
         logging_steps=200,
         save_steps=2_000,
         save_total_limit=2,
