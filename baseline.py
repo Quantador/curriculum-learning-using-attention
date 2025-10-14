@@ -15,7 +15,7 @@ random.seed(SEED); np.random.seed(SEED)
 
 BLOCK_SIZE = 512
 
-ds = load_dataset("wikitext", "wikitext-2-raw-v1")  # train/validation/test
+ds = load_dataset("wikitext", "wikitext-2-raw-v1")  # train/validation/test  Upgrade to wikitext-103 for more data
 tokenizer = AutoTokenizer.from_pretrained("gpt2")   # 50k BPE; add pad token
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
