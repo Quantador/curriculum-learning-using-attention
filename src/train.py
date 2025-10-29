@@ -43,7 +43,6 @@ def main(args):
         num_train_epochs=cfg_train["num_train_epochs"],
         lr_scheduler_type=cfg_train["lr_scheduler_type"],
         logging_steps=cfg_train["logging_steps"],
-        evaluation_strategy="steps",
         eval_steps=cfg_train["eval_steps"],
         save_steps=cfg_train["save_steps"],
         save_total_limit=2,

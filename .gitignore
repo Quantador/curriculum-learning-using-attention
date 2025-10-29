@@ -1,2 +1,6 @@
 runs/
 wandb/
+data/
+outputs/
+__pycache__/
+models
