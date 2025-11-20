@@ -1,12 +1,3 @@
-# eval_curriculum_improved.py
-# Improved router with most impactful enhancements:
-# 1. Learning progress reward (tracks how much we're improving per sample)
-# 2. Better features from first transformer block
-# 3. Larger pool (4x instead of 2x)
-# 4. Temperature & entropy annealing
-# 5. Multi-head attention router
-# 6. Mixed hard/easy selection
-
 import math, torch, random, json
 from torch import nn
 from torch.utils.data import Dataset
@@ -14,7 +5,7 @@ from datasets import load_dataset
 from transformers import GPT2TokenizerFast
 from pathlib import Path
 from collections import defaultdict
-import numpy as np
+import copy
 
 # -------------------------
 # Config
@@ -22,34 +13,27 @@ import numpy as np
 class Config:
     # Data
     block = 256
+    easy_samples = 30000   # Reduced from 50000
+    hard_samples = 5000    # Reduced from 10000
     
-    # Training - IMPROVED
-    batch = 16
-    pool_mult = 4           # INCREASED from 2 -> more diversity
-    epochs = 6
+    # Training
+    batch = 16           # final selected batch size (k)
+    pool_mult = 3        # candidate pool multiplier -> M = pool_mult * batch (increased)
+    epochs = 3
     lr_lm = 3e-4
     lr_router = 1e-3
-    
-    # Router improvements
-    temp_start = 2.0        # Start with high exploration
-    temp_end = 0.5          # End with focused selection
-    lambda_ent_start = 0.05 # Start with strong diversity
-    lambda_ent_end = 0.005  # Allow specialization
+    temp = 1.0           # Reduced from 2.0 - less random
+    lambda_ent = 0.005   # Reduced from 0.02 - allow more focused selection
     lambda_router = 0.1
-    
-    # Learning progress tracking
-    use_learning_progress = True
-    progress_ema = 0.9
-    
-    # Mixed selection
-    use_mixed_selection = True  # Select both hard and easy
-    hard_ratio = 0.75           # 75% hard, 25% easy
     
     # Model
     d_model = 256
     n_layers = 4
     n_heads = 8
     d_ff = 1024
+    
+    # Features
+    n_chunks = 8  # For hierarchical pooling
     
     # System
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -72,26 +56,130 @@ if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 vocab_size = len(tok)
 
+print(f"Device: {cfg.device}")
+print(f"Vocab size: {vocab_size}")
+
 # -------------------------
-# Data
+# Data - Mixed Difficulty Dataset
 # -------------------------
-def make_chunks(split):
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-    text = tok.eos_token.join(ds["text"])
-    ids = tok(text, add_special_tokens=False)["input_ids"]
-    L = (len(ids) // (cfg.block + 1)) * (cfg.block + 1)
-    ids = ids[:L]
-    chunks = [ids[i:i+cfg.block+1] for i in range(0, L, cfg.block+1)]
+def load_mixed_dataset():
+    """Load TinyStories (easy) + OpenWebText (hard)"""
+    print("\n" + "="*70)
+    print("Loading Mixed Difficulty Dataset")
+    print("="*70)
+    
+    # Easy samples: TinyStories (children's stories)
+    print(f"Loading TinyStories (easy)... target: {cfg.easy_samples} samples")
+    easy_ds = load_dataset("roneneldan/TinyStories", split=f"train[:{cfg.easy_samples}]")
+    
+    # Hard samples: OpenWebText (Reddit, news)
+    print(f"Loading OpenWebText (hard)... target: {cfg.hard_samples} samples")
+    hard_ds = load_dataset("stas/openwebtext-10k", split="train")
+    # Take subset if needed
+    if len(hard_ds) > cfg.hard_samples:
+        hard_ds = hard_ds.select(range(cfg.hard_samples))
+    
+    print(f"✓ Loaded {len(easy_ds)} easy samples")
+    print(f"✓ Loaded {len(hard_ds)} hard samples")
+    
+    return easy_ds, hard_ds
+
+def tokenize_and_chunk(text, max_length=cfg.block+1):
+    """Tokenize text and create chunks"""
+    tokens = tok(text, add_special_tokens=False)["input_ids"]
+    
+    # Create chunks of max_length
+    chunks = []
+    for i in range(0, len(tokens), max_length):
+        chunk = tokens[i:i+max_length]
+        if len(chunk) == max_length:  # Only keep full chunks
+            chunks.append(chunk)
+    
     return chunks
 
-class LMDataset(Dataset):
-    def __init__(self, chunks):
-        self.x = [torch.tensor(c[:-1], dtype=torch.long) for c in chunks]
-        self.y = [torch.tensor(c[1:],  dtype=torch.long) for c in chunks]
+def make_mixed_chunks(split="train"):
+    """Create training/validation chunks from mixed dataset"""
+    if split == "train":
+        easy_ds, hard_ds = load_mixed_dataset()
+        
+        print("\nTokenizing and chunking...")
+        easy_chunks = []
+        for item in easy_ds:
+            chunks = tokenize_and_chunk(item['text'])
+            easy_chunks.extend(chunks)
+        
+        hard_chunks = []
+        for item in hard_ds:
+            chunks = tokenize_and_chunk(item['text'])
+            hard_chunks.extend(chunks)
+        
+        print(f"✓ Created {len(easy_chunks)} easy chunks")
+        print(f"✓ Created {len(hard_chunks)} hard chunks")
+        
+        # CRITICAL FIX: Balance the dataset after chunking
+        # We want 70% easy, 30% hard for clear curriculum signal
+        target_easy_ratio = 0.7
+        
+        if len(easy_chunks) > 0 and len(hard_chunks) > 0:
+            total_chunks = len(easy_chunks) + len(hard_chunks)
+            current_easy_ratio = len(easy_chunks) / total_chunks
+            
+            print(f"⚠ Current ratio - Easy: {current_easy_ratio:.2f}, Hard: {1-current_easy_ratio:.2f}")
+            
+            # Downsample to achieve target ratio
+            target_total = min(50000, total_chunks)  # Cap at 50k for speed
+            target_easy = int(target_total * target_easy_ratio)
+            target_hard = target_total - target_easy
+            
+            # Sample with replacement if needed
+            if len(easy_chunks) >= target_easy:
+                easy_sampled = random.sample(easy_chunks, target_easy)
+            else:
+                easy_sampled = random.choices(easy_chunks, k=target_easy)
+            
+            if len(hard_chunks) >= target_hard:
+                hard_sampled = random.sample(hard_chunks, target_hard)
+            else:
+                hard_sampled = random.choices(hard_chunks, k=target_hard)
+            
+            print(f"✓ Rebalanced to {len(easy_sampled)} easy, {len(hard_sampled)} hard")
+            print(f"✓ New ratio - Easy: {len(easy_sampled)/(len(easy_sampled)+len(hard_sampled)):.2f}")
+        else:
+            easy_sampled = easy_chunks
+            hard_sampled = hard_chunks
+        
+        # Label chunks with difficulty
+        easy_labeled = [(chunk, 0) for chunk in easy_sampled]  # 0 = easy
+        hard_labeled = [(chunk, 1) for chunk in hard_sampled]  # 1 = hard
+        
+        # Combine and shuffle
+        all_chunks = easy_labeled + hard_labeled
+        random.shuffle(all_chunks)
+        
+        print(f"✓ Final dataset: {len(all_chunks)} chunks")
+        
+        return all_chunks
+    
+    else:  # validation - use WikiText for consistency
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        text = tok.eos_token.join(ds["text"])
+        ids = tok(text, add_special_tokens=False)["input_ids"]
+        L = (len(ids) // (cfg.block + 1)) * (cfg.block + 1)
+        ids = ids[:L]
+        chunks = [ids[i:i+cfg.block+1] for i in range(0, L, cfg.block+1)]
+        return [(chunk, -1) for chunk in chunks]  # -1 = unknown difficulty
+
+class MixedLMDataset(Dataset):
+    def __init__(self, labeled_chunks):
+        self.x = [torch.tensor(c[:-1], dtype=torch.long) for c, _ in labeled_chunks]
+        self.y = [torch.tensor(c[1:],  dtype=torch.long) for c, _ in labeled_chunks]
+        self.difficulty = [d for _, d in labeled_chunks]
+    
     def __len__(self): 
         return len(self.x)
+    
     def __getitem__(self, i): 
-        return self.x[i], self.y[i]
+        return self.x[i], self.y[i], self.difficulty[i]
 
 def make_index_loader(ds_len, pool_size):
     order = list(range(ds_len))
@@ -100,46 +188,10 @@ def make_index_loader(ds_len, pool_size):
         yield order[i:i+pool_size]
 
 # -------------------------
-# Learning Progress Tracker
-# -------------------------
-class LearningProgressTracker:
-    """Tracks EMA of loss per sample to compute learning progress"""
-    def __init__(self, dataset_size, ema_decay=0.9):
-        self.ema_decay = ema_decay
-        self.loss_ema = {}  # dict: sample_idx -> EMA(loss)
-        self.dataset_size = dataset_size
-        
-    def update(self, indices, losses):
-        """Update EMA for given sample indices"""
-        for idx, loss in zip(indices, losses):
-            idx = int(idx)
-            if idx not in self.loss_ema:
-                self.loss_ema[idx] = loss
-            else:
-                self.loss_ema[idx] = self.ema_decay * self.loss_ema[idx] + (1 - self.ema_decay) * loss
-    
-    def get_progress(self, indices, current_losses):
-        """
-        Compute learning progress: how much better are we doing vs. EMA?
-        Positive progress = we're improving (current loss < EMA)
-        """
-        progress = []
-        for idx, curr_loss in zip(indices, current_losses):
-            idx = int(idx)
-            if idx in self.loss_ema:
-                # Progress = previous - current (positive = improving)
-                prog = self.loss_ema[idx] - curr_loss
-            else:
-                # New sample: assume moderate progress
-                prog = 0.0
-            progress.append(prog)
-        return torch.tensor(progress, device=current_losses.device)
-
-# -------------------------
 # Model
 # -------------------------
 class TinyGPT(nn.Module):
-    def __init__(self, vocab, d_model=256, n_layers=4, n_heads=8, d_ff=1024, block=256):
+    def __init__(self, vocab, d_model=256, n_layers=6, n_heads=8, d_ff=1024, block=256):
         super().__init__()
         self.block = block
         self.d_model = d_model
@@ -154,69 +206,118 @@ class TinyGPT(nn.Module):
     def _causal_mask(self, L):
         m = torch.ones(L, L, dtype=torch.bool, device=self.lm_head.weight.device).triu(1)
         return m
-
-    def forward(self, x):
+    
+    def forward_to_hidden(self, x):
+        """Forward pass returning hidden states (for feature extraction)"""
         B, L = x.shape
         pos = torch.arange(L, device=x.device).unsqueeze(0).expand(B, L)
         h = self.tok_emb(x) + self.pos_emb(pos)
         mask = self._causal_mask(L)
         h = self.tr(h, mask=mask)
+        return h  # [B, L, d_model]
+
+    def forward(self, x):
+        h = self.forward_to_hidden(x)
         return self.lm_head(h)
-    
-    def get_first_block_features(self, x):
-        """IMPROVED: Extract features from first transformer block"""
-        B, L = x.shape
-        pos = torch.arange(L, device=x.device).unsqueeze(0).expand(B, L)
-        h = self.tok_emb(x) + self.pos_emb(pos)
-        mask = self._causal_mask(L)
-        # Pass through only first layer
-        h = self.tr.layers[0](h, src_mask=mask)
-        # Mean pool over sequence
-        return h.mean(dim=1)  # [B, d_model]
 
 # -------------------------
-# Multi-Head Attention Router (IMPROVED)
+# Feature Extraction - Hierarchical + Text Stats
 # -------------------------
-class MultiHeadAttentionRouter(nn.Module):
+def compute_text_statistics(X, pad_token_id=tok.pad_token_id):
     """
-    Multiple attention heads capture different aspects:
-    - Head 1: Difficulty/loss
-    - Head 2: Sample diversity/novelty
-    - Head 3: Syntactic patterns
+    Compute simple text statistics as explicit difficulty features.
+    X: [M, L] tensor of token IDs
+    Returns: [M, 4] tensor of features
     """
-    def __init__(self, d_model=256, d_k=64, n_heads=3):
+    M, L = X.shape
+    stats = []
+    
+    for i in range(M):
+        tokens = X[i]
+        valid_mask = tokens != pad_token_id
+        valid_tokens = tokens[valid_mask]
+        
+        if len(valid_tokens) == 0:
+            stats.append([0, 0, 0, 0])
+            continue
+        
+        # 1. Sequence length
+        length = len(valid_tokens)
+        
+        # 2. Unique token ratio (vocabulary diversity)
+        unique_ratio = len(valid_tokens.unique()) / length
+        
+        # 3. Average token ID (lower IDs = more common words)
+        avg_token_id = valid_tokens.float().mean().item() / vocab_size  # Normalize
+        
+        # 4. Token ID std (variation in vocabulary)
+        std_token_id = valid_tokens.float().std().item() / vocab_size
+        
+        stats.append([length / cfg.block, unique_ratio, avg_token_id, std_token_id])
+    
+    return torch.tensor(stats, device=X.device, dtype=torch.float32)
+
+def extract_hierarchical_features(model, X):
+    """
+    Extract hierarchical features from model hidden states.
+    X: [M, L] input tokens
+    Returns: [M, n_chunks*d_model + 4] features
+    """
+    with torch.no_grad():
+        # Get hidden states (model's actual understanding)
+        h = model.forward_to_hidden(X)  # [M, L, d_model]
+        M, L, d_model = h.shape
+        
+        # Hierarchical pooling - divide sequence into chunks
+        n_chunks = cfg.n_chunks
+        chunk_size = L // n_chunks
+        
+        chunk_features = []
+        for i in range(n_chunks):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size if i < n_chunks - 1 else L
+            chunk = h[:, start:end, :]  # [M, chunk_size, d_model]
+            chunk_mean = chunk.mean(dim=1)  # [M, d_model]
+            chunk_features.append(chunk_mean)
+        
+        # Concatenate all chunk features
+        learned_features = torch.cat(chunk_features, dim=-1)  # [M, n_chunks*d_model]
+        
+        # Add text statistics (explicit difficulty metrics)
+        text_stats = compute_text_statistics(X)  # [M, 4]
+        
+        # Combine learned and statistical features
+        features = torch.cat([learned_features, text_stats], dim=-1)
+        
+    return features  # [M, n_chunks*d_model + 4]
+
+# -------------------------
+# Router - Attention-based
+# -------------------------
+class AttentionRouter(nn.Module):
+    def __init__(self, d_input, d_k=64):
         super().__init__()
-        self.n_heads = n_heads
-        self.d_k = d_k
+        self.K = nn.Linear(d_input, d_k, bias=False)
+        self.q = nn.Parameter(torch.randn(d_k))
+        nn.init.normal_(self.q, std=0.02)
         
-        # Separate key projections for each head
-        self.K_heads = nn.ModuleList([
-            nn.Linear(d_model, d_k, bias=False) for _ in range(n_heads)
-        ])
-        
-        # Learnable queries for each head
-        self.queries = nn.ParameterList([
-            nn.Parameter(torch.randn(d_k)) for _ in range(n_heads)
-        ])
-        
-        # Merge scores from multiple heads
-        self.merge = nn.Linear(n_heads, 1, bias=False)
-        
-        # Initialize
-        for q in self.queries:
-            nn.init.normal_(q, std=0.02)
-        
-    def forward(self, feats):  # [M, d_model]
-        head_scores = []
-        for i in range(self.n_heads):
-            K = self.K_heads[i](feats)  # [M, d_k]
-            scores = K @ self.queries[i]  # [M]
-            head_scores.append(scores)
-        
-        # Stack and merge: [M, n_heads] -> [M, 1] -> [M]
-        head_scores = torch.stack(head_scores, dim=1)  # [M, n_heads]
-        final_scores = self.merge(head_scores).squeeze(-1)  # [M]
-        return final_scores
+    def forward(self, feats):  # [M, d_input]
+        K = self.K(feats)      # [M, d_k]
+        scores = K @ self.q    # [M]
+        return scores
+
+# -------------------------
+# Loss Computation
+# -------------------------
+def compute_loss_per_sample(model, X, Y, loss_fn):
+    """Compute loss for each sample separately"""
+    logits = model(X)  # [batch, L, vocab]
+    # Compute per-sample loss
+    losses = []
+    for i in range(X.size(0)):
+        loss = loss_fn(logits[i].reshape(-1, logits.size(-1)), Y[i].reshape(-1))
+        losses.append(loss)
+    return torch.stack(losses)  # [batch]
 
 # -------------------------
 # Evaluation
@@ -226,9 +327,9 @@ def evaluate(model, ds, loss_fn):
     model.eval()
     total_loss, total_tok = 0.0, 0
     for i in range(len(ds)):
-        x, y = ds[i]
-        x = x.unsqueeze(0).to(model.lm_head.weight.device)
-        y = y.unsqueeze(0).to(model.lm_head.weight.device)
+        x, y, _ = ds[i]
+        x = x.unsqueeze(0).to(cfg.device)
+        y = y.unsqueeze(0).to(cfg.device)
         logits = model(x)
         loss = loss_fn(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         total_loss += loss.item() * y.numel()
@@ -267,12 +368,17 @@ class DiversityTracker:
         self.dataset_size = dataset_size
         self.selection_counts = torch.zeros(dataset_size)
         self.step_selections = []
+        self.difficulty_selections = defaultdict(int)  # Track easy vs hard
         
-    def update(self, selected_indices):
+    def update(self, selected_indices, difficulties):
         self.step_selections.append(set(selected_indices))
         for idx in selected_indices:
             if 0 <= idx < self.dataset_size:
                 self.selection_counts[idx] += 1
+        
+        # Track difficulty distribution
+        for d in difficulties:
+            self.difficulty_selections[d] += 1
     
     def get_metrics(self):
         nonzero = self.selection_counts[self.selection_counts > 0]
@@ -287,39 +393,40 @@ class DiversityTracker:
             unique_ratio = unique_recent / max(total_selections, 1)
         else:
             unique_ratio = 0
+        
+        # Difficulty ratio
+        total_sel = sum(self.difficulty_selections.values())
+        easy_ratio = self.difficulty_selections[0] / max(total_sel, 1)
+        hard_ratio = self.difficulty_selections[1] / max(total_sel, 1)
             
         return {
             'coverage': coverage,
             'balance_std': balance_std,
-            'unique_ratio': unique_ratio
+            'unique_ratio': unique_ratio,
+            'easy_ratio': easy_ratio,
+            'hard_ratio': hard_ratio
         }
 
 # -------------------------
-# Training: IMPROVED ROUTER
+# Training: REINFORCE with Loss Improvement
 # -------------------------
-def train_router_improved(train_ds, val_ds, metrics, diversity):
+def train_router(train_ds, val_ds, metrics, diversity):
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.block).to(cfg.device)
-    router = MultiHeadAttentionRouter(d_model=model.d_model, d_k=64, n_heads=3).to(cfg.device)
+    
+    # Router input dimension: n_chunks * d_model + 4 (text stats)
+    d_router_input = cfg.n_chunks * cfg.d_model + 4
+    router = AttentionRouter(d_input=d_router_input, d_k=64).to(cfg.device)
     
     opt_lm = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm)
     opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router)
     loss_fn = nn.CrossEntropyLoss()
     
-    # Learning progress tracker
-    progress_tracker = LearningProgressTracker(len(train_ds), ema_decay=cfg.progress_ema)
-    
     global_step = 0
-    total_steps = cfg.epochs * (len(train_ds) // cfg.pool)
     
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         router.train()
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
-        
-        # Anneal temperature and entropy reg
-        progress = (epoch - 1) / cfg.epochs
-        temp = cfg.temp_start * (1 - progress) + cfg.temp_end * progress
-        lambda_ent = cfg.lambda_ent_start * (1 - progress) + cfg.lambda_ent_end * progress
         
         for pool_indices in idx_loader:
             if len(pool_indices) < cfg.batch:
@@ -327,90 +434,81 @@ def train_router_improved(train_ds, val_ds, metrics, diversity):
             global_step += 1
             
             # Load pool
-            xs, ys = zip(*[train_ds[i] for i in pool_indices])
+            batch_data = [train_ds[i] for i in pool_indices]
+            xs, ys, diffs = zip(*batch_data)
             X = torch.stack(xs, 0).to(cfg.device)
             Y = torch.stack(ys, 0).to(cfg.device)
             M = X.size(0)
             
-            # IMPROVED: Extract features from first transformer block
-            with torch.no_grad():
-                feats = model.get_first_block_features(X)  # [M, d_model]
+            # Extract hierarchical features
+            feats = extract_hierarchical_features(model, X)  # [M, d_router_input]
             
             # Router scoring
             scores = router(feats)
-            probs = torch.softmax(scores / temp, dim=0)
             
-            # IMPROVED: Mixed hard/easy selection
+            # CURRICULUM BIAS: Encourage easy samples early in training
+            training_progress = global_step / (len(train_ds) // cfg.pool * cfg.epochs)
+            curriculum_strength = max(0, 1.0 - training_progress)  # 1.0 → 0.0
+            
+            if curriculum_strength > 0:
+                # Boost easy samples, penalize hard samples
+                difficulty_tensor = torch.tensor([diffs[i] for i in range(M)], 
+                                                 device=scores.device, dtype=torch.float32)
+                curriculum_bonus = curriculum_strength * 2.0 * (1 - difficulty_tensor)  # Easy=+2, Hard=0
+                scores = scores + curriculum_bonus
+            
+            probs = torch.softmax(scores / cfg.temp, dim=0)
+            
+            # Hard select top-k
             k = cfg.batch
-            if cfg.use_mixed_selection:
-                k_hard = int(k * cfg.hard_ratio)
-                k_easy = k - k_hard
-                
-                # Select hardest samples (highest scores)
-                hard_idx = torch.topk(probs, k=k_hard, dim=0).indices
-                
-                # Select easiest samples (lowest scores)
-                easy_idx = torch.topk(probs, k=k_easy, dim=0, largest=False).indices
-                
-                topk_idx = torch.cat([hard_idx, easy_idx])
-            else:
-                # Standard top-k
-                topk_idx = torch.topk(probs, k=k, dim=0).indices
+            topk_idx = torch.topk(probs, k=k, dim=0).indices
             
             # Selected batch
             X_sel = X[topk_idx]
             Y_sel = Y[topk_idx]
-            selected_pool_indices = [pool_indices[i] for i in topk_idx.cpu().tolist()]
             
-            # LM forward
+            # ===== LOSS IMPROVEMENT REWARD =====
+            # Step 1: Measure loss BEFORE update
+            with torch.no_grad():
+                loss_before = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
+            
+            # Step 2: LM forward and backward
             logits = model(X_sel)
             loss_lm = loss_fn(logits.reshape(-1, logits.size(-1)), Y_sel.reshape(-1))
             
-            # Compute per-sample losses
-            with torch.no_grad():
-                per_sample_loss = nn.functional.cross_entropy(
-                    logits.detach().reshape(-1, logits.size(-1)),
-                    Y_sel.reshape(-1),
-                    reduction='none'
-                ).reshape(k, -1).mean(dim=1)  # [k]
-            
-            # IMPROVED: Learning progress reward
-            if cfg.use_learning_progress:
-                progress_reward = progress_tracker.get_progress(
-                    selected_pool_indices, 
-                    per_sample_loss.detach().cpu().numpy()
-                )
-                # Update tracker
-                progress_tracker.update(
-                    selected_pool_indices,
-                    per_sample_loss.detach().cpu().numpy()
-                )
-                # Combine: prefer samples with high loss AND high learning progress
-                reward = per_sample_loss + 0.5 * progress_reward.to(cfg.device)
-            else:
-                # Standard: just use loss
-                reward = per_sample_loss
-            
-            # Normalize reward
-            baseline = reward.mean()
-            
-            # Router loss (REINFORCE)
-            sel_probs = probs[topk_idx].clamp_min(1e-12)
-            reinforce = -((reward - baseline) * torch.log(sel_probs)).mean()
-            
-            # Entropy with annealing
-            ent = (probs * torch.log(probs.clamp_min(1e-12))).sum()
-            loss_router = reinforce + lambda_ent * ent
-            
-            # Combined step
             opt_lm.zero_grad(set_to_none=True)
-            opt_router.zero_grad(set_to_none=True)
-            (loss_lm + cfg.lambda_router * loss_router).backward()
+            loss_lm.backward()
             opt_lm.step()
+            
+            # Step 3: Measure loss AFTER update
+            with torch.no_grad():
+                loss_after = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
+            
+            # Step 4: Reward = improvement (positive = good learning)
+            improvement = loss_before - loss_after  # [k]
+            
+            # CRITICAL: Clip negative improvements (samples that hurt learning)
+            improvement = improvement.clamp(min=0.0)  # No negative rewards
+            
+            baseline = improvement.mean()
+            
+            # Router loss (REINFORCE with improvement reward)
+            sel_probs = probs[topk_idx].clamp_min(1e-12)
+            reinforce = -((improvement - baseline) * torch.log(sel_probs)).mean()
+            
+            # Entropy regularization
+            ent = (probs * torch.log(probs.clamp_min(1e-12))).sum()
+            loss_router = reinforce + cfg.lambda_ent * ent
+            
+            # Router update
+            opt_router.zero_grad(set_to_none=True)
+            loss_router.backward()
             opt_router.step()
             
             # Track diversity
-            diversity.update(selected_pool_indices)
+            selected_indices = [pool_indices[i] for i in topk_idx.cpu().tolist()]
+            selected_diffs = [diffs[i] for i in topk_idx.cpu().tolist()]
+            diversity.update(selected_indices, selected_diffs)
             
             # Log
             if global_step % cfg.log_every == 0:
@@ -421,17 +519,16 @@ def train_router_improved(train_ds, val_ds, metrics, diversity):
                     loss_lm=loss_lm.item(),
                     loss_router_reinforce=reinforce.item(),
                     entropy=-ent.item(),
-                    temperature=temp,
-                    lambda_ent=lambda_ent,
+                    avg_improvement=improvement.mean().item(),
+                    curriculum_bias=curriculum_strength,
                     **div_metrics
                 )
                 print(f"[Router] epoch {epoch} step {global_step}: "
                       f"LM={loss_lm.item():.4f}  "
-                      f"Reinf={reinforce.item():.4f}  "
+                      f"Improve={improvement.mean().item():.4f}  "
                       f"H={-ent.item():.3f}  "
-                      f"T={temp:.2f}  "
-                      f"λ_ent={lambda_ent:.4f}  "
-                      f"Cov={div_metrics['coverage']:.3f}")
+                      f"CurrBias={curriculum_strength:.2f}  "
+                      f"Easy={div_metrics['easy_ratio']:.2f} Hard={div_metrics['hard_ratio']:.2f}")
         
         # Validation
         val_loss, val_ppl = evaluate(model, val_ds, loss_fn)
@@ -441,7 +538,7 @@ def train_router_improved(train_ds, val_ds, metrics, diversity):
     return model, router
 
 # -------------------------
-# Training: Baseline (unchanged)
+# Training: Baseline (uniform)
 # -------------------------
 def train_baseline(train_ds, val_ds, metrics, diversity):
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.block).to(cfg.device)
@@ -463,7 +560,8 @@ def train_baseline(train_ds, val_ds, metrics, diversity):
             selected_indices = random.sample(pool_indices, cfg.batch)
             
             # Load batch
-            xs, ys = zip(*[train_ds[i] for i in selected_indices])
+            batch_data = [train_ds[i] for i in selected_indices]
+            xs, ys, diffs = zip(*batch_data)
             X = torch.stack(xs, 0).to(cfg.device)
             Y = torch.stack(ys, 0).to(cfg.device)
             
@@ -477,7 +575,7 @@ def train_baseline(train_ds, val_ds, metrics, diversity):
             opt.step()
             
             # Track diversity
-            diversity.update(selected_indices)
+            diversity.update(selected_indices, diffs)
             
             # Log
             if global_step % cfg.log_every == 0:
@@ -486,12 +584,12 @@ def train_baseline(train_ds, val_ds, metrics, diversity):
                     epoch=epoch,
                     step=global_step,
                     loss_lm=loss.item(),
-                    entropy=math.log(cfg.batch),
+                    entropy=math.log(cfg.batch),  # max entropy
                     **div_metrics
                 )
                 print(f"[Baseline] epoch {epoch} step {global_step}: "
                       f"LM={loss.item():.4f}  "
-                      f"Cov={div_metrics['coverage']:.3f}")
+                      f"Easy={div_metrics['easy_ratio']:.2f} Hard={div_metrics['hard_ratio']:.2f}")
         
         # Validation
         val_loss, val_ppl = evaluate(model, val_ds, loss_fn)
@@ -505,7 +603,7 @@ def train_baseline(train_ds, val_ds, metrics, diversity):
 # -------------------------
 def compare_runs(baseline_metrics, router_metrics):
     print("\n" + "="*70)
-    print("COMPARISON REPORT - IMPROVED ROUTER")
+    print("COMPARISON REPORT")
     print("="*70)
     
     # Final PPL
@@ -518,23 +616,21 @@ def compare_runs(baseline_metrics, router_metrics):
     print(f"   Router:   {router_ppl:.2f}")
     print(f"   Improvement: {improvement:+.2f}%")
     
-    # PPL trajectory
-    def steps_to_ppl(metrics, target):
-        for i, ppl in enumerate(metrics.history.get('val_ppl', [])):
-            if ppl <= target:
-                return metrics.history['step'][i]
-        return None
-    
-    target = 2000
-    baseline_steps = steps_to_ppl(baseline_metrics, target)
-    router_steps = steps_to_ppl(router_metrics, target)
-    
-    print(f"\n2. Steps to reach PPL ≤ {target}:")
-    print(f"   Baseline: {baseline_steps if baseline_steps else 'Not reached'}")
-    print(f"   Router:   {router_steps if router_steps else 'Not reached'}")
-    if baseline_steps and router_steps:
-        speedup = ((baseline_steps - router_steps) / baseline_steps) * 100
-        print(f"   Speedup: {speedup:+.2f}%")
+    # Difficulty progression (analyze easy vs hard ratio over time)
+    if 'easy_ratio' in router_metrics.history:
+        easy_ratios = router_metrics.history['easy_ratio']
+        early_easy = sum(easy_ratios[:len(easy_ratios)//3]) / max(len(easy_ratios)//3, 1)
+        late_easy = sum(easy_ratios[-len(easy_ratios)//3:]) / max(len(easy_ratios)//3, 1)
+        
+        print(f"\n2. Curriculum Progression (Router):")
+        print(f"   Early training easy ratio: {early_easy:.2f}")
+        print(f"   Late training easy ratio:  {late_easy:.2f}")
+        print(f"   Shift toward hard samples: {(early_easy - late_easy):.2f}")
+        
+        if early_easy > late_easy + 0.05:
+            print("   ✓ Clear curriculum: easy→hard progression observed")
+        else:
+            print("   ✗ No clear curriculum progression")
     
     # Sample diversity
     def avg_last(metrics, key, n=5):
@@ -549,18 +645,11 @@ def compare_runs(baseline_metrics, router_metrics):
     print(f"   Baseline Entropy:  {avg_last(baseline_metrics, 'entropy'):.3f}")
     print(f"   Router Entropy:    {avg_last(router_metrics, 'entropy'):.3f}")
     
-    print(f"\n4. Router Behavior:")
-    print(f"   Final Temperature:  {router_metrics.history['temperature'][-1]:.3f}")
-    print(f"   Final λ_ent:        {router_metrics.history['lambda_ent'][-1]:.5f}")
-    print(f"   Unique Ratio:       {avg_last(router_metrics, 'unique_ratio'):.3f}")
-    
     # Verdict
-    print(f"\n5. Verdict:")
-    if improvement > 10:
-        print("   ✓✓✓ Router provides STRONG improvement (>10%)")
-    elif improvement > 5:
-        print("   ✓✓ Router provides significant improvement (5-10%)")
-    elif improvement > 2:
+    print(f"\n4. Verdict:")
+    if improvement > 5 and router_ppl < baseline_ppl:
+        print("   ✓✓ Router provides significant improvement (>5%)")
+    elif improvement > 2 and router_ppl < baseline_ppl:
         print("   ✓ Router shows meaningful improvement (2-5%)")
     elif improvement > 0:
         print("   ~ Router shows modest improvement (<2%)")
@@ -574,28 +663,25 @@ def compare_runs(baseline_metrics, router_metrics):
 # -------------------------
 def main():
     print("="*70)
-    print("IMPROVED ROUTER EVALUATION")
+    print("IMPROVED CURRICULUM LEARNING EXPERIMENT")
     print("="*70)
-    print(f"Improvements:")
-    print(f"  • Pool size: {cfg.pool_mult}x (was 2x)")
-    print(f"  • Features: First transformer block (was mean embeddings)")
-    print(f"  • Router: Multi-head attention ({3} heads)")
-    print(f"  • Reward: Learning progress tracking")
-    print(f"  • Selection: Mixed hard/easy ({cfg.hard_ratio:.0%} hard)")
-    print(f"  • Annealing: Temp {cfg.temp_start}→{cfg.temp_end}, λ_ent {cfg.lambda_ent_start}→{cfg.lambda_ent_end}")
-    print("="*70 + "\n")
+    print(f"\nImprovements:")
+    print("  1. Mixed dataset: TinyStories (easy) + OpenWebText (hard)")
+    print("  2. Loss improvement reward signal")
+    print("  3. Hierarchical hidden states + text statistics features")
+    print()
     
-    print("Loading WikiText-2...")
-    train_chunks = make_chunks("train")
-    val_chunks = make_chunks("validation")
-    train_ds = LMDataset(train_chunks)
-    val_ds = LMDataset(val_chunks)
-    print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples\n")
+    # Load data
+    train_chunks = make_mixed_chunks("train")
+    val_chunks = make_mixed_chunks("validation")
+    train_ds = MixedLMDataset(train_chunks)
+    val_ds = MixedLMDataset(val_chunks)
+    print(f"\n✓ Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
     
     Path(cfg.save_dir).mkdir(exist_ok=True)
     
     # Baseline
-    print("="*70)
+    print("\n" + "="*70)
     print("BASELINE (Uniform Random Selection)")
     print("="*70)
     baseline_metrics = MetricsTracker()
@@ -603,23 +689,24 @@ def main():
     baseline_model = train_baseline(train_ds, val_ds, baseline_metrics, baseline_diversity)
     baseline_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
     
-    # Reset seed
+    # Reset seed for fair comparison
     random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     
-    # Improved Router
+    # Router
     print("\n" + "="*70)
-    print("IMPROVED ROUTER (Multi-head + Learning Progress)")
+    print("ROUTER (Attention-based Curriculum with Loss Improvement)")
     print("="*70)
     router_metrics = MetricsTracker()
     router_diversity = DiversityTracker(len(train_ds))
-    router_model, router_net = train_router_improved(train_ds, val_ds, router_metrics, router_diversity)
+    router_model, router_net = train_router(train_ds, val_ds, router_metrics, router_diversity)
     router_metrics.save(f"{cfg.save_dir}/router_metrics.json")
     
     # Compare
     compare_runs(baseline_metrics, router_metrics)
     
     print(f"✓ Results saved to {cfg.save_dir}/")
+    print(f"✓ Metrics: baseline_metrics.json, router_metrics.json")
 
 if __name__ == "__main__":
     main()
