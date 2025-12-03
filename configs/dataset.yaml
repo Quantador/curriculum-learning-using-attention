@@ -1,4 +1,0 @@
-name: wikitext
-config: wikitext-2-raw-v1
-seq_len: 512
-num_proc: 4

@@ -1,3 +1,9 @@
+# eval_curriculum_improved.py
+# Improved curriculum learning with:
+# 1. Mixed difficulty dataset (TinyStories + OpenWebText)
+# 2. Loss improvement reward signal
+# 3. Hierarchical hidden states + text statistics features
+
 import math, torch, random, json
 from torch import nn
 from torch.utils.data import Dataset
@@ -6,6 +12,15 @@ from transformers import GPT2TokenizerFast
 from pathlib import Path
 from collections import defaultdict
 import copy
+
+# Wandb for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("⚠️  wandb not installed. Run: pip install wandb")
+    print("   Continuing without wandb logging...")
 
 # -------------------------
 # Config
@@ -18,8 +33,8 @@ class Config:
     
     # Training
     batch = 16           # final selected batch size (k)
-    pool_mult = 3        # candidate pool multiplier -> M = pool_mult * batch (increased)
-    epochs = 3
+    pool_mult = 5        # candidate pool multiplier -> M = pool_mult * batch (increased)
+    epochs = 10
     lr_lm = 3e-4
     lr_router = 1e-3
     temp = 1.0           # Reduced from 2.0 - less random
@@ -38,6 +53,11 @@ class Config:
     # System
     device = "cuda" if torch.cuda.is_available() else "cpu"
     seed = 0
+    
+    # Wandb
+    use_wandb = True
+    wandb_project = "curriculum-learning"
+    wandb_entity = None  # Set to your wandb username/team, or None for default
     
     # Eval
     save_dir = "results_improved"
@@ -342,14 +362,21 @@ def evaluate(model, ds, loss_fn):
 # Metrics tracker
 # -------------------------
 class MetricsTracker:
-    def __init__(self):
+    def __init__(self, use_wandb=False):
         self.history = defaultdict(list)
+        self.use_wandb = use_wandb
         
     def log(self, epoch, step, **kwargs):
         self.history['epoch'].append(epoch)
         self.history['step'].append(step)
         for k, v in kwargs.items():
             self.history[k].append(v)
+        
+        # Log to wandb if enabled
+        if self.use_wandb and WANDB_AVAILABLE:
+            wandb_dict = {'epoch': epoch, 'step': step}
+            wandb_dict.update(kwargs)
+            wandb.log(wandb_dict, step=step)
     
     def save(self, path):
         with open(path, 'w') as f:
@@ -410,7 +437,38 @@ class DiversityTracker:
 # -------------------------
 # Training: REINFORCE with Loss Improvement
 # -------------------------
-def train_router(train_ds, val_ds, metrics, diversity):
+def train_router(train_ds, val_ds, metrics, diversity, use_wandb=False):
+    # Initialize wandb for router
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name="router-curriculum",
+            config={
+                "method": "router-curriculum",
+                "batch_size": cfg.batch,
+                "pool_size": cfg.pool,
+                "pool_mult": cfg.pool_mult,
+                "epochs": cfg.epochs,
+                "lr_lm": cfg.lr_lm,
+                "lr_router": cfg.lr_router,
+                "temperature": cfg.temp,
+                "lambda_ent": cfg.lambda_ent,
+                "lambda_router": cfg.lambda_router,
+                "d_model": cfg.d_model,
+                "n_layers": cfg.n_layers,
+                "n_heads": cfg.n_heads,
+                "n_chunks": cfg.n_chunks,
+                "block_size": cfg.block,
+                "dataset_size": len(train_ds),
+                "seed": cfg.seed,
+                "reward_signal": "loss_improvement",
+                "features": "hierarchical_hidden_states",
+                "curriculum_bias": "warmup"
+            },
+            reinit=True
+        )
+    
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.block).to(cfg.device)
     
     # Router input dimension: n_chunks * d_model + 4 (text stats)
@@ -450,12 +508,12 @@ def train_router(train_ds, val_ds, metrics, diversity):
             training_progress = global_step / (len(train_ds) // cfg.pool * cfg.epochs)
             curriculum_strength = max(0, 1.0 - training_progress)  # 1.0 → 0.0
             
-            if curriculum_strength > 0:
-                # Boost easy samples, penalize hard samples
-                difficulty_tensor = torch.tensor([diffs[i] for i in range(M)], 
-                                                 device=scores.device, dtype=torch.float32)
-                curriculum_bonus = curriculum_strength * 2.0 * (1 - difficulty_tensor)  # Easy=+2, Hard=0
-                scores = scores + curriculum_bonus
+            # if curriculum_strength > 0:
+            #     # Boost easy samples, penalize hard samples
+            #     difficulty_tensor = torch.tensor([diffs[i] for i in range(M)], 
+            #                                      device=scores.device, dtype=torch.float32)
+            #     curriculum_bonus = curriculum_strength * 2.0 * (1 - difficulty_tensor)  # Easy=+2, Hard=0
+            #     scores = scores + curriculum_bonus
             
             probs = torch.softmax(scores / cfg.temp, dim=0)
             
@@ -535,12 +593,38 @@ def train_router(train_ds, val_ds, metrics, diversity):
         metrics.log(epoch=epoch, step=global_step, val_loss=val_loss, val_ppl=val_ppl)
         print(f"==> [Router] epoch {epoch}: val_loss={val_loss:.4f}  val_ppl={val_ppl:.2f}\n")
     
+    # Finish wandb run
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
+    
     return model, router
 
 # -------------------------
 # Training: Baseline (uniform)
 # -------------------------
-def train_baseline(train_ds, val_ds, metrics, diversity):
+def train_baseline(train_ds, val_ds, metrics, diversity, use_wandb=False):
+    # Initialize wandb for baseline
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name="baseline-uniform",
+            config={
+                "method": "baseline",
+                "batch_size": cfg.batch,
+                "pool_size": cfg.pool,
+                "epochs": cfg.epochs,
+                "lr_lm": cfg.lr_lm,
+                "d_model": cfg.d_model,
+                "n_layers": cfg.n_layers,
+                "n_heads": cfg.n_heads,
+                "block_size": cfg.block,
+                "dataset_size": len(train_ds),
+                "seed": cfg.seed
+            },
+            reinit=True
+        )
+    
     model = TinyGPT(vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.block).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm)
     loss_fn = nn.CrossEntropyLoss()
@@ -596,12 +680,16 @@ def train_baseline(train_ds, val_ds, metrics, diversity):
         metrics.log(epoch=epoch, step=global_step, val_loss=val_loss, val_ppl=val_ppl)
         print(f"==> [Baseline] epoch {epoch}: val_loss={val_loss:.4f}  val_ppl={val_ppl:.2f}\n")
     
+    # Finish wandb run
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
+    
     return model
 
 # -------------------------
 # Comparison
 # -------------------------
-def compare_runs(baseline_metrics, router_metrics):
+def compare_runs(baseline_metrics, router_metrics, use_wandb=False):
     print("\n" + "="*70)
     print("COMPARISON REPORT")
     print("="*70)
@@ -617,18 +705,22 @@ def compare_runs(baseline_metrics, router_metrics):
     print(f"   Improvement: {improvement:+.2f}%")
     
     # Difficulty progression (analyze easy vs hard ratio over time)
+    curriculum_progression = False
+    early_easy, late_easy, shift = 0, 0, 0
     if 'easy_ratio' in router_metrics.history:
         easy_ratios = router_metrics.history['easy_ratio']
         early_easy = sum(easy_ratios[:len(easy_ratios)//3]) / max(len(easy_ratios)//3, 1)
         late_easy = sum(easy_ratios[-len(easy_ratios)//3:]) / max(len(easy_ratios)//3, 1)
+        shift = early_easy - late_easy
         
         print(f"\n2. Curriculum Progression (Router):")
         print(f"   Early training easy ratio: {early_easy:.2f}")
         print(f"   Late training easy ratio:  {late_easy:.2f}")
-        print(f"   Shift toward hard samples: {(early_easy - late_easy):.2f}")
+        print(f"   Shift toward hard samples: {shift:.2f}")
         
         if early_easy > late_easy + 0.05:
             print("   ✓ Clear curriculum: easy→hard progression observed")
+            curriculum_progression = True
         else:
             print("   ✗ No clear curriculum progression")
     
@@ -639,24 +731,73 @@ def compare_runs(baseline_metrics, router_metrics):
             return sum(vals[-n:]) / n
         return 0
     
+    baseline_coverage = avg_last(baseline_metrics, 'coverage')
+    router_coverage = avg_last(router_metrics, 'coverage')
+    baseline_entropy = avg_last(baseline_metrics, 'entropy')
+    router_entropy = avg_last(router_metrics, 'entropy')
+    
     print(f"\n3. Sample Diversity (avg last 5 checkpoints):")
-    print(f"   Baseline Coverage: {avg_last(baseline_metrics, 'coverage'):.3f}")
-    print(f"   Router Coverage:   {avg_last(router_metrics, 'coverage'):.3f}")
-    print(f"   Baseline Entropy:  {avg_last(baseline_metrics, 'entropy'):.3f}")
-    print(f"   Router Entropy:    {avg_last(router_metrics, 'entropy'):.3f}")
+    print(f"   Baseline Coverage: {baseline_coverage:.3f}")
+    print(f"   Router Coverage:   {router_coverage:.3f}")
+    print(f"   Baseline Entropy:  {baseline_entropy:.3f}")
+    print(f"   Router Entropy:    {router_entropy:.3f}")
     
     # Verdict
     print(f"\n4. Verdict:")
+    verdict = ""
     if improvement > 5 and router_ppl < baseline_ppl:
+        verdict = "significant_improvement"
         print("   ✓✓ Router provides significant improvement (>5%)")
     elif improvement > 2 and router_ppl < baseline_ppl:
+        verdict = "meaningful_improvement"
         print("   ✓ Router shows meaningful improvement (2-5%)")
     elif improvement > 0:
+        verdict = "modest_improvement"
         print("   ~ Router shows modest improvement (<2%)")
     else:
+        verdict = "no_improvement"
         print("   ✗ Router does not improve over baseline")
     
     print("\n" + "="*70 + "\n")
+    
+    # Log comparison to wandb
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            name="comparison",
+            reinit=True
+        )
+        
+        wandb.log({
+            "comparison/baseline_ppl": baseline_ppl,
+            "comparison/router_ppl": router_ppl,
+            "comparison/improvement_pct": improvement,
+            "comparison/early_easy_ratio": early_easy,
+            "comparison/late_easy_ratio": late_easy,
+            "comparison/curriculum_shift": shift,
+            "comparison/curriculum_progression": curriculum_progression,
+            "comparison/baseline_coverage": baseline_coverage,
+            "comparison/router_coverage": router_coverage,
+            "comparison/baseline_entropy": baseline_entropy,
+            "comparison/router_entropy": router_entropy,
+            "comparison/verdict": verdict
+        })
+        
+        # Create summary table
+        wandb.log({
+            "comparison_table": wandb.Table(
+                columns=["Metric", "Baseline", "Router", "Difference"],
+                data=[
+                    ["Validation PPL", f"{baseline_ppl:.2f}", f"{router_ppl:.2f}", f"{improvement:+.2f}%"],
+                    ["Coverage", f"{baseline_coverage:.3f}", f"{router_coverage:.3f}", f"{router_coverage-baseline_coverage:+.3f}"],
+                    ["Entropy", f"{baseline_entropy:.3f}", f"{router_entropy:.3f}", f"{router_entropy-baseline_entropy:+.3f}"],
+                    ["Curriculum Shift", "-", f"{shift:.2f}", "-"]
+                ]
+            )
+        })
+        
+        wandb.finish()
 
 # -------------------------
 # Main
@@ -671,6 +812,14 @@ def main():
     print("  3. Hierarchical hidden states + text statistics features")
     print()
     
+    # Check wandb
+    use_wandb = cfg.use_wandb and WANDB_AVAILABLE
+    if cfg.use_wandb and not WANDB_AVAILABLE:
+        print("⚠️  wandb requested but not available. Install with: pip install wandb")
+        print("   Continuing without wandb logging...\n")
+    elif use_wandb:
+        print(f"✓ wandb enabled - logging to project: {cfg.wandb_project}\n")
+    
     # Load data
     train_chunks = make_mixed_chunks("train")
     val_chunks = make_mixed_chunks("validation")
@@ -684,9 +833,9 @@ def main():
     print("\n" + "="*70)
     print("BASELINE (Uniform Random Selection)")
     print("="*70)
-    baseline_metrics = MetricsTracker()
+    baseline_metrics = MetricsTracker(use_wandb=use_wandb)
     baseline_diversity = DiversityTracker(len(train_ds))
-    baseline_model = train_baseline(train_ds, val_ds, baseline_metrics, baseline_diversity)
+    baseline_model = train_baseline(train_ds, val_ds, baseline_metrics, baseline_diversity, use_wandb=use_wandb)
     baseline_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
     
     # Reset seed for fair comparison
@@ -697,16 +846,18 @@ def main():
     print("\n" + "="*70)
     print("ROUTER (Attention-based Curriculum with Loss Improvement)")
     print("="*70)
-    router_metrics = MetricsTracker()
+    router_metrics = MetricsTracker(use_wandb=use_wandb)
     router_diversity = DiversityTracker(len(train_ds))
-    router_model, router_net = train_router(train_ds, val_ds, router_metrics, router_diversity)
+    router_model, router_net = train_router(train_ds, val_ds, router_metrics, router_diversity, use_wandb=use_wandb)
     router_metrics.save(f"{cfg.save_dir}/router_metrics.json")
     
     # Compare
-    compare_runs(baseline_metrics, router_metrics)
+    compare_runs(baseline_metrics, router_metrics, use_wandb=use_wandb)
     
     print(f"✓ Results saved to {cfg.save_dir}/")
     print(f"✓ Metrics: baseline_metrics.json, router_metrics.json")
+    if use_wandb:
+        print(f"✓ wandb: https://wandb.ai/{cfg.wandb_entity or 'your-username'}/{cfg.wandb_project}")
 
 if __name__ == "__main__":
     main()
