@@ -4,3 +4,5 @@ data/
 outputs/
 __pycache__/
 models
+results_improved/
+clean/results/
