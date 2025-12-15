@@ -34,7 +34,7 @@ class Config:
     # Training
     batch = 16           # final selected batch size (k)
     pool_mult = 5        # candidate pool multiplier -> M = pool_mult * batch (increased)
-    epochs = 10
+    epochs = 20
     lr_lm = 3e-4
     lr_router = 1e-3
     temp = 1.0           # Reduced from 2.0 - less random
@@ -585,7 +585,6 @@ def train_router(train_ds, val_ds, metrics, diversity, use_wandb=False):
                       f"LM={loss_lm.item():.4f}  "
                       f"Improve={improvement.mean().item():.4f}  "
                       f"H={-ent.item():.3f}  "
-                      f"CurrBias={curriculum_strength:.2f}  "
                       f"Easy={div_metrics['easy_ratio']:.2f} Hard={div_metrics['hard_ratio']:.2f}")
         
         # Validation
