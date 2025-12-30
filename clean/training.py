@@ -9,6 +9,8 @@ from typing import Tuple
 import torch
 from torch import nn
 
+from tqdm import tqdm
+
 from config import Config
 from data import make_index_loader, MixedLMDataset
 from model import TinyGPT, AttentionRouter, extract_hierarchical_features
@@ -90,7 +92,7 @@ def train_baseline(
     for epoch in range(cfg.epochs):
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
-        for pool_indices in idx_loader:
+        for pool_indices in tqdm(idx_loader):
             if len(pool_indices) < cfg.batch:
                 continue
 
@@ -178,7 +180,7 @@ def train_router(
     for epoch in range(cfg.epochs):
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
-        for pool_indices in idx_loader:
+        for pool_indices in tqdm(idx_loader):
             if len(pool_indices) < cfg.batch:
                 continue
 

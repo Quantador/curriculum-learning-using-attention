@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from datasets import load_dataset
 from transformers import GPT2TokenizerFast
 
+from tqdm import tqdm, tqdm
 from config import Config
 
 
@@ -25,12 +26,10 @@ def load_mixed_dataset(cfg: Config):
     print("=" * 70)
 
     print(f"Loading TinyStories (easy)... target: {cfg.easy_samples} samples")
-    easy_ds = load_dataset("roneneldan/TinyStories", split=f"train[:{cfg.easy_samples}]")
+    easy_ds = load_dataset("roneneldan/TinyStories", split=f"train[0:{cfg.easy_samples}]")
 
     print(f"Loading OpenWebText (hard)... target: {cfg.hard_samples} samples")
-    hard_ds = load_dataset("stas/openwebtext-10k", split="train")
-    if len(hard_ds) > cfg.hard_samples:
-        hard_ds = hard_ds.select(range(cfg.hard_samples))
+    hard_ds = load_dataset("Geralt-Targaryen/openwebtext2", split=f"train[0:{cfg.hard_samples}]")
 
     print(f"✓ Loaded {len(easy_ds)} easy samples")
     print(f"✓ Loaded {len(hard_ds)} hard samples")
@@ -62,13 +61,13 @@ def make_mixed_chunks(
 
         print("\nTokenizing and chunking...")
         easy_chunks: List[List[int]] = []
-        for item in easy_ds:
+        for item in tqdm(easy_ds):
             easy_chunks.extend(
                 tokenize_and_chunk(item["text"], tokenizer, cfg.block + 1)
             )
 
         hard_chunks: List[List[int]] = []
-        for item in hard_ds:
+        for item in tqdm(hard_ds):
             hard_chunks.extend(
                 tokenize_and_chunk(item["text"], tokenizer, cfg.block + 1)
             )

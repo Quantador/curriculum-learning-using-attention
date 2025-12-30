@@ -6,15 +6,15 @@ import torch
 class Config:
     # Data
     block: int = 256
-    easy_samples: int = 30000
-    hard_samples: int = 5000
-    max_chunks: int = 50000
+    easy_samples: int = 10_000
+    hard_samples: int = 2_000
+    max_chunks: int = 20_000
 
     # Model
-    d_model: int = 256
-    n_layers: int = 4
+    d_model: int = 512
+    n_layers: int = 8
     n_heads: int = 8
-    d_ff: int = 1024
+    d_ff: int = 2048
     n_chunks: int = 8
 
     # Training
