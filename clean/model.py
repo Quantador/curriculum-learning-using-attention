@@ -131,6 +131,7 @@ def extract_hierarchical_features(
     cfg: Config,
     pad_token_id: int,
     vocab_size: int,
+    mode: str = "full",
 ) -> torch.Tensor:
     # Original "full" features: hierarchical hidden + stats
     pooled = extract_hierarchical_hidden(model, X, cfg)  # [B, n_chunks*D]
@@ -140,8 +141,19 @@ def extract_hierarchical_features(
         vocab_size=vocab_size,
         block=cfg.block,
     )
-    return torch.cat([pooled, stats], dim=1)
-
+    if mode == "no_hidden":
+        return stats
+    if mode == "no_stats":
+        return pooled
+    if mode == "no_hier":
+        mean_hidden = X.mean(dim=1)  # [B, D]
+        return torch.cat([mean_hidden, stats], dim=1)
+    if mode == "full":
+        return torch.cat([pooled, stats], dim=1)
+    if mode == "random":
+        full_dim = cfg.n_chunks * cfg.d_model + 4
+        return torch.randn(X.size(0), full_dim, device=X.device)
+    raise ValueError(f"Unknown feature mode: {mode}")
 
 def extract_router_features(
     model: TinyGPT,

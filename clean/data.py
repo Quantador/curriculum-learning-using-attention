@@ -19,6 +19,51 @@ def get_tokenizer() -> GPT2TokenizerFast:
         tok.pad_token = tok.eos_token
     return tok
 
+def _get_dataset_config(source: str, num_samples: int) -> dict:
+    """
+    Returns HuggingFace dataset loading arguments for a given source key.
+    You can add/adjust these easily.
+    """
+    source = source.lower()
+
+    if source == "tinystories":
+        return dict(path="roneneldan/TinyStories", name=None, split="train[:{}]".format(num_samples))
+
+    if source == "openwebtext2":
+        # commonly used: Geralt-Targaryen/openwebtext2
+        return dict(path="Geralt-Targaryen/openwebtext2", name=None, split="train[:{}]".format(num_samples))
+    if source == "wikipedia":
+        # stable fallback: wikipedia 20220301.en
+        return dict(path="wikipedia", name="20220301.en", split="train[:{}]".format(num_samples))
+    if source == "c4":
+        # C4 is huge; for sweeps you may want to use 'en' or a smaller shard
+        return dict(path="c4", name="en", split="train[:{}]".format(num_samples))
+    if source == "fineweb_edu":
+        # FineWeb-edu naming varies by mirror; keep this configurable
+        # Try "HuggingFaceFW/fineweb-edu" first; if your env differs, update here.
+        return dict(path="HuggingFaceFW/fineweb-edu", name=None, split="train[:{}]".format(num_samples))
+    if source == "fineweb":
+        return dict(path="HuggingFaceFW/fineweb", name=None, split="train[:{}]".format(num_samples))
+
+    raise ValueError(f"Unknown source: {source}")
+
+
+def load_text_stream(source: str, num_samples: int):
+    cfg = _get_dataset_config(source, num_samples)
+    ds = load_dataset(cfg["path"], cfg["name"], split=cfg["split"])
+    # Most datasets use 'text'; Wikipedia uses 'text'; some use 'content'
+    if "text" in ds.column_names:
+        return ds["text"]
+    if "content" in ds.column_names:
+        return ds["content"]
+    # last resort: join all string-like columns (rare)
+    cols = [c for c in ds.column_names if ds[c].dtype == "string"]
+    if not cols:
+        raise ValueError(f"No usable text columns found for source={source}, columns={ds.column_names}")
+    return ["\n".join([row[c] for c in cols if isinstance(row[c], str)]) for row in ds]
+
+
+
 
 def load_mixed_dataset(cfg: Config):
     print("\n" + "=" * 70)
@@ -128,6 +173,68 @@ def make_mixed_chunks(
             ids[i : i + cfg.block + 1] for i in range(0, L, cfg.block + 1)
         ]
         return [(chunk, -1) for chunk in chunks]
+    
+    
+    
+def make_mixed_chunks_gen(cfg, tokenizer):
+    """
+    Builds a mixed set of token chunks of length cfg.block+1 from:
+      - cfg.easy_source (default tinystories)
+      - cfg.hard_source (default openwebtext2)
+    Mixed according to cfg.easy_ratio.
+    """
+    blockp1 = cfg.block + 1
+
+    easy_text = load_text_stream(cfg.easy_source, cfg.easy_samples)
+    hard_text = load_text_stream(cfg.hard_source, cfg.hard_samples)
+
+    def tokenize_and_chunk(text_list, max_chunks=None):
+        chunks = []
+        for t in text_list:
+            if not isinstance(t, str) or len(t) == 0:
+                continue
+            ids = tokenizer(t, add_special_tokens=False)["input_ids"]
+            # chunk into block+1 sequences
+            for i in range(0, len(ids) - blockp1 + 1, blockp1):
+                chunks.append(ids[i:i+blockp1])
+                if max_chunks is not None and len(chunks) >= max_chunks:
+                    return chunks
+        return chunks
+
+    easy_chunks = tokenize_and_chunk(easy_text, max_chunks=cfg.max_easy_chunks)
+    hard_chunks = tokenize_and_chunk(hard_text, max_chunks=cfg.max_hard_chunks)
+
+    if cfg.max_chunks is not None:
+        # cap total chunks if you already use cfg.max_chunks elsewhere
+        max_total = cfg.max_chunks
+    else:
+        max_total = None
+
+    # determine how many to take from each source
+    if max_total is None:
+        # take as much as possible while respecting ratio based on available hard/easy
+        # choose total based on limiting source
+        # total_easy = r*T, total_hard = (1-r)*T -> T <= easy/r and T <= hard/(1-r)
+        r = float(cfg.easy_ratio)
+        T1 = int(len(easy_chunks) / max(r, 1e-9))
+        T2 = int(len(hard_chunks) / max(1.0 - r, 1e-9))
+        T = min(T1, T2)
+    else:
+        T = max_total
+
+    n_easy = int(round(cfg.easy_ratio * T))
+    n_hard = T - n_easy
+
+    # safety: clip to availability
+    n_easy = min(n_easy, len(easy_chunks))
+    n_hard = min(n_hard, len(hard_chunks))
+
+    mixed = easy_chunks[:n_easy] + hard_chunks[:n_hard]
+    rng = np.random.default_rng(cfg.seed)
+    rng.shuffle(mixed)
+
+    return mixed
+
 
 
 class MixedLMDataset(Dataset):

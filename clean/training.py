@@ -1,20 +1,83 @@
 # training.py
 from __future__ import annotations
 
-from calendar import c
 import math
 import random
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
-from torch import nn
+from torch import mode, nn
 
 from tqdm import tqdm
 
 from config import Config
 from data import make_index_loader, MixedLMDataset
-from model import TinyGPT, AttentionRouter, extract_hierarchical_features
+from model import TinyGPT, extract_hierarchical_features
 from metrics import MetricsTracker, DiversityTracker
+import math
+
+
+
+def normalize_advantage(x: torch.Tensor, mode: str, eps: float, clip: float | None):
+    """
+    x: [K] reward-like tensor for selected samples.
+    Returns normalized advantage.
+    """
+    if mode == "none":
+        adv = x
+    elif mode == "center":
+        adv = x - x.mean()
+    elif mode == "zscore":
+        adv = (x - x.mean()) / (x.std(unbiased=False) + eps)
+    else:
+        raise ValueError(f"Unknown advantage_norm: {mode}")
+
+    if clip is not None:
+        adv = adv.clamp(-clip, clip)
+    return adv
+
+
+def scheduled_value(step: int, start: float, final_mult: float, warmup: int, anneal: int, schedule: str) -> float:
+    """
+    Returns a value that starts at `start` and anneals to `start * final_mult`.
+    - warmup: steps to hold constant at start
+    - anneal: steps over which to anneal (after warmup)
+    """
+    if schedule == "constant" or anneal <= 0:
+        return start
+
+    if step < warmup:
+        return start
+
+    t = min(1.0, (step - warmup) / float(anneal))
+    end = start * final_mult
+
+    if schedule == "linear":
+        return start + t * (end - start)
+    elif schedule == "exp":
+        # exponential interpolation in log-space (requires start > 0, end >= 0)
+        # If end == 0, approximate with a small floor to avoid log(0)
+        floor = 1e-12
+        a = max(start, floor)
+        b = max(end, floor)
+        return a * ((b / a) ** t)
+    else:
+        raise ValueError(f"Unknown schedule: {schedule}")
+
+
+def novelty_from_counts(counts: torch.Tensor, mode: str) -> torch.Tensor:
+    """
+    counts: int tensor [K] (how many times each selected dataset index was selected)
+    returns: float tensor [K] novelty bonus
+    """
+    if mode == "inv_sqrt":
+        return 1.0 / torch.sqrt(counts.float() + 1.0)
+    if mode == "exp":
+        return torch.exp(-counts.float())
+    if mode == "first_time":
+        return (counts == 0).float()
+    raise ValueError(f"Unknown novelty_mode: {mode}")
+
 
 
 def compute_loss_per_sample(
@@ -148,13 +211,13 @@ def train_baseline(
 def train_router(
     cfg: Config,
     model: TinyGPT,
-    router: AttentionRouter,
+    router: Optional[nn.Module],
     train_ds: MixedLMDataset,
     val_ds: MixedLMDataset,
     tokenizer,
     metrics: MetricsTracker,
     diversity: DiversityTracker,
-) -> Tuple[TinyGPT, AttentionRouter]:
+) -> Tuple[TinyGPT, Optional[nn.Module]]:
     
     if cfg.use_wandb:
         import wandb
@@ -166,15 +229,21 @@ def train_router(
         )
     
     model.to(cfg.device)
-    router.to(cfg.device)
+    if router is not None:
+        router.to(cfg.device)
     model.train()
-    router.train()
-
+    if router is not None:
+        router.train()
+    
     loss_fn = nn.CrossEntropyLoss()
     opt_lm = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
-    opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
+    opt_router = None
+    if router is not None:
+        opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
 
     total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
+    sel_counts = torch.zeros(len(train_ds), dtype=torch.int32)
+
     global_step = 0
 
     for epoch in range(cfg.epochs):
@@ -197,9 +266,14 @@ def train_router(
                 cfg=cfg,
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=tokenizer.vocab_size,
+                mode=cfg.feature_mode,
             )  # [M, d_in]
 
-            scores = router(feats)  # [M]
+            if router is None:
+                scores = torch.randn(feats.size(0), device=feats.device)
+            else:   
+                scores = router(feats)  # [M]
+                
             probs = torch.softmax(scores / cfg.temp, dim=0)  # [M]
 
             topk = torch.topk(probs, k=cfg.batch)
@@ -210,6 +284,22 @@ def train_router(
             Y_sel = Y[sel_idx_local]
             selected_diffs = [diffs[i] for i in sel_idx_local.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
+            
+            # Map pool positions -> global dataset indices
+            # pool_indices is usually a Python list of dataset indices
+            pool_idx_t = torch.as_tensor(pool_indices, dtype=torch.long)
+            sel_dataset_idx = pool_idx_t[sel_idx_local.detach().cpu()]  # [K] on CPU
+
+            # novelty bonus from counts BEFORE increment
+            if cfg.novelty_bonus > 0.0:
+                counts = sel_counts[sel_dataset_idx]  # [K]
+                nov = novelty_from_counts(counts, cfg.novelty_mode)  # [K] float on CPU
+            else:
+                nov = None
+
+            # update counts AFTER reading
+            sel_counts[sel_dataset_idx] += 1
+
 
             loss_before = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
 
@@ -222,18 +312,62 @@ def train_router(
             loss_lm.backward()
             opt_lm.step()
 
+            # ---- reward for router update (ablation-ready) ----
             loss_after = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
-            improvement = (loss_before - loss_after).clamp(min=0.0)
-            baseline = improvement.mean().detach()
 
-            reinforce = -((improvement - baseline) * sel_probs.log()).mean()
+            if cfg.reward_mode == "progress":
+                # Full method: learning progress
+                reward = (loss_before - loss_after).clamp(min=0.0).detach()
+            elif cfg.reward_mode == "neg_loss":
+                # Ablation A5: no progress, just prefer high/low loss depending on sign
+                # (reward = -loss_before encourages selecting LOWER-loss samples)
+                reward = (-loss_before).detach()
+            else:
+                raise ValueError(f"Unknown reward_mode: {cfg.reward_mode}")
+
+            if cfg.novelty_bonus > 0.0 and nov is not None:
+                eta = scheduled_value(
+                    step=global_step,
+                    start=cfg.novelty_bonus,
+                    final_mult=cfg.novelty_final_mult,
+                    warmup=0,
+                    anneal=cfg.entropy_anneal_steps if cfg.entropy_anneal_steps > 0 else 0,
+                    schedule=cfg.novelty_anneal,
+                )
+                reward = reward + eta * nov.to(device=reward.device, dtype=reward.dtype)
+
+            # Entropy (note: this is usually negative; keep same convention you had)
             ent = (probs * probs.clamp_min(1e-12).log()).sum()
+            
+            adv = normalize_advantage(
+                reward,
+                mode=cfg.advantage_norm,
+                eps=cfg.advantage_eps,
+                clip=cfg.advantage_clip,
+            )
+            
+            lam_ent = scheduled_value(
+                step=global_step,
+                start=cfg.lambda_ent,
+                final_mult=cfg.entropy_final_mult,
+                warmup=cfg.entropy_warmup_steps,
+                anneal=cfg.entropy_anneal_steps,
+                schedule=cfg.entropy_schedule,
+            )
 
-            loss_router = reinforce + cfg.lambda_ent * ent
+            # REINFORCE loss only if router is learnable
+            if router is not None:
+                reinforce = -(adv  * sel_probs.log()).mean()
+                loss_router = reinforce + lam_ent * ent
 
-            opt_router.zero_grad()
-            loss_router.backward()
-            opt_router.step()
+                opt_router.zero_grad()
+                loss_router.backward()
+                opt_router.step()
+            else:
+                loss_router = torch.tensor(0.0, device=probs.device)
+                reinforce = torch.tensor(0.0, device=probs.device)
+            improvement = (loss_before - loss_after)
+
 
             diversity.update(selected_indices, selected_diffs)
 
@@ -242,17 +376,35 @@ def train_router(
                 training_progress = global_step / total_steps
                 curriculum_strength = 1.0 - training_progress
                 div_metrics = diversity.get_metrics()
-                metrics.log(
-                    epoch=epoch,
-                    step=global_step,
-                    loss_lm=loss_lm.item(),
-                    loss_router=loss_router.item(),
-                    reinforce=reinforce.item(),
-                    entropy=-ent.item(),
-                    avg_improvement=improvement.mean().item(),
-                    curriculum_strength=curriculum_strength,
-                    **div_metrics,
-                )
+                if cfg.novelty_bonus > 0.0 and nov is not None:
+                    metrics.log(
+                        epoch=epoch,
+                        step=global_step,
+                        loss_lm=loss_lm.item(),
+                        loss_router=loss_router.item(),
+                        reinforce=reinforce.item(),
+                        entropy=-ent.item(),
+                        avg_improvement=improvement.mean().item(),
+                        curriculum_strength=curriculum_strength,
+                        lam_ent=lam_ent,
+                        novelty_bonus=eta,
+                        novelty_avg=nov.mean().item(),
+                        novelty_frac_first=(nov > 0).float().mean().item(),
+                        **div_metrics,
+                    )
+                else:
+                    metrics.log(
+                        epoch=epoch,
+                        step=global_step,
+                        loss_lm=loss_lm.item(),
+                        loss_router=loss_router.item(),
+                        reinforce=reinforce.item(),
+                        entropy=-ent.item(),
+                        avg_improvement=improvement.mean().item(),
+                        curriculum_strength=curriculum_strength,
+                        lam_ent=lam_ent,
+                        **div_metrics,
+                    )
                 
                 print(f"[Router] Step {global_step} - loss_lm={loss_lm.item():.4f}, loss_router={loss_router.item():.4f}")
 
