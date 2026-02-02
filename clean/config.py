@@ -58,18 +58,83 @@ class ExperimentConfig(Config):
     # Data mixing
     easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
     hard_proportion: float = 0.3  # Proportion of hard samples in mixed chunks
-    
+
+    # Dataset options by difficulty:
+    # Easy:   roneneldan/TinyStories, ajibawa-2023/Children-Stories-Collection,
+    #         wikipedia (simple), Salesforce/wikitext
+    # Medium: Geralt-Targaryen/openwebtext2, bookcorpus, HuggingFaceFW/fineweb-edu, allenai/c4
+    # Hard:   armanc/scientific_papers, CShorten/ML-ArXiv-Papers, bigcode/the-stack
     easy_dataset: str = "roneneldan/TinyStories"
     hard_dataset: str = "Geralt-Targaryen/openwebtext2"
     
     
-    # router choices
+    # Router architecture
     router_architecture: str = "mlp"  # options: attention, linear, mlp
-    
+
+    # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
-    
-    
-    reward_signal: str = "loss_improvement"  # options: loss_improvement, neg_loss
+
+    # Training algorithm
+    training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo
+
+    # Reward signal options:
+    #   - loss_improvement: (loss_before - loss_after).clamp(0) - reward progress
+    #   - neg_loss: -loss_after - prefer easier samples
+    #   - relative_improvement: (loss_before - loss_after) / loss_before - normalized
+    #   - difficulty_weighted: improvement * difficulty - reward harder samples more
+    #   - uncertainty_reduction: entropy_before - entropy_after - reward confidence gain
+    #   - combined: weighted sum of multiple signals
+    reward_signal: str = "loss_improvement"
+
+    # Weights for combined reward signal
+    reward_weight_improvement: float = 1.0
+    reward_weight_difficulty: float = 0.5
+    reward_weight_uncertainty: float = 0.3
+
+    # Selection strategy
+    selection_strategy: str = "topk"  # options: topk, sample, epsilon_greedy
+    epsilon_greedy: float = 0.1  # epsilon for epsilon_greedy selection
+
+    # Baseline for variance reduction (REINFORCE)
+    baseline_type: str = "batch_mean"  # options: batch_mean, moving_avg, none
+    baseline_momentum: float = 0.99  # momentum for moving_avg baseline
+
+    # Temperature schedule
+    temp_schedule: str = "fixed"  # options: fixed, linear_decay, cosine_decay
+    temp_min: float = 0.1  # minimum temperature for decay schedules
+
+    # Entropy coefficient schedule
+    # Options: fixed, linear_decay, cosine_decay, exponential_decay, cyclic, adaptive
+    entropy_schedule: str = "fixed"
+    lambda_ent_min: float = 0.001  # minimum entropy coefficient for decay
+    entropy_cycle_length: int = 1000  # steps per cycle for cyclic schedule
+
+    # Entropy formulation
+    # Options: shannon, renyi, tsallis, kl_uniform
+    entropy_type: str = "shannon"
+    entropy_alpha: float = 2.0  # Rényi entropy parameter (alpha > 0, != 1)
+    entropy_q: float = 2.0  # Tsallis entropy parameter (q > 0)
+
+    # Entropy targeting (SAC-style)
+    # When enabled, automatically adjusts lambda_ent to maintain target entropy
+    use_entropy_targeting: bool = False
+    target_entropy_ratio: float = 0.5  # target = ratio * max_entropy
+    entropy_lr: float = 1e-3  # learning rate for entropy coefficient
+
+    # Coverage regularization
+    # Encourages the router to select diverse samples over time
+    use_coverage_regularization: bool = False
+    coverage_type: str = "count"  # options: count, recency, uncertainty
+    lambda_coverage: float = 0.01  # weight for coverage regularization
+    coverage_decay: float = 0.99  # decay factor for recency-based coverage
+    coverage_temperature: float = 1.0  # temperature for coverage bonus
+
+    # PPO specific
+    ppo_clip: float = 0.2  # PPO clipping parameter
+    ppo_epochs: int = 4  # number of PPO update epochs per batch
+
+    # GRPO specific
+    grpo_group_size: int = 4  # number of groups for GRPO
     
     
