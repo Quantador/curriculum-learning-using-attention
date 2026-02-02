@@ -20,7 +20,7 @@ class Config:
     # Training
     batch: int = 16
     pool_mult: int = 5
-    epochs: int = 10
+    epochs: int = 5
     lr_lm: float = 3e-4
     lr_router: float = 1e-3
     temp: float = 1.0
@@ -41,3 +41,35 @@ class Config:
     @property
     def pool(self) -> int:
         return self.pool_mult * self.batch
+    
+    
+    
+    
+@dataclass
+
+class ExperimentConfig(Config):
+    experiment_name: str = "mlp_router_experiment"
+    
+    wanb_project: str = "curriculum-learning-"+experiment_name
+    
+    save_dir: str = "results/" + experiment_name
+
+
+    # Data mixing
+    easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
+    hard_proportion: float = 0.3  # Proportion of hard samples in mixed chunks
+    
+    easy_dataset: str = "roneneldan/TinyStories"
+    hard_dataset: str = "Geralt-Targaryen/openwebtext2"
+    
+    
+    # router choices
+    router_architecture: str = "mlp"  # options: attention, linear, mlp
+    
+    enable_text_stat: bool = True
+    enable_text_hierarchical: bool = True
+    
+    
+    reward_signal: str = "loss_improvement"  # options: loss_improvement, neg_loss
+    
+    

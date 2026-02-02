@@ -57,28 +57,6 @@ class AttentionRouter(nn.Module):
         return keys @ self.q     # [B]
 
 
-class LinearRouter(nn.Module):
-    def __init__(self, d_input: int):
-        super().__init__()
-        self.fc = nn.Linear(d_input, 1)
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        return self.fc(feats).squeeze(-1)
-
-
-class MLPRouter(nn.Module):
-    def __init__(self, d_input: int, d_hidden: int = 256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_input, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, 1),
-        )
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        return self.net(feats).squeeze(-1)
-
-
 def compute_text_statistics(
     X: torch.Tensor,
     pad_token_id: int,
@@ -143,70 +121,4 @@ def extract_hierarchical_features(
     return torch.cat([pooled, stats], dim=1)
 
 
-def extract_router_features(
-    model: TinyGPT,
-    X: torch.Tensor,
-    cfg: Config,
-    pad_token_id: int,
-    vocab_size: int,
-    mode: str = "full",
-) -> torch.Tensor:
-    """
-    mode in {"full", "no_hidden", "no_stats", "no_hier", "random"}.
-    """
-    B = X.size(0)
-    stats = compute_text_statistics(
-        X,
-        pad_token_id=pad_token_id,
-        vocab_size=vocab_size,
-        block=cfg.block,
-    )
 
-    with torch.no_grad():
-        h = model.forward_to_hidden(X)  # [B, L, D]
-    B_h, L, D = h.shape
-    assert B_h == B
-
-    if mode == "random":
-        full_dim = cfg.n_chunks * cfg.d_model + 4
-        return torch.randn(B, full_dim, device=X.device)
-
-    if mode in {"full", "no_stats"}:
-        hidden_feat = extract_hierarchical_hidden(model, X, cfg)  # [B, n_chunks*D]
-    elif mode == "no_hier":
-        hidden_feat = h.mean(dim=1)  # [B, D]
-    elif mode == "no_hidden":
-        hidden_feat = None
-    else:
-        raise ValueError(f"Unknown feature mode: {mode}")
-
-    feats = []
-    if hidden_feat is not None and mode != "no_hidden":
-        feats.append(hidden_feat)
-    if mode != "no_stats":
-        feats.append(stats)
-
-    if len(feats) == 1:
-        return feats[0]
-    return torch.cat(feats, dim=1)
-
-
-def build_router(
-    d_input: int,
-    arch: str = "attention",
-    d_k: int = 128,
-    d_hidden: int = 256,
-) -> nn.Module | None:
-    """
-    arch in {"attention", "linear", "mlp", "random"}.
-    "random" returns None (scores will be random in training code).
-    """
-    if arch == "attention":
-        return AttentionRouter(d_input=d_input, d_k=d_k)
-    if arch == "linear":
-        return LinearRouter(d_input=d_input)
-    if arch == "mlp":
-        return MLPRouter(d_input=d_input, d_hidden=d_hidden)
-    if arch == "random":
-        return None
-    raise ValueError(f"Unknown router arch: {arch}")

@@ -38,6 +38,14 @@ class MetricsTracker:
         if not vals:
             return None
         return vals[-1]
+    
+    def load(path: str | Path) -> MetricsTracker:
+        path = Path(path)
+        with path.open("r") as f:
+            history = json.load(f)
+        tracker = MetricsTracker(name=path.stem)
+        tracker.history = {k: v for k, v in history.items()}
+        return tracker
 
 
 class DiversityTracker:
@@ -98,3 +106,4 @@ class DiversityTracker:
             "easy_ratio": easy_ratio,
             "hard_ratio": hard_ratio,
         }
+        
