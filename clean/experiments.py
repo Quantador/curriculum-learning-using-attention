@@ -20,11 +20,12 @@ from trainingExperiments import *
 # Format: field_name -> (baseline_value, [alternative_values])
 EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # Router architecture
-    "router_architecture": ("mlp", ["attention", "linear"]),
+    "router_architecture": ("attention", ["mlp", "linear"]),
 
     # Router features
     "enable_text_stat": (True, [False]),
     "enable_text_hierarchical": (True, [False]),
+    "hierarchical_representation": ("full", ["embedder"]),
 
     # Training algorithm
     "training_algorithm": ("reinforce", ["grpo", "ppo"]),
@@ -106,7 +107,7 @@ def run_experiment():
 
     model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
     router = build_router(
-        d_input=cfg.n_chunks * cfg.d_model + 4,
+        d_input=get_router_feature_dim(cfg),
         arch=cfg.router_architecture,
         d_k=128,
     )
@@ -146,6 +147,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     print(f"  router_architecture: {cfg.router_architecture}")
     print(f"  enable_text_stat: {cfg.enable_text_stat}")
     print(f"  enable_text_hierarchical: {cfg.enable_text_hierarchical}")
+    print(f"  hierarchical_representation: {cfg.hierarchical_representation}")
     print(f"  training_algorithm: {cfg.training_algorithm}")
     print(f"  reward_signal: {cfg.reward_signal}")
     print(f"  selection_strategy: {cfg.selection_strategy}")
@@ -160,7 +162,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
 
     model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
     router = build_router(
-        d_input=cfg.n_chunks * cfg.d_model + 4,
+        d_input=get_router_feature_dim(cfg),
         arch=cfg.router_architecture,
         d_k=128,
     )

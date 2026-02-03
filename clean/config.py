@@ -6,9 +6,9 @@ import torch
 class Config:
     # Data
     block: int = 256
-    easy_samples: int = 10_000
-    hard_samples: int = 2_000
-    max_chunks: int = 20_000
+    easy_samples: int = 10_00
+    hard_samples: int = 2_00
+    max_chunks: int = 20_00
 
     # Model
     d_model: int = 512
@@ -16,11 +16,14 @@ class Config:
     n_heads: int = 8
     d_ff: int = 2048
     n_chunks: int = 8
+    # Hierarchical feature source
+    # options: full (transformer hidden), embedder (token+pos embeddings)
+    hierarchical_representation: str = "full"
 
     # Training
     batch: int = 16
     pool_mult: int = 5
-    epochs: int = 5
+    epochs: int = 1
     lr_lm: float = 3e-4
     lr_router: float = 1e-3
     temp: float = 1.0

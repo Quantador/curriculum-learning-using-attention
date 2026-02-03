@@ -43,16 +43,20 @@ Runs one-factor-at-a-time experiments where each experiment varies only ONE fiel
 python experiments.py --all
 ```
 
-**Current ablation experiments (~26 total):**
+**Current ablation experiments (~35 total):**
 - 1 baseline
 - 2 router architectures (attention, linear)
-- 2 router features (disable text_stat, disable hierarchical)
+- 3 router feature variants (disable text_stat, disable hierarchical, embedder-only hierarchy)
 - 2 training algorithms (grpo, ppo)
 - 5 reward signals (neg_loss, relative_improvement, difficulty_weighted, uncertainty_reduction, combined)
 - 2 selection strategies (sample, epsilon_greedy)
 - 2 baseline types (moving_avg, none)
 - 2 temperature schedules (linear_decay, cosine_decay)
-- 1 entropy schedule (linear_decay)
+- 4 entropy schedules (linear_decay, cosine_decay, exponential_decay, cyclic)
+- 3 entropy formulations (renyi, tsallis, kl_uniform)
+- 1 entropy targeting toggle
+- 1 coverage regularization toggle
+- 2 coverage types (recency, uncertainty)
 - 2 easy datasets (Children-Stories, WikiText)
 - 3 hard datasets (scientific_papers, ML-ArXiv, fineweb-edu)
 
@@ -97,6 +101,9 @@ python experiments.py --combinations --field training_algorithm --field reward_s
 |-------|----------|-------------|
 | `enable_text_stat` | True | False |
 | `enable_text_hierarchical` | True | False |
+| `hierarchical_representation` | `full` | `embedder` |
+
+`hierarchical_representation=full` uses transformer hidden states, while `embedder` uses only token+positional embeddings.
 
 ### Training Algorithm
 | Value | Description |

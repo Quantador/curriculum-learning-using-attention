@@ -94,7 +94,15 @@ def extract_hierarchical_hidden(
     cfg: Config,
 ) -> torch.Tensor:
     with torch.no_grad():
-        h = model.forward_to_hidden(X)  # [B, L, D]
+        repr_mode = getattr(cfg, "hierarchical_representation", "full")
+        if repr_mode == "full":
+            h = model.forward_to_hidden(X)  # [B, L, D]
+        elif repr_mode == "embedder":
+            b, L = X.size()
+            pos = torch.arange(L, device=X.device).unsqueeze(0).expand(b, L)
+            h = model.tok_embed(X) + model.pos_embed(pos)
+        else:
+            raise ValueError(f"Unknown hierarchical_representation: {repr_mode}")
     B, L, D = h.shape
     assert L % cfg.n_chunks == 0, "Sequence length must be divisible by n_chunks"
     chunk_len = L // cfg.n_chunks

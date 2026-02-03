@@ -60,6 +60,21 @@ def extract_router_features(
     return torch.cat(features, dim=1)  # [B, F]
 
 
+def get_router_feature_dim(cfg: ExperimentConfig) -> int:
+    """
+    Compute feature dimensionality based on enabled feature flags.
+    """
+    full_dim = cfg.n_chunks * cfg.d_model + 4
+    if not cfg.enable_text_hierarchical and not cfg.enable_text_stat:
+        return full_dim
+    dim = 0
+    if cfg.enable_text_hierarchical:
+        dim += cfg.n_chunks * cfg.d_model
+    if cfg.enable_text_stat:
+        dim += 4
+    return dim
+
+
 
 def build_router(
     d_input: int,
