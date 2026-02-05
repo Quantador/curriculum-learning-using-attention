@@ -22,6 +22,7 @@ python experiments.py --all
 | `--all` | Run all ablation experiments (one-factor-at-a-time) |
 | `--combinations` | Run full grid search of all combinations (warning: many experiments!) |
 | `--field FIELD` | Run experiments for specific field(s) only (can be repeated) |
+| `--profile PROFILE` | Run a predefined experiment profile (e.g., `final_presentation`) |
 | `--no-baseline` | Skip the baseline experiment |
 | `--list` | List experiments without running them |
 
@@ -43,12 +44,12 @@ Runs one-factor-at-a-time experiments where each experiment varies only ONE fiel
 python experiments.py --all
 ```
 
-**Current ablation experiments (~35 total):**
+**Current ablation experiments (~37 total):**
 - 1 baseline
-- 2 router architectures (attention, linear)
+- 2 router architectures (mlp, linear)
 - 3 router feature variants (disable text_stat, disable hierarchical, embedder-only hierarchy)
 - 2 training algorithms (grpo, ppo)
-- 5 reward signals (neg_loss, relative_improvement, difficulty_weighted, uncertainty_reduction, combined)
+- 7 reward signals (neg_loss, relative_improvement, difficulty_weighted, uncertainty_reduction, gradient_norm, gradient_alignment, combined)
 - 2 selection strategies (sample, epsilon_greedy)
 - 2 baseline types (moving_avg, none)
 - 2 temperature schedules (linear_decay, cosine_decay)
@@ -92,8 +93,8 @@ python experiments.py --combinations --field training_algorithm --field reward_s
 ### Router Architecture
 | Value | Description |
 |-------|-------------|
-| `mlp` (baseline) | Multi-layer perceptron router |
-| `attention` | Attention-based router |
+| `attention` (baseline) | Attention-based router |
+| `mlp` | Multi-layer perceptron router |
 | `linear` | Simple linear router |
 
 ### Router Features
@@ -120,6 +121,8 @@ python experiments.py --combinations --field training_algorithm --field reward_s
 | `relative_improvement` | `improvement / loss_before` | Normalized improvement |
 | `difficulty_weighted` | `improvement * (1 + difficulty)` | Reward harder samples more |
 | `uncertainty_reduction` | `entropy_before - entropy_after` | Reward confidence gain |
+| `gradient_norm` | `||∇θ L_LM(S_t)||` | Reward strong batch updates |
+| `gradient_alignment` | `<g_t, g_ema>` | Reward alignment with EMA gradient |
 | `combined` | Weighted sum | Multi-objective reward |
 
 ### Selection Strategy
@@ -226,6 +229,10 @@ python experiments.py --field easy_dataset --field hard_dataset
 # Full ablation study
 python experiments.py --all
 
+# Final presentation profile (curated subset)
+python experiments.py --profile final_presentation
+python experiments.py --list --profile final_presentation
+
 # Training algorithm x reward signal grid
 python experiments.py --combinations --field training_algorithm --field reward_signal
 ```
@@ -275,6 +282,10 @@ grpo_group_size: int = 4
 reward_weight_improvement: float = 1.0
 reward_weight_difficulty: float = 0.5
 reward_weight_uncertainty: float = 0.3
+
+# Gradient-based reward
+gradient_ema_momentum: float = 0.9
+gradient_reward_clip: float | None = 10.0
 ```
 
 ## Adding New Experiments

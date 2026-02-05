@@ -34,6 +34,8 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
         "relative_improvement",
         "difficulty_weighted",
         "uncertainty_reduction",
+        "gradient_norm",
+        "gradient_alignment",
         "combined",
     ]),
 
@@ -72,6 +74,38 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
         "HuggingFaceFW/fineweb-edu",
     ]),
 }
+
+# Predefined experiment profiles (subset of ablations)
+FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
+    # Neg loss, gradient magnitude
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["neg_loss", "gradient_norm"]),
+    # GRPO, PPO
+    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "ppo"]),
+    # Shannon fixed vs Shannon with decay (linear)
+    "entropy_schedule": (EXPERIMENTAL_FIELDS["entropy_schedule"][0], ["linear_decay"]),
+    # Coverage bonus
+    "use_coverage_regularization": (EXPERIMENTAL_FIELDS["use_coverage_regularization"][0], [True]),
+    # Top-k (baseline), sampling, sigma-greedy (epsilon_greedy)
+    "selection_strategy": (EXPERIMENTAL_FIELDS["selection_strategy"][0], ["sample", "epsilon_greedy"]),
+}
+
+EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
+    "final_presentation": FINAL_PRESENTATION_FIELDS,
+    "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
+}
+
+
+def get_profile_fields(profile: str | None) -> Dict[str, tuple[Any, List[Any]]] | None:
+    if not profile:
+        return None
+    if profile in EXPERIMENT_PROFILES:
+        return EXPERIMENT_PROFILES[profile]
+    normalized = profile.replace("-", "_").replace(" ", "_")
+    if normalized in EXPERIMENT_PROFILES:
+        return EXPERIMENT_PROFILES[normalized]
+    raise ValueError(
+        f"Unknown profile '{profile}'. Available: {', '.join(sorted(set(EXPERIMENT_PROFILES.keys())))}"
+    )
 
 
 def set_seed(seed: int):
@@ -396,6 +430,11 @@ if __name__ == "__main__":
              f"Options: {', '.join(EXPERIMENTAL_FIELDS.keys())}"
     )
     parser.add_argument(
+        "--profile",
+        type=str,
+        help="Run a predefined experiment profile (e.g., final_presentation)"
+    )
+    parser.add_argument(
         "--no-baseline",
         action="store_true",
         help="Skip the baseline experiment"
@@ -409,8 +448,19 @@ if __name__ == "__main__":
 
     if args.list:
         # Just list the experiments
+        if args.profile and args.field:
+            print("Error: --profile and --field cannot be used together.")
+            exit(1)
+
+        try:
+            profile_fields = get_profile_fields(args.profile)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            exit(1)
         if args.field:
             selected_fields = {k: v for k, v in EXPERIMENTAL_FIELDS.items() if k in args.field}
+        elif profile_fields is not None:
+            selected_fields = profile_fields
         else:
             selected_fields = EXPERIMENTAL_FIELDS
 
@@ -428,12 +478,23 @@ if __name__ == "__main__":
             print(f"  {i}. {cfg.experiment_name}")
         print()
 
-    elif args.all or args.field or args.combinations:
+    elif args.all or args.field or args.combinations or args.profile:
+        if args.profile and args.field:
+            print("Error: --profile and --field cannot be used together.")
+            exit(1)
+
+        try:
+            profile_fields = get_profile_fields(args.profile)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            exit(1)
         if args.field:
             selected_fields = {k: v for k, v in EXPERIMENTAL_FIELDS.items() if k in args.field}
             if not selected_fields:
                 print(f"Error: No valid fields specified. Available: {list(EXPERIMENTAL_FIELDS.keys())}")
                 exit(1)
+        elif profile_fields is not None:
+            selected_fields = profile_fields
         else:
             selected_fields = None
 

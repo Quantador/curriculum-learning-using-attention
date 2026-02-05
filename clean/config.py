@@ -6,9 +6,9 @@ import torch
 class Config:
     # Data
     block: int = 256
-    easy_samples: int = 10_00
-    hard_samples: int = 2_00
-    max_chunks: int = 20_00
+    easy_samples: int = 100_000
+    hard_samples: int = 20_000
+    max_chunks: int = 500_000
 
     # Model
     d_model: int = 512
@@ -23,7 +23,7 @@ class Config:
     # Training
     batch: int = 16
     pool_mult: int = 5
-    epochs: int = 1
+    epochs: int = 10
     lr_lm: float = 3e-4
     lr_router: float = 1e-3
     temp: float = 1.0
@@ -36,7 +36,7 @@ class Config:
 
     # Logging
     use_wandb: bool = True
-    wandb_project: str = "curriculum-learning"
+    wandb_project: str = "curriculum-learning-final"
     wandb_entity: str | None = None
     save_dir: str = "results"
     log_every: int = 100
@@ -51,9 +51,9 @@ class Config:
 @dataclass
 
 class ExperimentConfig(Config):
-    experiment_name: str = "mlp_router_experiment"
+    experiment_name: str = "default_experiment"
     
-    wanb_project: str = "curriculum-learning-"+experiment_name
+    wandb_project: str = "curriculum-learning-"+experiment_name
     
     save_dir: str = "results/" + experiment_name
 
@@ -72,7 +72,7 @@ class ExperimentConfig(Config):
     
     
     # Router architecture
-    router_architecture: str = "mlp"  # options: attention, linear, mlp
+    router_architecture: str = "attention"  # options: attention, linear, mlp
 
     # Router features
     enable_text_stat: bool = True
@@ -87,6 +87,8 @@ class ExperimentConfig(Config):
     #   - relative_improvement: (loss_before - loss_after) / loss_before - normalized
     #   - difficulty_weighted: improvement * difficulty - reward harder samples more
     #   - uncertainty_reduction: entropy_before - entropy_after - reward confidence gain
+    #   - gradient_norm: ||∇θ L_LM(S_t)|| - batch gradient magnitude
+    #   - gradient_alignment: <g_t, g_ema> - alignment with EMA gradient
     #   - combined: weighted sum of multiple signals
     reward_signal: str = "loss_improvement"
 
@@ -94,6 +96,10 @@ class ExperimentConfig(Config):
     reward_weight_improvement: float = 1.0
     reward_weight_difficulty: float = 0.5
     reward_weight_uncertainty: float = 0.3
+
+    # Gradient-based reward settings
+    gradient_ema_momentum: float = 0.9
+    gradient_reward_clip: float | None = 10.0
 
     # Selection strategy
     selection_strategy: str = "topk"  # options: topk, sample, epsilon_greedy

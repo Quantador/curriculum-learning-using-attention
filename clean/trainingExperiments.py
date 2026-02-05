@@ -488,6 +488,53 @@ def compute_entropy_per_sample(logits: torch.Tensor) -> torch.Tensor:
     return entropy.mean(dim=1)  # [B]
 
 
+def compute_gradient_reward(
+    params: list[torch.nn.Parameter],
+    grad_ema: list[torch.Tensor] | None,
+    reward_signal: str,
+    ema_momentum: float,
+    param_count: int,
+    clip: float | None = None,
+) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
+    """
+    Compute scalar gradient-based reward from current LM gradients.
+
+    Uses either L2 norm (gradient_norm) or alignment with EMA (gradient_alignment).
+    """
+    if reward_signal not in ("gradient_norm", "gradient_alignment"):
+        return None, grad_ema
+    if not params:
+        return None, grad_ema
+
+    device = params[0].device
+    grad_norm_sq = torch.zeros((), device=device)
+    dot = torch.zeros((), device=device) if reward_signal == "gradient_alignment" else None
+
+    if reward_signal == "gradient_alignment" and grad_ema is None:
+        grad_ema = [torch.zeros_like(p, device=p.device) for p in params]
+
+    for i, p in enumerate(params):
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        grad_norm_sq = grad_norm_sq + (g * g).sum()
+        if reward_signal == "gradient_alignment":
+            dot = dot + (g * grad_ema[i]).sum()
+            grad_ema[i] = ema_momentum * grad_ema[i] + (1 - ema_momentum) * g
+
+    grad_norm = grad_norm_sq.sqrt()
+    if param_count > 0:
+        scale = math.sqrt(param_count)
+        grad_norm = grad_norm / scale
+        if reward_signal == "gradient_alignment":
+            dot = dot / float(param_count)
+
+    reward = grad_norm if reward_signal == "gradient_norm" else dot
+    if clip is not None and clip > 0:
+        reward = reward.clamp(min=-clip, max=clip)
+    return reward, grad_ema
+
+
 def compute_reward(
     loss_before: torch.Tensor,
     loss_after: torch.Tensor,
@@ -495,6 +542,7 @@ def compute_reward(
     difficulty: torch.Tensor | None = None,
     entropy_before: torch.Tensor | None = None,
     entropy_after: torch.Tensor | None = None,
+    gradient_reward: torch.Tensor | None = None,
     cfg: ExperimentConfig | None = None,
 ) -> torch.Tensor:
     """
@@ -507,6 +555,7 @@ def compute_reward(
         difficulty: Per-sample difficulty scores [B] (optional)
         entropy_before: Per-sample entropy before update [B] (optional)
         entropy_after: Per-sample entropy after update [B] (optional)
+        gradient_reward: Scalar or per-sample gradient reward (optional)
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -541,6 +590,13 @@ def compute_reward(
             entropy_reduction = (entropy_before - entropy_after).clamp(min=0.0)
             return entropy_reduction
         return improvement
+
+    elif reward_signal in ("gradient_norm", "gradient_alignment"):
+        if gradient_reward is None:
+            return torch.zeros_like(loss_before)
+        if gradient_reward.dim() == 0:
+            return gradient_reward.expand_as(loss_before)
+        return gradient_reward
 
     elif reward_signal == "combined":
         # Weighted combination of multiple signals
@@ -798,6 +854,10 @@ def train_router_experiments(
     opt_lm = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
     opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
 
+    grad_params = [p for p in model.parameters() if p.requires_grad]
+    grad_param_count = sum(p.numel() for p in grad_params)
+    grad_ema = None
+
     # Initialize moving average baseline if needed
     moving_avg_baseline = None
     if cfg.baseline_type == "moving_avg":
@@ -907,6 +967,17 @@ def train_router_experiments(
             )
 
             loss_lm.backward()
+
+            gradient_reward = None
+            if cfg.reward_signal in ("gradient_norm", "gradient_alignment"):
+                gradient_reward, grad_ema = compute_gradient_reward(
+                    params=grad_params,
+                    grad_ema=grad_ema,
+                    reward_signal=cfg.reward_signal,
+                    ema_momentum=cfg.gradient_ema_momentum,
+                    param_count=grad_param_count,
+                    clip=cfg.gradient_reward_clip,
+                )
             opt_lm.step()
 
             # loss and entropy AFTER update
@@ -926,6 +997,7 @@ def train_router_experiments(
                 difficulty=difficulty_tensor,
                 entropy_before=entropy_before,
                 entropy_after=entropy_after,
+                gradient_reward=gradient_reward,
                 cfg=cfg,
             )
 

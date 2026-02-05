@@ -28,7 +28,7 @@ def load_mixed_dataset(cfg: Config):
     print(f"Loading TinyStories (easy)... target: {cfg.easy_samples} samples")
     easy_ds = load_dataset("roneneldan/TinyStories", split=f"train[0:{cfg.easy_samples}]")
 
-    print(f"Loading OpenWebText (hard)... target: {cfg.hard_samples} samples")
+    print(f"Loading FineWeb (hard)... target: {cfg.hard_samples} samples")
     hard_ds = load_dataset("Geralt-Targaryen/openwebtext2", split=f"train[0:{cfg.hard_samples}]")
 
     print(f"✓ Loaded {len(easy_ds)} easy samples")
