@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from typing import Tuple
 
 import torch
@@ -953,6 +954,8 @@ def train_router_experiments(
             feature_cache = build_feature_cache(model, train_ds, cfg)
 
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
+        epoch_start = time.perf_counter()
+        total_feat_time = 0.0
 
         for pool_indices in tqdm(idx_loader):
             if len(pool_indices) < cfg.batch:
@@ -983,6 +986,7 @@ def train_router_experiments(
             Y = torch.stack(ys).to(cfg.device)  # [M, L]
 
             # --- Router features over the full pool ---
+            feat_start = time.perf_counter()
             if feature_cache is not None:
                 hidden_feats = feature_cache[pool_indices].to(cfg.device).float()
                 if cfg.enable_text_stat:
@@ -1003,6 +1007,7 @@ def train_router_experiments(
                     pad_token_id=tokenizer.pad_token_id,
                     vocab_size=tokenizer.vocab_size,
                 )  # [M, F]
+            total_feat_time += time.perf_counter() - feat_start
 
             scores = router(feats)  # [M]
             probs = torch.softmax(scores / current_temp, dim=0)  # [M]
@@ -1179,8 +1184,10 @@ def train_router_experiments(
                     "curriculum_strength": curriculum_strength,
                     "temperature": current_temp,
                     "lambda_ent": current_lambda_ent,
+                    "feat_time_ms": total_feat_time / cfg.log_every * 1000,
                     **diversity.get_metrics(),
                 }
+                total_feat_time = 0.0
 
                 # Add coverage stats if enabled
                 if coverage_tracker is not None:
@@ -1199,16 +1206,19 @@ def train_router_experiments(
         loss_fn = nn.CrossEntropyLoss()
         val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
 
+        epoch_time = time.perf_counter() - epoch_start
         metrics.log(
             epoch=epoch,
             step=global_step,
             val_loss=val_loss,
             val_ppl=val_ppl,
+            epoch_time_s=epoch_time,
         )
 
         print(
             f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
-            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
+            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
+            f"epoch_time={epoch_time:.1f}s"
         )
 
     if cfg.use_wandb:
@@ -1218,12 +1228,21 @@ def train_router_experiments(
     return model, router
 
 
+def _avg_epoch_time(metrics: MetricsTracker) -> float | None:
+    times = metrics.history.get("epoch_time_s")
+    if not times:
+        return None
+    # Skip epoch 0 — cache is never active then and it skews the average
+    relevant = times[1:] if len(times) > 1 else times
+    return sum(relevant) / len(relevant)
+
+
 def compare_runs_experiments(
     baseline_metrics: MetricsTracker,
     router_metrics: MetricsTracker,
     experiment_metrics: MetricsTracker,
 ) -> None:
-    """Compare final validation perplexity across runs."""
+    """Compare final validation perplexity and training speed across runs."""
     base_ppl = baseline_metrics.get_final_ppl()
     router_ppl = router_metrics.get_final_ppl()
     experiment_ppl = experiment_metrics.get_final_ppl()
@@ -1235,7 +1254,17 @@ def compare_runs_experiments(
     router_gain = (base_ppl - router_ppl) / base_ppl * 100.0
     experiment_gain = (base_ppl - experiment_ppl) / base_ppl * 100.0
 
-    print("\n=== Comparison ===")
+    print("\n=== Performance ===")
     print(f"Baseline   val_ppl: {base_ppl:.1f}")
-    print(f"Router     val_ppl: {router_ppl:.1f} ({router_gain:.2f}%)")
-    print(f"Experiment val_ppl: {experiment_ppl:.1f} ({experiment_gain:.2f}%)")
+    print(f"Router     val_ppl: {router_ppl:.1f} ({router_gain:+.2f}%)")
+    print(f"Experiment val_ppl: {experiment_ppl:.1f} ({experiment_gain:+.2f}%)")
+
+    router_time = _avg_epoch_time(router_metrics)
+    experiment_time = _avg_epoch_time(experiment_metrics)
+
+    if router_time is not None and experiment_time is not None:
+        speedup = router_time / experiment_time
+        time_saved = (router_time - experiment_time) / router_time * 100.0
+        print("\n=== Speed (avg epoch time, excl. epoch 0) ===")
+        print(f"Router     : {router_time:.1f}s / epoch")
+        print(f"Experiment : {experiment_time:.1f}s / epoch  ({speedup:.2f}x speedup, {time_saved:.1f}% faster)")

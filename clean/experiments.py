@@ -93,6 +93,7 @@ FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 }
 
 FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
+    # baseline=0 (no cache) is the reference; 2 is the experiment
     "feature_cache_epochs": (0, [2]),
 }
 
