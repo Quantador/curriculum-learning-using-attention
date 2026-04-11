@@ -28,7 +28,7 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "hierarchical_representation": ("full", ["embedder"]),
 
     # Training algorithm
-    "training_algorithm": ("reinforce", ["grpo", "ppo"]),
+    "training_algorithm": ("ppo", ["grpo", "reinforce"]),
     "reward_signal": ("loss_improvement", [
         "neg_loss",
         "relative_improvement",
@@ -83,7 +83,7 @@ FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # Neg loss, gradient magnitude
     "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["neg_loss", "gradient_norm"]),
     # GRPO, PPO
-    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "ppo"]),
+    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "reinforce"]),
     # Shannon fixed vs Shannon with decay (linear)
     "entropy_schedule": (EXPERIMENTAL_FIELDS["entropy_schedule"][0], ["linear_decay"]),
     # Coverage bonus

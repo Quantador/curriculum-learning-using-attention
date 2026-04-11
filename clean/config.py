@@ -51,7 +51,7 @@ class Config:
 @dataclass
 
 class ExperimentConfig(Config):
-    experiment_name: str = "default_experiment"
+    experiment_name: str = "presentation_experiment"
     
     wandb_project: str = "curriculum-learning-"+experiment_name
     
