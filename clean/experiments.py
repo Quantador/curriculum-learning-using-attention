@@ -73,6 +73,9 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
         "CShorten/ML-ArXiv-Papers",
         "HuggingFaceFW/fineweb-edu",
     ]),
+
+    # Feature caching
+    "feature_cache_epochs": (0, [1, 2]),
 }
 
 # Predefined experiment profiles (subset of ablations)
@@ -89,9 +92,14 @@ FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "selection_strategy": (EXPERIMENTAL_FIELDS["selection_strategy"][0], ["sample", "epsilon_greedy"]),
 }
 
+FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
+    "feature_cache_epochs": (0, [2]),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
+    "feature_cache": FEATURE_CACHE_FIELDS,
 }
 
 

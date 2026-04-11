@@ -145,5 +145,13 @@ class ExperimentConfig(Config):
 
     # GRPO specific
     grpo_group_size: int = 4  # number of groups for GRPO
-    
-    
+
+    # Feature caching
+    # 0 = disabled (recompute every step), n = rebuild cache every n epochs
+    # Cache is never built during epoch 0 (features are noise early on)
+    feature_cache_epochs: int = 0
+    feature_cache_batch_size: int = 64
+    # Path to save/load the cache on disk as a .pt file (fp16)
+    # Empty string = keep in CPU RAM only, no disk persistence
+    feature_cache_path: str = ""
+

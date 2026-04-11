@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Tuple
 
 import torch
@@ -10,7 +11,7 @@ from tqdm import tqdm
 
 from config import ExperimentConfig
 from data import make_index_loader, MixedLMDataset
-from model import TinyGPT, AttentionRouter
+from model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from metrics import MetricsTracker, DiversityTracker
 from training import evaluate  # keep using your existing evaluate()
 from modelExperiments import extract_router_features
@@ -822,6 +823,56 @@ def ppo_update(
     return total_loss / n, total_policy_loss / n, total_entropy / n
 
 
+def build_feature_cache(
+    model: TinyGPT,
+    train_ds: MixedLMDataset,
+    cfg: ExperimentConfig,
+) -> torch.Tensor:
+    """
+    Precompute hierarchical hidden features for all training samples.
+
+    Runs the full transformer (no grad) over the dataset in batches and stores
+    the chunk-pooled hidden states as a fp16 CPU tensor of shape [N, n_chunks * d_model].
+    If cfg.feature_cache_path is set, saves to disk and loads from there on the
+    next call (skipping the forward pass entirely).
+
+    Returns:
+        cache: [N, n_chunks * d_model] fp16 CPU tensor
+    """
+    expected_shape = (len(train_ds), cfg.n_chunks * cfg.d_model)
+
+    # Try loading from disk if a valid file already exists
+    if cfg.feature_cache_path and os.path.exists(cfg.feature_cache_path):
+        try:
+            cache = torch.load(cfg.feature_cache_path, map_location="cpu", weights_only=True)
+            if tuple(cache.shape) == expected_shape and cache.dtype == torch.float16:
+                print(f"[Cache] Loaded from {cfg.feature_cache_path}")
+                return cache
+            print(f"[Cache] Shape mismatch ({cache.shape} vs {expected_shape}), rebuilding...")
+        except Exception as e:
+            print(f"[Cache] Could not load ({e}), rebuilding...")
+
+    N, F = expected_shape
+    cache = torch.zeros(N, F, dtype=torch.float16)
+
+    model.eval()
+    with torch.no_grad():
+        for start in tqdm(range(0, N, cfg.feature_cache_batch_size), desc="Building feature cache"):
+            end = min(start + cfg.feature_cache_batch_size, N)
+            xs = [train_ds[i][0] for i in range(start, end)]
+            X = torch.stack(xs).to(cfg.device)
+            hidden = extract_hierarchical_hidden(model, X, cfg)  # [B, n_chunks * d_model]
+            cache[start:end] = hidden.cpu().half()
+    model.train()
+
+    if cfg.feature_cache_path:
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.feature_cache_path)), exist_ok=True)
+        torch.save(cache, cfg.feature_cache_path)
+        print(f"[Cache] Saved to {cfg.feature_cache_path}")
+
+    return cache
+
+
 def train_router_experiments(
     cfg: ExperimentConfig,
     model: TinyGPT,
@@ -888,7 +939,19 @@ def train_router_experiments(
     total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
     global_step = 0
 
+    # Feature cache: None until first rebuild (never built during epoch 0)
+    feature_cache: torch.Tensor | None = None
+
     for epoch in range(cfg.epochs):
+        # Rebuild cache at epoch 1, then every feature_cache_epochs epochs after that
+        if (
+            cfg.feature_cache_epochs > 0
+            and cfg.enable_text_hierarchical
+            and epoch > 0
+            and (epoch - 1) % cfg.feature_cache_epochs == 0
+        ):
+            feature_cache = build_feature_cache(model, train_ds, cfg)
+
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
         for pool_indices in tqdm(idx_loader):
@@ -920,13 +983,26 @@ def train_router_experiments(
             Y = torch.stack(ys).to(cfg.device)  # [M, L]
 
             # --- Router features over the full pool ---
-            feats = extract_router_features(
-                model=model,
-                X=X,
-                cfg=cfg,
-                pad_token_id=tokenizer.pad_token_id,
-                vocab_size=tokenizer.vocab_size,
-            )  # [M, F]
+            if feature_cache is not None:
+                hidden_feats = feature_cache[pool_indices].to(cfg.device).float()
+                if cfg.enable_text_stat:
+                    stats = compute_text_statistics(
+                        X,
+                        pad_token_id=tokenizer.pad_token_id,
+                        vocab_size=tokenizer.vocab_size,
+                        block=cfg.block,
+                    )
+                    feats = torch.cat([hidden_feats, stats], dim=1)
+                else:
+                    feats = hidden_feats
+            else:
+                feats = extract_router_features(
+                    model=model,
+                    X=X,
+                    cfg=cfg,
+                    pad_token_id=tokenizer.pad_token_id,
+                    vocab_size=tokenizer.vocab_size,
+                )  # [M, F]
 
             scores = router(feats)  # [M]
             probs = torch.softmax(scores / current_temp, dim=0)  # [M]
