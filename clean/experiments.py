@@ -8,7 +8,7 @@ from itertools import product
 from typing import Dict, List, Any
 
 from config import ExperimentConfig
-from data import get_tokenizer, make_mixed_chunks, MixedLMDataset
+from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
 from model import TinyGPT, AttentionRouter
 from metrics import MetricsTracker, DiversityTracker
 
@@ -154,11 +154,15 @@ def run_experiment():
     tokenizer = get_tokenizer()
 
     print("\n=== Building datasets ===")
-    train_chunks = make_mixed_chunks("train", cfg, tokenizer)
-    val_chunks = make_mixed_chunks("validation", cfg, tokenizer)
-
-    train_ds = MixedLMDataset(train_chunks)
-    val_ds = MixedLMDataset(val_chunks)
+    if cfg.use_single_dataset:
+        train_chunks, val_chunks, train_embs, val_embs = make_single_chunks(cfg, tokenizer)
+        train_ds = MixedLMDataset(train_chunks, embeddings=train_embs)
+        val_ds   = MixedLMDataset(val_chunks,   embeddings=val_embs)
+    else:
+        train_chunks = make_mixed_chunks("train", cfg, tokenizer)
+        val_chunks   = make_mixed_chunks("validation", cfg, tokenizer)
+        train_ds = MixedLMDataset(train_chunks)
+        val_ds   = MixedLMDataset(val_chunks)
 
     # Read baseline and router metrics from previous runs
     base_metrics = MetricsTracker.load(f"results/baseline_metrics.json")
@@ -391,11 +395,15 @@ def run_all_experiments(
     tokenizer = get_tokenizer()
 
     print("\n=== Building datasets ===")
-    train_chunks = make_mixed_chunks("train", base_cfg, tokenizer)
-    val_chunks = make_mixed_chunks("validation", base_cfg, tokenizer)
-
-    train_ds = MixedLMDataset(train_chunks)
-    val_ds = MixedLMDataset(val_chunks)
+    if base_cfg.use_single_dataset:
+        train_chunks, val_chunks, train_embs, val_embs = make_single_chunks(base_cfg, tokenizer)
+        train_ds = MixedLMDataset(train_chunks, embeddings=train_embs)
+        val_ds   = MixedLMDataset(val_chunks,   embeddings=val_embs)
+    else:
+        train_chunks = make_mixed_chunks("train", base_cfg, tokenizer)
+        val_chunks   = make_mixed_chunks("validation", base_cfg, tokenizer)
+        train_ds = MixedLMDataset(train_chunks)
+        val_ds   = MixedLMDataset(val_chunks)
 
     # Read baseline and router metrics from previous runs
     base_metrics = MetricsTracker.load("results/baseline_metrics.json")
