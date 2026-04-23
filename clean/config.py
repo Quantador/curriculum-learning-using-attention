@@ -62,17 +62,36 @@ class ExperimentConfig(Config):
     easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
     hard_proportion: float = 0.3  # Proportion of hard samples in mixed chunks
 
-    # Dataset options by difficulty:
-    # Easy:   roneneldan/TinyStories, ajibawa-2023/Children-Stories-Collection,
-    #         wikipedia (simple), Salesforce/wikitext
-    # Medium: Geralt-Targaryen/openwebtext2, bookcorpus, HuggingFaceFW/fineweb-edu, allenai/c4
-    # Hard:   armanc/scientific_papers, CShorten/ML-ArXiv-Papers, bigcode/the-stack
+    # Dataset options by difficulty (see DATASET_REGISTRY in data.py):
+    # Easy:         roneneldan/TinyStories
+    #               ajibawa-2023/Children-Stories-Collection
+    #               Salesforce/wikitext  (wikitext-103-raw-v1)
+    # Medium/Hard:  Geralt-Targaryen/openwebtext2
+    #               HuggingFaceFW/fineweb-edu
+    #               allenai/c4
+    # Hard:         armanc/scientific_papers
+    #               CShorten/ML-ArXiv-Papers
+    # Unstructured: HuggingFaceFW/fineweb  (use with use_single_dataset=True)
     easy_dataset: str = "roneneldan/TinyStories"
     hard_dataset: str = "Geralt-Targaryen/openwebtext2"
-    
-    
+
+    # Single-dataset mode (no easy/hard split).
+    # When True, trains on one dataset only; easy/hard fields above are ignored.
+    use_single_dataset: bool = False
+    single_dataset: str = "HuggingFaceFW/fineweb"
+    single_dataset_samples: int = 120_000
+    single_dataset_val_split: float = 0.05
+
+    # External pre-computed embeddings (e.g. Vinko's FineWeb embeddings).
+    # The HuggingFace dataset must have a 'text' and an 'embedding' column.
+    # Only used when use_single_dataset=True.
+    use_external_embeddings: bool = False
+    external_embeddings_dataset: str = ""
+    external_embedding_dim: int = 768
+
     # Router architecture
     router_architecture: str = "attention"  # options: attention, linear, mlp
+    router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter
 
     # Router features
     enable_text_stat: bool = True
@@ -154,4 +173,12 @@ class ExperimentConfig(Config):
     # Path to save/load the cache on disk as a .pt file (fp16)
     # Empty string = keep in CPU RAM only, no disk persistence
     feature_cache_path: str = ""
+
+    # Auxiliary network baseline.
+    # When True, a supervised MLP is trained alongside the RL router.
+    # It regresses directly on the observed loss-improvement signal and
+    # selects samples by predicted improvement — a direct supervised
+    # alternative to policy-gradient curriculum learning.
+    run_aux_baseline: bool = False
+    aux_net_hidden: int = 256
 

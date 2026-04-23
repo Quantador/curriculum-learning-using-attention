@@ -97,10 +97,30 @@ FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "feature_cache_epochs": (0, [2]),
 }
 
+# New experiments added for NeurIPS:
+#   1. Multi-head attention router (n_heads = 2 and 4)
+#   2. Harder easy datasets (WikiText, Children-Stories)
+#   3. Harder hard datasets (scientific papers, ML-ArXiv, FineWeb-Edu)
+# Note: single-dataset mode and aux-net baseline use a different training loop
+# and must be run via baselineVSrouter.py with use_single_dataset / run_aux_baseline.
+ADDITIONAL_EXPERIMENTS_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
+    "router_n_heads": (1, [2, 4]),
+    "easy_dataset": (
+        "roneneldan/TinyStories",
+        ["ajibawa-2023/Children-Stories-Collection", "Salesforce/wikitext"],
+    ),
+    "hard_dataset": (
+        "Geralt-Targaryen/openwebtext2",
+        ["armanc/scientific_papers", "CShorten/ML-ArXiv-Papers", "HuggingFaceFW/fineweb-edu"],
+    ),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
     "feature_cache": FEATURE_CACHE_FIELDS,
+    "additional_experiments": ADDITIONAL_EXPERIMENTS_FIELDS,
+    "additional-experiments": ADDITIONAL_EXPERIMENTS_FIELDS,  # alias
 }
 
 
@@ -153,6 +173,7 @@ def run_experiment():
         d_input=get_router_feature_dim(cfg),
         arch=cfg.router_architecture,
         d_k=128,
+        n_heads=getattr(cfg, "router_n_heads", 1),
     )
 
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
@@ -208,6 +229,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         d_input=get_router_feature_dim(cfg),
         arch=cfg.router_architecture,
         d_k=128,
+        n_heads=getattr(cfg, "router_n_heads", 1),
     )
 
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)

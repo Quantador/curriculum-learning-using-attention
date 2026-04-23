@@ -1009,6 +1009,13 @@ def train_router_experiments(
                 )  # [M, F]
             total_feat_time += time.perf_counter() - feat_start
 
+            # Append pre-computed external embeddings when available.
+            if train_ds.embeddings is not None:
+                pool_embs = torch.stack(
+                    [train_ds.embeddings[i] for i in pool_indices]
+                ).to(cfg.device)
+                feats = torch.cat([feats, pool_embs], dim=1)
+
             scores = router(feats)  # [M]
             probs = torch.softmax(scores / current_temp, dim=0)  # [M]
 
@@ -1235,6 +1242,160 @@ def _avg_epoch_time(metrics: MetricsTracker) -> float | None:
     # Skip epoch 0 — cache is never active then and it skews the average
     relevant = times[1:] if len(times) > 1 else times
     return sum(relevant) / len(relevant)
+
+
+def train_aux_baseline(
+    cfg: ExperimentConfig,
+    model: TinyGPT,
+    aux_net: nn.Module,
+    train_ds: MixedLMDataset,
+    val_ds: MixedLMDataset,
+    tokenizer,
+    metrics: MetricsTracker,
+    diversity: DiversityTracker,
+) -> tuple[TinyGPT, nn.Module]:
+    """
+    Curriculum learning via a supervised auxiliary network.
+
+    At each step:
+      1. Extract features for the pool.
+      2. Score pool with aux_net (predicted loss improvement) → top-k selection.
+      3. Compute actual per-sample loss_before and loss_after.
+      4. Train aux_net with MSE(predicted, actual_improvement).
+      5. Update LM on selected samples.
+
+    This is a direct supervised alternative to the policy-gradient router:
+    same features, same top-k selection, same feature pipeline — only the
+    training objective differs (MSE regression vs. REINFORCE).
+    """
+    if cfg.use_wandb:
+        import wandb
+        wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,
+            config=vars(cfg),
+            name="aux_baseline",
+        )
+
+    model.to(cfg.device)
+    aux_net.to(cfg.device)
+    model.train()
+    aux_net.train()
+
+    loss_fn = nn.CrossEntropyLoss()
+    mse_fn  = nn.MSELoss()
+    opt_lm  = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
+    opt_aux = torch.optim.Adam(aux_net.parameters(), lr=cfg.lr_router)
+
+    total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
+    global_step = 0
+
+    for epoch in range(cfg.epochs):
+        epoch_start = time.perf_counter()
+        idx_loader = make_index_loader(len(train_ds), cfg.pool)
+
+        for pool_indices in tqdm(idx_loader):
+            if len(pool_indices) < cfg.batch:
+                continue
+
+            batch = [train_ds[i] for i in pool_indices]
+            xs, ys, diffs = zip(*batch)
+
+            X = torch.stack(xs).to(cfg.device)  # [M, L]
+            Y = torch.stack(ys).to(cfg.device)  # [M, L]
+
+            # --- Feature extraction ---
+            feats = extract_router_features(
+                model=model,
+                X=X,
+                cfg=cfg,
+                pad_token_id=tokenizer.pad_token_id,
+                vocab_size=tokenizer.vocab_size,
+            )  # [M, F]
+
+            if train_ds.embeddings is not None:
+                pool_embs = torch.stack(
+                    [train_ds.embeddings[i] for i in pool_indices]
+                ).to(cfg.device)
+                feats = torch.cat([feats, pool_embs], dim=1)
+
+            # --- Selection: top-k by predicted improvement ---
+            with torch.no_grad():
+                predicted_improvement = aux_net(feats.detach())  # [M]
+            topk = torch.topk(predicted_improvement, k=cfg.batch)
+            sel_idx_local = topk.indices
+
+            X_sel = X[sel_idx_local]
+            Y_sel = Y[sel_idx_local]
+            feats_sel = feats[sel_idx_local]
+            selected_diffs   = [diffs[i] for i in sel_idx_local.tolist()]
+            selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
+
+            # --- Compute actual improvement ---
+            with torch.no_grad():
+                loss_before = compute_loss_per_sample_vectorized(model(X_sel), Y_sel)
+
+            opt_lm.zero_grad()
+            logits_sel = model(X_sel)
+            loss_lm = loss_fn(
+                logits_sel.view(-1, logits_sel.size(-1)),
+                Y_sel.view(-1),
+            )
+            loss_lm.backward()
+            opt_lm.step()
+
+            with torch.no_grad():
+                loss_after = compute_loss_per_sample_vectorized(model(X_sel), Y_sel)
+
+            actual_improvement = (loss_before - loss_after).clamp(min=0.0).detach()
+
+            # --- Train aux_net with supervised MSE ---
+            pred = aux_net(feats_sel.detach())  # [B]
+            loss_aux = mse_fn(pred, actual_improvement)
+            opt_aux.zero_grad()
+            loss_aux.backward()
+            opt_aux.step()
+
+            diversity.update(selected_indices, selected_diffs)
+
+            global_step += 1
+            if global_step % cfg.log_every == 0:
+                training_progress = global_step / total_steps
+                div_metrics = diversity.get_metrics()
+                metrics.log(
+                    epoch=epoch,
+                    step=global_step,
+                    loss_lm=loss_lm.item(),
+                    loss_aux=loss_aux.item(),
+                    avg_improvement=actual_improvement.mean().item(),
+                    curriculum_strength=1.0 - training_progress,
+                    **div_metrics,
+                )
+                print(
+                    f"[AuxNet] Step {global_step} | "
+                    f"loss_lm={loss_lm.item():.4f} | "
+                    f"loss_aux={loss_aux.item():.6f}"
+                )
+
+        val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+        epoch_time = time.perf_counter() - epoch_start
+        metrics.log(
+            epoch=epoch,
+            step=global_step,
+            val_loss=val_loss,
+            val_ppl=val_ppl,
+            epoch_time_s=epoch_time,
+        )
+        print(
+            f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
+            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
+        )
+
+    if cfg.use_wandb:
+        import wandb
+        wandb.finish()
+
+    return model, aux_net
 
 
 def compare_runs_experiments(
