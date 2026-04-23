@@ -77,18 +77,18 @@ class ExperimentConfig(Config):
 
     # Single-dataset mode (no easy/hard split).
     # When True, trains on one dataset only; easy/hard fields above are ignored.
-    use_single_dataset: bool = False
+    use_single_dataset: bool = True
     single_dataset: str = "HuggingFaceFW/fineweb"
     single_dataset_samples: int = 120_000
     single_dataset_val_split: float = 0.05
 
-    # External pre-computed embeddings (e.g. Vinko's FineWeb embeddings).
-    # The HuggingFace dataset must have a 'text' and an 'embedding' column.
+    # External pre-computed embeddings (e.g. epfml/FineWeb-HQ).
+    # The HuggingFace dataset must have a 'text' and an 'embeddings' column.
     # Only used when use_single_dataset=True.
-    use_external_embeddings: bool = False
-    external_embeddings_dataset: str = ""
+    use_external_embeddings: bool = True
+    external_embeddings_dataset: str = "epfml/FineWeb-HQ"
     external_embedding_dim: int = 768
-
+    
     # Router architecture
     router_architecture: str = "attention"  # options: attention, linear, mlp
     router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter

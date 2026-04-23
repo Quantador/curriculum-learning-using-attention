@@ -175,7 +175,7 @@ def load_dataset_with_embeddings(
     dataset_name: str,
     n_samples: int,
     text_col: str = "text",
-    embedding_col: str = "embedding",
+    embedding_col: str = "embeddings",
 ) -> Tuple[List[str], List[torch.Tensor]]:
     """Load a HuggingFace dataset that has a pre-computed embedding column."""
     ds = load_dataset(dataset_name, split="train", streaming=True).take(n_samples)
@@ -183,7 +183,12 @@ def load_dataset_with_embeddings(
     embeddings = []
     for row in ds:
         texts.append(row[text_col])
-        embeddings.append(torch.tensor(row[embedding_col], dtype=torch.float32))
+        emb = torch.tensor(row[embedding_col], dtype=torch.float32)
+        # Some datasets (e.g. epfml/FineWeb-HQ) store one vector per sub-chunk,
+        # yielding shape [n_chunks, dim]. Mean-pool to a single document vector.
+        if emb.dim() == 2:
+            emb = emb.mean(dim=0)
+        embeddings.append(emb)
     return texts, embeddings
 
 
