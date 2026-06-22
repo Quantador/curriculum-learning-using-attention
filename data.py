@@ -1,4 +1,27 @@
 # data.py
+"""
+Dataset loading, tokenisation, and chunking for curriculum learning.
+
+Two dataset modes:
+  - Mixed-difficulty: load an easy + a hard HuggingFace dataset, tokenise,
+    chunk into (block+1)-token sequences, label them 0 (easy) / 1 (hard).
+    Use make_mixed_chunks().
+  - Single-dataset: one source, no difficulty split (all labels 0). Supports
+    optional pre-computed external embeddings (e.g. epfml/FineWeb-HQ).
+    Use make_single_chunks().
+
+Difficulty label convention: 0 = easy, 1 = hard, -1 = validation (no label).
+
+Validation always uses WikiText-2 regardless of training dataset config,
+keeping the eval set fixed across all experiments for fair comparison.
+
+Key exports:
+  get_tokenizer()       — shared GPT-2 BPE tokeniser
+  make_mixed_chunks()   — builds labelled train/val chunks for mixed mode
+  make_single_chunks()  — builds chunks for single-dataset mode
+  MixedLMDataset        — PyTorch Dataset yielding (x, y, difficulty) triples
+  make_index_loader()   — yields shuffled pool-sized index batches
+"""
 from __future__ import annotations
 
 import random
@@ -160,6 +183,8 @@ def make_mixed_chunks(
         return all_chunks
 
     else:
+        # Validation always uses WikiText-2, not the configured training datasets.
+        # This keeps the eval signal identical across all experiment variants.
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
         text = tokenizer.eos_token.join(ds["text"])
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -177,7 +202,17 @@ def load_dataset_with_embeddings(
     text_col: str = "text",
     embedding_col: str = "embeddings",
 ) -> Tuple[List[str], List[torch.Tensor]]:
-    """Load a HuggingFace dataset that has a pre-computed embedding column."""
+    """
+    Load a HuggingFace dataset that has a pre-computed embedding column.
+
+    Some datasets (e.g. epfml/FineWeb-HQ) store one embedding vector per
+    sub-chunk of the document, yielding shape [n_sub_chunks, dim]. These
+    are mean-pooled to a single document-level vector before being attached
+    to each token chunk produced from that document.
+
+    Returns (texts, embeddings) where embeddings[i] is a 1-D float32 tensor
+    aligned with texts[i].
+    """
     ds = load_dataset(dataset_name, split="train", streaming=True).take(n_samples)
     texts = []
     embeddings = []
@@ -281,6 +316,7 @@ class MixedLMDataset(Dataset):
             torch.tensor(c[1:], dtype=torch.long) for c, _ in labeled_chunks
         ]
         self.difficulty = [d for _, d in labeled_chunks]
+        # Labels: 0 = easy, 1 = hard, -1 = validation set (no curriculum label).
         # Pre-computed external embeddings aligned with each chunk (or None).
         # Access via dataset.embeddings[i] rather than __getitem__ so that
         # existing training loops unpacking (x, y, diff) don't break.
