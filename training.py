@@ -1,4 +1,22 @@
 # training.py
+"""
+Reference training loops used for the baseline comparison.
+
+  train_baseline() — uniform random batch selection, standard cross-entropy SGD.
+                     No router. The performance floor every other method must beat.
+  train_router()   — basic RL curriculum learning: REINFORCE with loss_improvement
+                     reward, fixed temperature, top-k selection, and Shannon entropy
+                     regularisation. This is the simplified reference router loop.
+
+For the full experiment-grade loop with configurable algorithms (REINFORCE/GRPO/PPO),
+reward signals, entropy formulations, and feature caching, see rl_training.py.
+
+evaluate() is shared by both loops above and by rl_training.py.
+
+Entry points that call this module:
+  compare.py    — runs baseline + router side-by-side
+  smoke_test.py — verifies all code paths via tiny smoke tests
+"""
 from __future__ import annotations
 
 import math
@@ -41,6 +59,14 @@ def evaluate(
     loss_fn: nn.Module,
     cfg: Config,
 ) -> Tuple[float, float]:
+    """
+    Compute mean cross-entropy loss and perplexity over the full dataset.
+
+    Iterates sample-by-sample (not batched) to avoid padding artefacts.
+    Sets model to eval() before the loop and restores train() after.
+
+    Returns (avg_loss, perplexity) where perplexity = exp(avg_loss).
+    """
     model.eval()
     total_loss, total_tok = 0.0, 0
     with torch.no_grad():
@@ -69,7 +95,14 @@ def train_baseline(
     metrics: MetricsTracker,
     diversity: DiversityTracker,
 ) -> TinyGPT:
-    
+    """
+    Train TinyGPT with uniform random batch selection (no curriculum).
+
+    At each step, draws cfg.batch samples uniformly at random from a pool
+    of cfg.pool candidates (pool_mult × batch). This is the control condition —
+    it sets the performance floor that the router should beat.
+    """
+
     if cfg.use_wandb:
         import wandb
         wandb.init(
@@ -154,7 +187,21 @@ def train_router(
     metrics: MetricsTracker,
     diversity: DiversityTracker,
 ) -> Tuple[TinyGPT, AttentionRouter]:
-    
+    """
+    Train TinyGPT with a basic RL curriculum learning router.
+
+    Per step:
+      1. Extract hierarchical features for the full pool (one transformer
+         forward pass over M samples — the main cost per step).
+      2. Router scores → softmax → top-k selection of cfg.batch samples.
+      3. LM forward+backward on selected batch.
+      4. Reward = (loss_before - loss_after).clamp(0) per sample.
+      5. REINFORCE update: minimise -(advantage * log_prob) + entropy_term.
+
+    This is the simplified reference loop. For ablatable algorithms and
+    reward signals, see rl_training.py::train_router_experiments().
+    """
+
     if cfg.use_wandb:
         import wandb
         wandb.init(
@@ -234,6 +281,9 @@ def train_router(
 
             reinforce = -((improvement - baseline) * sel_probs.log()).mean()
             ent = (probs * probs.clamp_min(1e-12).log()).sum()
+            # ent = sum(p * log p) = -H(p), the *negative* Shannon entropy.
+            # Adding lambda_ent * ent to the loss penalises low-entropy distributions,
+            # so minimising the total loss pushes the router toward diverse selection.
 
             loss_router = reinforce + cfg.lambda_ent * ent
 
