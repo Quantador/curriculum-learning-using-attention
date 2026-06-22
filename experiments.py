@@ -12,8 +12,8 @@ from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDa
 from model import TinyGPT, AttentionRouter
 from metrics import MetricsTracker, DiversityTracker
 
-from modelExperiments import *
-from trainingExperiments import *
+from router import *
+from rl_training import *
 
 
 # Define the experimental fields and their possible values

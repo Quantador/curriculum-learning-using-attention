@@ -15,7 +15,7 @@ from data import make_index_loader, MixedLMDataset
 from model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from metrics import MetricsTracker, DiversityTracker
 from training import evaluate  # keep using your existing evaluate()
-from modelExperiments import extract_router_features
+from router import extract_router_features
 
 
 @torch.no_grad()

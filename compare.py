@@ -6,9 +6,9 @@ import torch
 from config import ExperimentConfig
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
 from model import TinyGPT
-from modelExperiments import build_router, get_router_feature_dim
+from router import build_router, get_router_feature_dim
 from training import train_baseline, train_router, compare_runs
-from trainingExperiments import train_aux_baseline
+from rl_training import train_aux_baseline
 from metrics import MetricsTracker, DiversityTracker
 
 
