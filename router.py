@@ -1,5 +1,27 @@
 from __future__ import annotations
 
+"""
+Router factory and feature extraction for curriculum learning experiments.
+
+This module bridges the language model and the RL training loop: it defines
+how samples are featurized and which router architecture scores them.
+
+Router architectures (all nn.Module, produce [B] scalar scores):
+  LinearRouter   — single linear layer, fewest parameters, fastest
+  MLPRouter      — two-layer MLP with GELU, more expressive
+  AuxNetRouter   — supervised alternative trained with MSE to predict
+                   loss improvement (not policy gradient)
+
+The primary router architectures (AttentionRouter, MultiHeadAttentionRouter)
+are defined in model.py. build_router() here is the factory for all of them.
+
+Feature extraction:
+  extract_router_features() — concatenates up to three feature groups into
+                              the vector fed to the router
+  get_router_feature_dim()  — computes the expected input dimension so the
+                              router can be instantiated before training starts
+"""
+
 from typing import Optional
 
 import torch
@@ -40,13 +62,18 @@ class MLPRouter(nn.Module):
 
 class AuxNetRouter(nn.Module):
     """
-    Supervised alternative to the RL router.
+    Supervised alternative to the RL router — used as an ablation baseline.
 
-    Regresses directly on the observed per-sample loss-improvement signal
-    using MSE. At inference time its predicted improvement is used as a
-    selection score (top-k), exactly like the attention router — making it
-    a direct, fair comparison: same features, same selection logic, different
-    training objective (supervised regression vs. policy gradient).
+    Trained with MSE loss to directly regress the observed per-sample
+    loss-improvement signal, rather than via policy gradient. At inference
+    time it scores samples identically to the attention router (top-k by
+    predicted score), making it a controlled comparison:
+      - Same features (output of extract_router_features)
+      - Same selection logic (top-k in rl_training.train_aux_baseline)
+      - Different training objective: MSE regression vs. REINFORCE
+
+    Instantiate via build_router(arch='auxnet').
+    Training loop: rl_training.train_aux_baseline().
     """
     def __init__(self, d_input: int, d_hidden: int = 256):
         super().__init__()
@@ -71,12 +98,22 @@ def extract_router_features(
     external_emb: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Build the feature vector fed to the router.
+    Build the feature vector that the router scores each candidate sample with.
 
-    Concatenates any enabled feature groups:
-      - Hierarchical hidden states (cfg.enable_text_hierarchical)
-      - Text statistics: length, uniqueness, avg/std token id (cfg.enable_text_stat)
-      - Pre-computed external embeddings (cfg.use_external_embeddings, external_emb)
+    Concatenates up to three optional feature groups in this order:
+      1. Hierarchical hidden states  [B, n_chunks * d_model]
+         Enabled by cfg.enable_text_hierarchical. Runs a transformer forward
+         pass (or uses only embeddings if cfg.hierarchical_representation='embedder').
+      2. Text statistics  [B, 4]
+         Enabled by cfg.enable_text_stat. Cheap surface features: fill ratio,
+         lexical diversity, normalised mean/std token id.
+      3. Pre-computed external embeddings  [B, external_embedding_dim]
+         Used when cfg.use_external_embeddings=True and external_emb is provided.
+
+    If no group is enabled, returns random features as a fallback
+    (router learns nothing — intended only for sanity-check baselines).
+
+    Returns [B, F] where F == get_router_feature_dim(cfg).
     """
     features = []
 
@@ -105,7 +142,18 @@ def extract_router_features(
 
 
 def get_router_feature_dim(cfg: ExperimentConfig) -> int:
-    """Compute feature dimensionality based on enabled feature flags."""
+    """
+    Compute the router's expected input dimensionality from config flags.
+
+    Mirrors the concatenation order in extract_router_features():
+      n_chunks * d_model   if enable_text_hierarchical  (hierarchical hidden)
+      + 4                  if enable_text_stat           (text statistics)
+      + external_dim       if use_external_embeddings    (external embeddings)
+
+    When both hierarchical and stat flags are False, returns the full fallback
+    dimension n_chunks * d_model + 4 to match the random-feature path in
+    extract_router_features().
+    """
     full_dim = cfg.n_chunks * cfg.d_model + 4
     if not cfg.enable_text_hierarchical and not cfg.enable_text_stat:
         return full_dim
@@ -127,15 +175,22 @@ def build_router(
     n_heads: int = 1,
 ) -> nn.Module | None:
     """
-    Factory for router architectures.
+    Factory for all router architectures.
 
-    arch options:
-      "attention"  — single-head AttentionRouter (n_heads=1) or
-                     MultiHeadAttentionRouter (n_heads > 1)
-      "linear"     — single linear projection to scalar
-      "mlp"        — two-hidden-layer MLP
-      "auxnet"     — supervised aux-net that regresses on loss improvement
-      "random"     — returns None (scores will be random in training code)
+    Args:
+        d_input:  Input feature dimensionality. Pass get_router_feature_dim(cfg).
+        arch:     Architecture name:
+                    'attention' — AttentionRouter (n_heads=1) or
+                                  MultiHeadAttentionRouter (n_heads > 1)
+                    'linear'   — single linear projection
+                    'mlp'      — two-hidden-layer MLP with GELU
+                    'auxnet'   — supervised AuxNetRouter (MSE training)
+                    'random'   — returns None; training falls back to random scores
+        d_k:      Key/query dimension for attention routers.
+        d_hidden: Hidden dimension for MLP/auxnet routers.
+        n_heads:  Attention heads (attention arch only; >1 enables multi-head).
+
+    Returns an nn.Module or None (for arch='random').
     """
     if arch == "attention":
         if n_heads == 1:
