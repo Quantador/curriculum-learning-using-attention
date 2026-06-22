@@ -1,4 +1,25 @@
 # model.py
+"""
+Model and router architecture definitions.
+
+TinyGPT:
+  Small causal language model built on PyTorch's TransformerEncoder with a
+  causal attention mask (upper-triangular -inf). Shares weights between the
+  token embedding and the LM head (weight tying). Used as the student LM
+  in all experiments.
+
+Router architectures (all produce a scalar score [B] per sample in the pool):
+  AttentionRouter          — single (projection, query) pair; the baseline router
+  MultiHeadAttentionRouter — n independent heads, scores averaged across heads
+
+Feature extraction utilities:
+  compute_text_statistics()     — 4 cheap surface-level features: sequence fill
+                                  ratio, lexical diversity, mean/std token id
+  extract_hierarchical_hidden() — transformer hidden states, chunked & pooled
+  extract_hierarchical_features() — combines the above two (legacy helper used
+                                    by training.py's reference router loop)
+"""
+
 from __future__ import annotations
 
 import torch
@@ -8,6 +29,17 @@ from config import Config
 
 
 class TinyGPT(nn.Module):
+    """
+    Small causal GPT-style language model (decoder-only transformer).
+
+    Uses nn.TransformerEncoderLayer with an upper-triangular causal mask to
+    simulate autoregressive decoding. Weight tying: lm_head.weight == tok_embed.weight,
+    halving the effective parameter count and stabilising training.
+
+    forward_to_hidden(x) exposes the transformer hidden states without computing
+    logits — used by extract_hierarchical_hidden() for feature extraction without
+    a second full forward pass.
+    """
     def __init__(self, vocab_size: int, cfg: Config):
         super().__init__()
         self.vocab_size = vocab_size
@@ -47,6 +79,16 @@ class TinyGPT(nn.Module):
 
 
 class AttentionRouter(nn.Module):
+    """
+    Single-head attention-based sample scorer.
+
+    Learns a linear projection W ∈ R^{d_input × d_k} and a query vector
+    q ∈ R^{d_k}. For a batch of feature vectors F ∈ R^{B × d_input}:
+        scores = (F @ W^T) @ q  ∈ R^B
+
+    Equivalent to a single-head cross-attention where F are the keys and q
+    is the query. This is the default/baseline router architecture.
+    """
     def __init__(self, d_input: int, d_k: int = 128):
         super().__init__()
         self.proj = nn.Linear(d_input, d_k, bias=False)
@@ -85,6 +127,20 @@ def compute_text_statistics(
     vocab_size: int,
     block: int,
 ) -> torch.Tensor:
+    """
+    Compute 4 cheap surface-level text features per sample.
+
+    Returns a [B, 4] tensor. Column semantics:
+      [0] relative_length — non-pad tokens / block  (sequence fill ratio)
+      [1] unique_ratio    — unique tokens / sequence length  (lexical diversity)
+      [2] avg_token       — mean token id / vocab_size  (normalized)
+      [3] std_token       — std of token ids / vocab_size  (normalized)
+
+    All values are in [0, 1]. These four statistics are fast to compute
+    (no transformer forward pass) and capture coarse difficulty signals:
+    longer, more diverse sequences with unusual token distributions tend to
+    be harder for the model to predict.
+    """
     mask = X != pad_token_id
     lengths = mask.sum(dim=1).clamp(min=1)
     rel_length = lengths.float() / float(block)
@@ -115,6 +171,24 @@ def extract_hierarchical_hidden(
     X: torch.Tensor,
     cfg: Config,
 ) -> torch.Tensor:
+    """
+    Extract chunked, mean-pooled hidden states from TinyGPT.
+
+    The sequence of length L is divided into cfg.n_chunks equal segments.
+    Each segment's hidden states are mean-pooled to a single d_model vector.
+    The n_chunks vectors are concatenated to produce [B, n_chunks * d_model].
+
+    Chunking captures positional structure: early chunks encode document
+    start (typically more predictable), later chunks encode content density.
+    This is richer than a single mean-pool over the whole sequence.
+
+    Two modes (cfg.hierarchical_representation):
+      'full'     — uses full transformer hidden states (one LM forward pass)
+      'embedder' — uses only token + positional embeddings, no transformer
+                   (~10× faster but loses contextual information)
+
+    Always runs under torch.no_grad() — never affects LM gradients.
+    """
     with torch.no_grad():
         repr_mode = getattr(cfg, "hierarchical_representation", "full")
         if repr_mode == "full":
