@@ -1,5 +1,36 @@
 from __future__ import annotations
 
+"""
+Advanced RL-based training loops for curriculum learning experiments.
+
+This is the experiment-grade router training loop used by experiments.py
+(ablation studies) and compare.py (single runs with all variants enabled).
+
+Key features over the reference loop in training.py:
+  - Three policy gradient algorithms: REINFORCE, GRPO, PPO
+  - Eight reward signals: loss_improvement, neg_loss, relative_improvement,
+    difficulty_weighted, uncertainty_reduction, gradient_norm,
+    gradient_alignment, combined
+  - Four entropy formulations: Shannon, Rényi, Tsallis, KL-uniform
+  - SAC-style entropy targeting (auto-adjusts lambda_ent to hit a target entropy)
+  - Coverage regularisation (penalises repeated sample selection)
+  - Feature caching (amortises expensive transformer forward passes)
+  - Supervised aux-net baseline (MSE alternative to policy gradient)
+
+Entropy sign convention — READ THIS:
+  All compute_*_entropy() functions return -H, the *negative* entropy.
+  Adding `lambda_ent * entropy_term` to the router loss therefore
+  penalises low-entropy distributions: minimising the total loss
+  *maximises* entropy and encourages diverse sample selection.
+  The logged 'entropy' value is always negated before display so the
+  dashboard shows a positive, human-readable entropy number.
+
+Entry points:
+  train_router_experiments() — main RL training loop (REINFORCE/GRPO/PPO)
+  train_aux_baseline()       — supervised MSE alternative
+  compare_runs_experiments() — prints a performance comparison table
+"""
+
 import math
 import os
 import time
@@ -51,7 +82,21 @@ def get_scheduled_value(
     step: int = 0,
     cycle_length: int = 1000,
 ) -> float:
-    """Get scheduled value based on training progress."""
+    """
+    Return a scheduled hyperparameter value at the given training progress.
+
+    Used for temperature annealing (cfg.temp_schedule) and entropy coefficient
+    annealing (cfg.entropy_schedule). All schedules interpolate from `initial`
+    at progress=0.0 to `minimum` at progress=1.0.
+
+    Schedules:
+      'fixed'             — constant initial throughout training
+      'linear_decay'      — linear interpolation from initial to minimum
+      'cosine_decay'      — cosine annealing (smooth S-curve decay)
+      'exponential_decay' — fast initial drop, slower tail
+      'cyclic'            — cosine warm restarts every cycle_length steps
+      'adaptive'          — placeholder, returns initial (not implemented)
+    """
     if schedule == "fixed":
         return initial
 
@@ -681,7 +726,17 @@ def reinforce_update(
     entropy_q: float = 2.0,
     coverage_loss: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Standard REINFORCE update with entropy regularization."""
+    """
+    Standard REINFORCE (vanilla policy gradient) router update.
+
+    Advantage = reward - baseline (reduces gradient variance).
+    Policy loss = -mean(advantage * log_prob_of_selected_samples).
+    Total loss = policy_loss + lambda_ent * entropy_term.
+
+    See module docstring for the entropy sign convention.
+
+    Returns (loss_router, reinforce_loss, entropy) where entropy = -H.
+    """
     advantage = reward - baseline
     reinforce_loss = -(advantage * sel_probs.log()).mean()
 
@@ -715,10 +770,15 @@ def grpo_update(
     coverage_loss: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Group Relative Policy Optimization (GRPO) update.
+    Group Relative Policy Optimization (GRPO) router update.
 
-    Instead of a global baseline, GRPO computes advantages relative to
-    groups of samples, providing more stable gradients.
+    Instead of a single global baseline, advantages are normalised within
+    small groups of group_size samples:
+        advantage_i = (r_i - group_mean) / group_std
+    This provides lower-variance gradient estimates when rewards vary
+    substantially across samples, without needing a learned value function.
+
+    Returns (loss_router, grpo_loss, entropy) where entropy = -H.
     """
     B = len(reward)
     n_groups = max(1, B // group_size)
@@ -778,9 +838,19 @@ def ppo_update(
     coverage_loss: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Proximal Policy Optimization (PPO) update.
+    Proximal Policy Optimization (PPO) router update.
 
-    Performs multiple epochs of updates with clipped objective.
+    Runs cfg.ppo_epochs inner update steps with the clipped surrogate:
+        L = min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)
+    where ratio = new_log_prob / old_log_prob and ε = cfg.ppo_clip.
+    Clipping prevents destructively large policy updates in a single step.
+
+    Advantages are normalised across the selected batch before clipping.
+    Coverage loss is applied only on the first inner epoch to avoid
+    double-counting the coverage penalty.
+
+    Returns averaged (loss_router, policy_loss, entropy) over inner steps,
+    where entropy = -H.
     """
     advantage = (reward - baseline).detach()
     # Normalize advantages
@@ -830,15 +900,21 @@ def build_feature_cache(
     cfg: ExperimentConfig,
 ) -> torch.Tensor:
     """
-    Precompute hierarchical hidden features for all training samples.
+    Pre-compute and cache hierarchical hidden features for the full training set.
 
-    Runs the full transformer (no grad) over the dataset in batches and stores
-    the chunk-pooled hidden states as a fp16 CPU tensor of shape [N, n_chunks * d_model].
-    If cfg.feature_cache_path is set, saves to disk and loads from there on the
-    next call (skipping the forward pass entirely).
+    Running a full transformer forward pass over M pool samples at every step
+    is the dominant cost when enable_text_hierarchical=True. This function
+    amortises that cost by running the model once over the entire dataset,
+    storing the result as fp16 on CPU, and reusing it for feature_cache_epochs
+    epochs before rebuilding.
 
-    Returns:
-        cache: [N, n_chunks * d_model] fp16 CPU tensor
+    Cache validity: if the stored shape or dtype does not match expectations
+    (e.g. after changing d_model or n_chunks), the cache is discarded and rebuilt.
+
+    Disk persistence: if cfg.feature_cache_path is non-empty, the cache is saved
+    as a .pt file and loaded on the next call instead of recomputing.
+
+    Returns: [N, n_chunks * d_model] fp16 CPU tensor.
     """
     expected_shape = (len(train_ds), cfg.n_chunks * cfg.d_model)
 
@@ -944,6 +1020,11 @@ def train_router_experiments(
     feature_cache: torch.Tensor | None = None
 
     for epoch in range(cfg.epochs):
+        # The feature cache is never built at epoch 0: the model's weights are
+        # randomly initialised, so the hidden states are noise. Caching garbage
+        # features would waste memory and mislead the router. Rebuilding every
+        # feature_cache_epochs epochs (starting at epoch 1) keeps the cache
+        # fresh as the model's representations improve.
         # Rebuild cache at epoch 1, then every feature_cache_epochs epochs after that
         if (
             cfg.feature_cache_epochs > 0
@@ -957,6 +1038,15 @@ def train_router_experiments(
         epoch_start = time.perf_counter()
         total_feat_time = 0.0
 
+        # ── Per-step curriculum loop ──────────────────────────────────────────
+        # Each iteration implements the core curriculum learning cycle:
+        #   1. Sample M = cfg.pool candidate indices (pre-shuffled each epoch).
+        #   2. Extract router features for all M samples.
+        #   3. Router scores pool → softmax(/ temp) → select k = cfg.batch samples.
+        #   4. LM forward + backward on selected batch.
+        #   5. Compute reward signal (loss improvement, gradient norm, etc.).
+        #   6. Router RL update (REINFORCE / GRPO / PPO + entropy regularisation).
+        # ─────────────────────────────────────────────────────────────────────
         for pool_indices in tqdm(idx_loader):
             if len(pool_indices) < cfg.batch:
                 continue
@@ -1058,6 +1148,9 @@ def train_router_experiments(
 
             gradient_reward = None
             if cfg.reward_signal in ("gradient_norm", "gradient_alignment"):
+                # Gradient reward is computed AFTER loss_lm.backward() populates
+                # .grad on all parameters but BEFORE opt_lm.step() zeroes them.
+                # This window is the only point where the raw batch gradients exist.
                 gradient_reward, grad_ema = compute_gradient_reward(
                     params=grad_params,
                     grad_ema=grad_ema,
@@ -1186,7 +1279,7 @@ def train_router_experiments(
                     "loss_lm": loss_lm.item(),
                     "loss_router": loss_router.item(),
                     "policy_loss": policy_loss.item(),
-                    "entropy": -entropy.item(),
+                    "entropy": -entropy.item(),  # entropy is -H; negate to log positive H
                     "avg_reward": reward.mean().item(),
                     "curriculum_strength": curriculum_strength,
                     "temperature": current_temp,
