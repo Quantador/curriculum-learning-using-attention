@@ -1,4 +1,18 @@
 # config.py
+"""
+Central configuration for all curriculum learning experiments.
+
+Two dataclasses:
+  - Config: base training hyperparameters (model size, batch, lr, etc.)
+  - ExperimentConfig: extends Config with all experiment-specific knobs —
+    router architecture, training algorithm (REINFORCE/GRPO/PPO), reward
+    signal, entropy formulation, dataset choices, coverage regularization,
+    PPO/GRPO params, and feature caching settings.
+
+Typical usage:
+    cfg = ExperimentConfig()           # sensible defaults
+    cfg = replace(cfg, epochs=5, ...)  # override via dataclasses.replace
+"""
 from dataclasses import dataclass, field
 import torch
 
@@ -51,6 +65,23 @@ class Config:
 @dataclass
 
 class ExperimentConfig(Config):
+    """
+    Extends Config with all experiment-specific hyperparameters.
+
+    All fields have sensible defaults. Override via dataclasses.replace()
+    to generate ablation configurations without mutating the base config.
+
+    Key field groups:
+      - Dataset: easy_dataset/hard_dataset for mixed mode, single_dataset
+        for single-source mode; use_external_embeddings for pre-computed vectors
+      - Router: router_architecture ('attention', 'mlp', 'linear'),
+        router_n_heads (>1 enables MultiHeadAttentionRouter)
+      - Training algorithm: training_algorithm ('reinforce', 'grpo', 'ppo')
+      - Reward: reward_signal (8 options documented in field comments)
+      - Entropy: entropy_type, entropy_schedule, use_entropy_targeting
+      - Coverage: use_coverage_regularization, coverage_type
+      - Caching: feature_cache_epochs (0 = disabled)
+    """
     experiment_name: str = "presentation_experiment"
     
     wandb_project: str = "curriculum-learning-"+experiment_name
