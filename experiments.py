@@ -1,4 +1,28 @@
 # run_experiment.py
+"""
+Ablation study orchestration for curriculum learning experiments.
+
+Three experiment modes:
+  1. One-factor-at-a-time ablation (--all flag, default):
+     For each field in EXPERIMENTAL_FIELDS, generates one config per
+     alternative value. Every config is identical to the baseline except
+     for exactly ONE field change, isolating the effect of each design choice.
+     Produces ~37 experiments total.
+
+  2. Full grid search (--combinations flag):
+     All combinations of all field values. Grows exponentially — use only
+     for a small subset of fields (e.g. 2-3 fields at most).
+
+  3. Predefined profiles (--profile flag):
+     Curated subsets defined in EXPERIMENT_PROFILES for focused runs
+     (e.g. 'final_presentation', 'additional_experiments').
+
+EXPERIMENTAL_FIELDS format:
+  { "field_name": (baseline_value, [alternative_values]), ... }
+
+Results are saved to cfg.save_dir/<experiment_name>.json.
+See EXPERIMENTS.md for the full CLI reference and field descriptions.
+"""
 from __future__ import annotations
 
 import os
@@ -16,8 +40,10 @@ from router import *
 from rl_training import *
 
 
-# Define the experimental fields and their possible values
-# Format: field_name -> (baseline_value, [alternative_values])
+# Maps each experimental dimension to (baseline_value, [alternative_values]).
+# The baseline_value is used in the control experiment (experiment_name="baseline").
+# Each alternative generates one experiment that changes only this single field.
+# This one-factor-at-a-time design lets us isolate the effect of each choice.
 EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # Router architecture
     "router_architecture": ("attention", ["mlp", "linear"]),
@@ -273,19 +299,22 @@ def generate_experiment_configs(
     include_baseline: bool = True,
 ) -> List[ExperimentConfig]:
     """
-    Generate ablation-style experimental configurations.
+    Generate ablation (one-factor-at-a-time) experiment configurations.
 
-    Instead of full grid search, this generates experiments where each one
-    varies only ONE field from the baseline (one-factor-at-a-time).
+    For each field in experimental_fields, generates one ExperimentConfig per
+    alternative value. Each config is identical to the baseline except for
+    exactly ONE field — this isolates each design choice cleanly.
+
+    Example: baseline uses (ppo, loss_improvement, topk). Varying
+    training_algorithm yields two configs: one with 'grpo', one with
+    'reinforce', both with all other fields at baseline values.
 
     Args:
-        base_cfg: Base configuration to use. If None, uses default ExperimentConfig.
-        experimental_fields: Dict mapping field names to (baseline, [alternatives]).
-                           If None, uses EXPERIMENTAL_FIELDS.
-        include_baseline: Whether to include the baseline config as first experiment.
+        base_cfg:            Starting config (defaults to ExperimentConfig()).
+        experimental_fields: {field: (baseline, [alternatives])} mapping.
+        include_baseline:    Whether to prepend the all-baseline config first.
 
-    Returns:
-        List of ExperimentConfig instances for ablation study.
+    Returns a list of ExperimentConfig with descriptive experiment_name fields.
     """
     if base_cfg is None:
         base_cfg = ExperimentConfig()
@@ -334,16 +363,17 @@ def generate_combination_configs(
     experimental_fields: Dict[str, List[Any]] | None = None,
 ) -> List[ExperimentConfig]:
     """
-    Generate all combinations of experimental configurations (full grid search).
+    Generate all combinations of experimental field values (full grid search).
 
-    Use this when you want to test all possible combinations of field values.
+    Produces the Cartesian product of all field value lists. Grows exponentially:
+    3 fields × 3 values each = 27 experiments; 10 fields = potentially thousands.
+    Only use this for small, targeted subsets of fields.
 
     Args:
-        base_cfg: Base configuration to use. If None, uses default ExperimentConfig.
-        experimental_fields: Dict mapping field names to list of values to try.
+        base_cfg:            Starting config (defaults to ExperimentConfig()).
+        experimental_fields: {field: [values]} mapping (flat lists, no baseline tuple).
 
-    Returns:
-        List of ExperimentConfig instances for each combination.
+    Returns a list of ExperimentConfig, one per combination.
     """
     if base_cfg is None:
         base_cfg = ExperimentConfig()
