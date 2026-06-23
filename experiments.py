@@ -128,7 +128,7 @@ FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 #   2. Harder easy datasets (WikiText, Children-Stories)
 #   3. Harder hard datasets (scientific papers, ML-ArXiv, FineWeb-Edu)
 # Note: single-dataset mode and aux-net baseline use a different training loop
-# and must be run via baselineVSrouter.py with use_single_dataset / run_aux_baseline.
+# and must be run via compare.py with use_single_dataset / run_aux_baseline.
 ADDITIONAL_EXPERIMENTS_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "router_n_heads": (1, [2, 4]),
     "easy_dataset": (

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Router factory and feature extraction for curriculum learning experiments.
 
@@ -21,6 +19,7 @@ Feature extraction:
   get_router_feature_dim()  — computes the expected input dimension so the
                               router can be instantiated before training starts
 """
+from __future__ import annotations
 
 from typing import Optional
 

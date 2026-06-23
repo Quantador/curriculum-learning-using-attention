@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Advanced RL-based training loops for curriculum learning experiments.
 
@@ -30,6 +28,7 @@ Entry points:
   train_aux_baseline()       — supervised MSE alternative
   compare_runs_experiments() — prints a performance comparison table
 """
+from __future__ import annotations
 
 import math
 import os
