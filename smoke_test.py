@@ -1,9 +1,21 @@
 """
-Smoke tests for all new experiment features.
-Runs 1 epoch on tiny dataset subsets to verify every code path works.
+Smoke tests for all major training code paths.
 
-Usage (from project root):
-    python clean/test_run.py
+Runs 1 epoch on tiny in-memory configurations (small model, few samples,
+no W&B) to verify that every code path executes end-to-end without error.
+These are crash tests, not correctness tests — any result > 1.0 perplexity
+is accepted.
+
+Run after any structural change:
+    python smoke_test.py
+
+Tests:
+  1. Default mixed datasets (TinyStories + OpenWebText2)
+  2. Custom datasets (WikiText easy + ML-ArXiv hard)
+  3. Multi-head router (n_heads = 2 and 4)
+  4. Single-dataset mode (OpenWebText2, no easy/hard split)
+  5. Auxiliary network baseline (supervised MSE router)
+  6. Full three-way comparison (baseline + router + aux-net)
 """
 from __future__ import annotations
 

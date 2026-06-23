@@ -1,4 +1,17 @@
 # baselineVSrouter.py
+"""
+Entry point for a single three-way comparison run.
+
+Trains and evaluates three models on the same dataset and reports final
+validation perplexity for each:
+  - Baseline:  uniform random batch selection (training.train_baseline)
+  - RL Router: attention router trained with REINFORCE (training.train_router)
+  - Aux-net:   supervised MSE router (rl_training.train_aux_baseline)
+               only runs when cfg.run_aux_baseline=True
+
+Results are printed by compare_runs() and saved to cfg.save_dir/.
+For running many ablation experiments sequentially, see experiments.py.
+"""
 from __future__ import annotations
 
 import torch

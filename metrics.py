@@ -1,4 +1,20 @@
 # metrics.py
+"""
+Metric tracking and logging utilities.
+
+MetricsTracker:
+  Accumulates scalar metrics as Python lists in self.history.
+  Optionally logs each step to Weights & Biases (if installed and enabled).
+  Serialises to / loads from JSON for persistence between training runs.
+  Used by every training loop in this project.
+
+DiversityTracker:
+  Records which samples (by dataset index) were selected at each step.
+  Computes coverage (fraction of dataset ever seen), easy/hard selection
+  ratio (curriculum direction), unique_ratio (short-window diversity), and
+  balance_std (selection uniformity across the dataset).
+  Logged every cfg.log_every steps via MetricsTracker.log().
+"""
 from __future__ import annotations
 
 import json
@@ -21,6 +37,10 @@ class MetricsTracker:
         self.history: Dict[str, List[float]] = defaultdict(list)
 
     def log(self, **kwargs: Any) -> None:
+        """Log scalar metrics to history and optionally to W&B.
+
+        Non-numeric values are silently skipped (e.g. epoch strings).
+        """
         for k, v in kwargs.items():
             if isinstance(v, (int, float)):
                 self.history[k].append(float(v))
@@ -40,6 +60,7 @@ class MetricsTracker:
         return vals[-1]
     
     def load(path: str | Path) -> MetricsTracker:
+        """Load a MetricsTracker from a JSON file previously saved by .save()."""
         path = Path(path)
         with path.open("r") as f:
             history = json.load(f)
@@ -73,6 +94,16 @@ class DiversityTracker:
                 self.difficulty_counts[d] += 1
 
     def get_metrics(self) -> Dict[str, float]:
+        """
+        Return a dict of diversity metrics accumulated since instantiation.
+
+        Keys:
+          coverage      — fraction of dataset samples selected at least once [0,1]
+          balance_std   — std of selection counts (lower = more uniform coverage)
+          unique_ratio  — fraction of unique samples in the last `window` steps [0,1]
+          easy_ratio    — fraction of selected samples with difficulty=0 [0,1]
+          hard_ratio    — fraction of selected samples with difficulty=1 [0,1]
+        """
         counts = self.selection_counts
         selected_mask = counts > 0
         num_selected = selected_mask.sum().item()

@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-Visualization module for curriculum learning experiments.
-Generates all must-have plots to validate router effectiveness.
+Visualization utilities for curriculum learning experiments.
+
+Loads baseline and router metrics JSON files (written by MetricsTracker.save)
+from a results directory and generates five comparison plots:
+  1. Validation perplexity over epochs (baseline vs router)
+  2. Easy vs hard sample selection ratio over training (curriculum progression)
+  3. Average loss improvement per step (router learning signal quality)
+  4. Dataset coverage and selection entropy over training
+  5. Final performance bar chart with improvement annotation
 
 Usage:
-    python visualize_results.py --results_dir results_improved
+    python visualize.py --results_dir results/
+
+Plots are saved as PNG files under results/plots/.
+A text summary report is also written to results/plots/summary_report.txt.
 """
 
 import json
