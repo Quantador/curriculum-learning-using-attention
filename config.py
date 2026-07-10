@@ -48,6 +48,12 @@ class Config:
     seed: int = 0
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
+    # Distributed (DDP). Defaults are the single-process case; train_ddp.py
+    # overrides these after torch.distributed.init_process_group().
+    rank: int = 0
+    world_size: int = 1
+    local_rank: int = 0
+
     # Logging
     use_wandb: bool = True
     wandb_project: str = "curriculum-learning-final"
@@ -116,7 +122,7 @@ class ExperimentConfig(Config):
     # External pre-computed embeddings (e.g. epfml/FineWeb-HQ).
     # The HuggingFace dataset must have a 'text' and an 'embeddings' column.
     # Only used when use_single_dataset=True.
-    use_external_embeddings: bool = True
+    use_external_embeddings: bool = False
     external_embeddings_dataset: str = "epfml/FineWeb-HQ"
     external_embedding_dim: int = 768
     

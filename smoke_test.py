@@ -202,9 +202,10 @@ def test_5_aux_baseline():
     tok, train_ds, val_ds, d_input = shared_data()
     cfg = tiny_cfg(aux_net_hidden=64)
     set_seed()
-
     model   = TinyGPT(vocab_size=tok.vocab_size, cfg=cfg)
-    aux_net = build_router(d_input=d_input, arch="auxnet", d_hidden=64)
+    aux_net = build_router(d_input=get_router_feature_dim(cfg), 
+                           arch="auxnet", 
+                           d_hidden=64)
     m   = MetricsTracker("aux", use_wandb=False)
     div = DiversityTracker(len(train_ds))
     train_aux_baseline(cfg, model, aux_net, train_ds, val_ds, tok, m, div)
