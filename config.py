@@ -15,6 +15,7 @@ Typical usage:
     cfg = load_config_from_yaml("configs/my_run.yaml")  # override via YAML file
 """
 from dataclasses import dataclass, field, fields, replace
+import os
 import torch
 import yaml
 
@@ -252,6 +253,9 @@ def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> Exp
     raises ValueError immediately rather than silently doing nothing (the
     likely outcome of a typo'd field name).
     """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+
     if cfg is None:
         cfg = ExperimentConfig()
     with open(path) as f:
