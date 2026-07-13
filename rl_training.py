@@ -36,6 +36,7 @@ import time
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -966,7 +967,7 @@ def train_router_experiments(
     configured via ExperimentConfig.
     """
 
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.init(
             project=cfg.wandb_project,
@@ -1046,7 +1047,7 @@ def train_router_experiments(
         #   5. Compute reward signal (loss improvement, gradient norm, etc.).
         #   6. Router RL update (REINFORCE / GRPO / PPO + entropy regularisation).
         # ─────────────────────────────────────────────────────────────────────
-        for pool_indices in tqdm(idx_loader):
+        for pool_indices in tqdm(idx_loader, disable=(cfg.rank != 0)):
             if len(pool_indices) < cfg.batch:
                 continue
 
@@ -1269,7 +1270,7 @@ def train_router_experiments(
 
             # --- Logging ---
             global_step += 1
-            if global_step % cfg.log_every == 0:
+            if global_step % cfg.log_every == 0 and cfg.rank == 0:
                 curriculum_strength = 1.0 - progress
 
                 log_data = {
@@ -1302,25 +1303,31 @@ def train_router_experiments(
                 )
 
         # --- Validation ---
-        loss_fn = nn.CrossEntropyLoss()
-        val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+        # Only rank 0 evaluates (val_ds is small and identical on every rank);
+        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
+        # .backward() calls before rank 0 has finished its forward-only pass.
+        if cfg.rank == 0:
+            loss_fn = nn.CrossEntropyLoss()
+            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
 
-        epoch_time = time.perf_counter() - epoch_start
-        metrics.log(
-            epoch=epoch,
-            step=global_step,
-            val_loss=val_loss,
-            val_ppl=val_ppl,
-            epoch_time_s=epoch_time,
-        )
+            epoch_time = time.perf_counter() - epoch_start
+            metrics.log(
+                epoch=epoch,
+                step=global_step,
+                val_loss=val_loss,
+                val_ppl=val_ppl,
+                epoch_time_s=epoch_time,
+            )
 
-        print(
-            f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
-            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
-            f"epoch_time={epoch_time:.1f}s"
-        )
+            print(
+                f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
+                f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
+                f"epoch_time={epoch_time:.1f}s"
+            )
+        if cfg.world_size > 1:
+            dist.barrier()
 
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.finish()
 
@@ -1374,6 +1381,7 @@ def train_aux_baseline(
     model.train()
     aux_net.train()
 
+    print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
     mse_fn  = nn.MSELoss()
     opt_lm  = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
@@ -1404,7 +1412,7 @@ def train_aux_baseline(
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=tokenizer.vocab_size,
             )  # [M, F]
-
+            
             if train_ds.embeddings is not None:
                 pool_embs = torch.stack(
                     [train_ds.embeddings[i] for i in pool_indices]

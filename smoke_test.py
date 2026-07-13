@@ -200,7 +200,7 @@ def test_4_single_dataset():
 
 def test_5_aux_baseline():
     tok, train_ds, val_ds, d_input = shared_data()
-    cfg = tiny_cfg(aux_net_hidden=64)
+    cfg = tiny_cfg(aux_net_hidden=64, use_external_embeddings = False)
     set_seed()
     model   = TinyGPT(vocab_size=tok.vocab_size, cfg=cfg)
     aux_net = build_router(d_input=get_router_feature_dim(cfg), 
@@ -222,7 +222,7 @@ def test_5_aux_baseline():
 
 def test_6_full_comparison():
     tok, train_ds, val_ds, d_input = shared_data()
-    cfg = tiny_cfg(aux_net_hidden=64)
+    cfg = tiny_cfg(aux_net_hidden=64, use_external_embeddings = False)
 
     # Baseline
     set_seed()

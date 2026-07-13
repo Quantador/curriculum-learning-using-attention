@@ -185,7 +185,7 @@ def make_mixed_chunks(
     else:
         # Validation always uses WikiText-2, not the configured training datasets.
         # This keeps the eval signal identical across all experiment variants.
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="validation")
         text = tokenizer.eos_token.join(ds["text"])
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         L = (len(ids) // (cfg.block + 1)) * (cfg.block + 1)

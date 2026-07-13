@@ -24,6 +24,7 @@ import random
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from tqdm import tqdm
@@ -103,7 +104,7 @@ def train_baseline(
     it sets the performance floor that the router should beat.
     """
 
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.init(
             project = cfg.wandb_project,
@@ -111,9 +112,9 @@ def train_baseline(
             config = vars(cfg),
             name = "baseline",
         )
-        
+
         print("WandB initialized for baseline training.")
-    
+
     model.to(cfg.device)
     model.train()
 
@@ -124,7 +125,7 @@ def train_baseline(
     for epoch in range(cfg.epochs):
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
-        for pool_indices in tqdm(idx_loader):
+        for pool_indices in tqdm(idx_loader, disable=(cfg.rank != 0)):
             if len(pool_indices) < cfg.batch:
                 continue
 
@@ -147,7 +148,7 @@ def train_baseline(
             diversity.update(selected_indices, diffs)
 
             global_step += 1
-            if global_step % cfg.log_every == 0:
+            if global_step % cfg.log_every == 0 and cfg.rank == 0:
                 div_metrics = diversity.get_metrics()
                 metrics.log(
                     epoch=epoch,
@@ -156,22 +157,28 @@ def train_baseline(
                     entropy=math.log(cfg.batch),
                     **div_metrics,
                 )
-                
+
                 print(f"[Baseline] Step {global_step} - loss_lm={loss.item():.4f}")
 
-        val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
-        metrics.log(
-            epoch=epoch,
-            step=global_step,
-            val_loss=val_loss,
-            val_ppl=val_ppl,
-        )
-        print(
-            f"[Baseline] Epoch {epoch+1}/{cfg.epochs} "
-            f"- val_loss={val_loss:.4f}, val_ppl={val_ppl:.1f}"
-        )
-        
-    if cfg.use_wandb:
+        # Only rank 0 evaluates (val_ds is small and identical on every rank);
+        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
+        # .backward() calls before rank 0 has finished its forward-only pass.
+        if cfg.rank == 0:
+            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+            metrics.log(
+                epoch=epoch,
+                step=global_step,
+                val_loss=val_loss,
+                val_ppl=val_ppl,
+            )
+            print(
+                f"[Baseline] Epoch {epoch+1}/{cfg.epochs} "
+                f"- val_loss={val_loss:.4f}, val_ppl={val_ppl:.1f}"
+            )
+        if cfg.world_size > 1:
+            dist.barrier()
+
+    if cfg.use_wandb and cfg.rank == 0:
         wandb.finish()
 
     return model
