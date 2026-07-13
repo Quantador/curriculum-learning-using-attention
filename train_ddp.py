@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from config import ExperimentConfig
+from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer, MixedLMDataset
 from distributed_utils import (
     build_and_cache_chunks,
@@ -60,6 +60,9 @@ def set_seed(seed: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", type=str, default=None,
+                    help="Path to a YAML file with ExperimentConfig field overrides, "
+                         "applied before the flags below (which take precedence).")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--single-dataset-samples", type=int, default=None)
     p.add_argument("--easy-hard-split", action="store_true",
@@ -97,7 +100,7 @@ def run() -> None:
     args = parse_args()
     rank, local_rank, world_size = setup_distributed()
 
-    cfg = ExperimentConfig()
+    cfg = load_config_from_yaml(args.config) if args.config else ExperimentConfig()
     cfg = apply_overrides(cfg, args)
 
     if cfg.run_aux_baseline and rank == 0:

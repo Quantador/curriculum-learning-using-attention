@@ -975,6 +975,8 @@ def train_router_experiments(
             config=vars(cfg),
             name=cfg.experiment_name,
         )
+        if cfg.config_path:
+            wandb.save(cfg.config_path, policy="now")
 
     model.to(cfg.device).train()
     router.to(cfg.device).train()
@@ -1375,6 +1377,8 @@ def train_aux_baseline(
             config=vars(cfg),
             name="aux_baseline",
         )
+        if cfg.config_path:
+            wandb.save(cfg.config_path, policy="now")
 
     model.to(cfg.device)
     aux_net.to(cfg.device)

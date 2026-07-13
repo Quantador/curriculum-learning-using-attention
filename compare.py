@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from config import ExperimentConfig
+from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
 from model import TinyGPT
 from router import build_router, get_router_feature_dim
@@ -35,8 +35,8 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def run_experiment():
-    cfg = ExperimentConfig()
+def run_experiment(config_path: str | None = None):
+    cfg = load_config_from_yaml(config_path) if config_path else ExperimentConfig()
     set_seed(cfg.seed)
 
     tokenizer = get_tokenizer()
@@ -132,4 +132,13 @@ def run_experiment():
 
 
 if __name__ == "__main__":
-    run_experiment()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a YAML file with ExperimentConfig field overrides "
+             "(defaults to ExperimentConfig() if omitted).",
+    )
+    args = parser.parse_args()
+    run_experiment(config_path=args.config)

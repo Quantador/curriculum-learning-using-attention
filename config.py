@@ -12,9 +12,11 @@ Two dataclasses:
 Typical usage:
     cfg = ExperimentConfig()           # sensible defaults
     cfg = replace(cfg, epochs=5, ...)  # override via dataclasses.replace
+    cfg = load_config_from_yaml("configs/my_run.yaml")  # override via YAML file
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 import torch
+import yaml
 
 @dataclass
 class Config:
@@ -70,6 +72,12 @@ class Config:
     wandb_entity: str | None = None
     save_dir: str = "results"
     log_every: int = 100
+
+    # Set automatically by load_config_from_yaml() to the source YAML path;
+    # not a hyperparameter. When set, training loops upload this file to the
+    # W&B run (see wandb.save() calls in training.py / rl_training.py) so the
+    # exact override file used for the run is attached alongside its metrics.
+    config_path: str | None = None
 
     @property
     def pool(self) -> int:
@@ -228,4 +236,36 @@ class ExperimentConfig(Config):
     # alternative to policy-gradient curriculum learning.
     run_aux_baseline: bool = False
     aux_net_hidden: int = 256
+
+
+def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> ExperimentConfig:
+    """
+    Apply field overrides from a YAML file on top of `cfg` (defaults to
+    ExperimentConfig() if not given). YAML keys must match ExperimentConfig
+    field names exactly, e.g.:
+
+        epochs: 5
+        training_algorithm: grpo
+        lambda_ent: 0.01
+
+    Only fields already present on `cfg` are accepted; an unrecognised key
+    raises ValueError immediately rather than silently doing nothing (the
+    likely outcome of a typo'd field name).
+    """
+    if cfg is None:
+        cfg = ExperimentConfig()
+    with open(path) as f:
+        overrides = yaml.safe_load(f) or {}
+
+    valid_fields = {f.name for f in fields(cfg)}
+    unknown = set(overrides) - valid_fields
+    if unknown:
+        raise ValueError(
+            f"Unknown config field(s) in {path}: {sorted(unknown)}. "
+            f"Valid fields: {sorted(valid_fields)}"
+        )
+    cfg = replace(cfg, **overrides)
+    # Always set from the real path, overriding any (unlikely) config_path
+    # key the YAML file itself tried to set.
+    return replace(cfg, config_path=path)
 

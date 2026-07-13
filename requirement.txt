@@ -18,6 +18,7 @@ huggingface_hub>=0.24
 numpy>=1.26
 torch==2.5.1
 tqdm>=4.66
+pyyaml>=6.0
 
 # (Optional, for local runs / notebooks)
 jupyter

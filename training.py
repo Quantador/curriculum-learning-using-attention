@@ -112,6 +112,8 @@ def train_baseline(
             config = vars(cfg),
             name = "baseline",
         )
+        if cfg.config_path:
+            wandb.save(cfg.config_path, policy="now")
 
         print("WandB initialized for baseline training.")
 
@@ -217,7 +219,9 @@ def train_router(
             config = vars(cfg),
             name = "router"
         )
-    
+        if cfg.config_path:
+            wandb.save(cfg.config_path, policy="now")
+
     model.to(cfg.device)
     router.to(cfg.device)
     model.train()
