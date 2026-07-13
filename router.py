@@ -129,6 +129,11 @@ def extract_router_features(
         )
         features.append(stats)
 
+    use_external_embbedings = getattr(cfg, "use_external_embeddings", False)
+    if use_external_embbedings and external_emb is None:
+        raise ValueError("Make sure there are external embeddings to be used "
+        "                   if use_external_embeddings is set to True")
+    
     if getattr(cfg, "use_external_embeddings", False) and external_emb is not None:
         features.append(external_emb)  # [B, external_embedding_dim]
 
