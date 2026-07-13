@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from config import Config
 
@@ -188,15 +189,21 @@ def extract_hierarchical_hidden(
                    (~10× faster but loses contextual information)
 
     Always runs under torch.no_grad() — never affects LM gradients.
+
+    Accepts model wrapped in DistributedDataParallel: forward_to_hidden/
+    tok_embed/pos_embed are accessed via model.module in that case, since
+    DDP only proxies its own registered submodules (the wrapped module as
+    a whole) through __getattr__, not the wrapped module's own attributes.
     """
+    m = model.module if isinstance(model, DDP) else model
     with torch.no_grad():
         repr_mode = getattr(cfg, "hierarchical_representation", "full")
         if repr_mode == "full":
-            h = model.forward_to_hidden(X)  # [B, L, D]
+            h = m.forward_to_hidden(X)  # [B, L, D]
         elif repr_mode == "embedder":
             b, L = X.size()
             pos = torch.arange(L, device=X.device).unsqueeze(0).expand(b, L)
-            h = model.tok_embed(X) + model.pos_embed(pos)
+            h = m.tok_embed(X) + m.pos_embed(pos)
         else:
             raise ValueError(f"Unknown hierarchical_representation: {repr_mode}")
     B, L, D = h.shape
