@@ -31,8 +31,8 @@ from tqdm import tqdm
 
 from config import Config
 from data import make_index_loader, MixedLMDataset
-from model import TinyGPT, AttentionRouter, extract_hierarchical_features
-from metrics import MetricsTracker, DiversityTracker
+from models.model import TinyGPT, AttentionRouter, extract_hierarchical_features
+from utils.metrics import MetricsTracker, DiversityTracker
 
 
 def compute_loss_per_sample(
@@ -110,7 +110,7 @@ def train_baseline(
             project = cfg.wandb_project,
             entity = cfg.wandb_entity,
             config = vars(cfg),
-            name = "baseline",
+            name = f"{cfg.experiment_name}_baseline",
         )
         if cfg.config_path:
             wandb.save(cfg.config_path, policy="now")
@@ -217,7 +217,7 @@ def train_router(
             project = cfg.wandb_project,
             entity = cfg.wandb_entity,
             config = vars(cfg),
-            name = "router"
+            name = f"{cfg.experiment_name}_router"
         )
         if cfg.config_path:
             wandb.save(cfg.config_path, policy="now")

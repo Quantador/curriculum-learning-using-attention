@@ -26,16 +26,19 @@ import argparse
 import sys
 import traceback
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config import ExperimentConfig
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
-from model import TinyGPT
-from router import build_router, get_router_feature_dim
+from models.model import TinyGPT
+from models.router import build_router, get_router_feature_dim
 from training import train_baseline, train_router, compare_runs
 from rl_training import train_aux_baseline
-from metrics import MetricsTracker, DiversityTracker
+from utils.metrics import MetricsTracker, DiversityTracker
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

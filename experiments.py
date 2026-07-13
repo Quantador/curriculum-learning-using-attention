@@ -33,10 +33,10 @@ from typing import Dict, List, Any
 
 from config import ExperimentConfig
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
-from model import TinyGPT, AttentionRouter
-from metrics import MetricsTracker, DiversityTracker
+from models.model import TinyGPT, AttentionRouter
+from utils.metrics import MetricsTracker, DiversityTracker
 
-from router import *
+from models.router import *
 from rl_training import *
 
 

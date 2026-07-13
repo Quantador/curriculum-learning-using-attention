@@ -1,0 +1,13 @@
+# Example ExperimentConfig override file.
+# Keys must match ExperimentConfig field names exactly (see config.py).
+# Any field not listed here keeps its dataclass default.
+#
+# Usage:
+#   python compare.py --config configs/example.yaml
+#   torchrun --standalone --nproc_per_node=2 train_ddp.py --config configs/example.yaml
+
+experiment_name: yaml_example
+epochs: 10
+batch: 16
+use_single_dataset: false 
+use_wandb: true 

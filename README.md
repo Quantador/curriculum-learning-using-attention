@@ -69,14 +69,14 @@ evaluated in a systematic one-factor-at-a-time study.
 | --- | --- |
 | `config.py` | `Config` and `ExperimentConfig` dataclasses — all hyperparameters |
 | `data.py` | Dataset loading, tokenisation, chunking; `MixedLMDataset` PyTorch dataset |
-| `model.py` | `TinyGPT` (causal LM), router architectures, feature extraction utilities |
-| `metrics.py` | `MetricsTracker` (logging + JSON), `DiversityTracker` (coverage stats) |
+| `models/model.py` | `TinyGPT` (causal LM), router architectures, feature extraction utilities |
+| `utils/metrics.py` | `MetricsTracker` (logging + JSON), `DiversityTracker` (coverage stats) |
 | `training.py` | Reference training loops: `train_baseline`, `train_router` (simplified) |
-| `router.py` | Router factory `build_router()`, `extract_router_features()`, `AuxNetRouter` |
+| `models/router.py` | Router factory `build_router()`, `extract_router_features()`, `AuxNetRouter` |
 | `rl_training.py` | Full RL training loop with all configurable algorithms and schedules |
 | `experiments.py` | Ablation orchestration: generates and runs one-factor-at-a-time configs |
 | `compare.py` | Entry point for a single baseline vs router vs aux-net comparison |
-| `smoke_test.py` | 6 end-to-end smoke tests — run after any structural change |
+| `tests/smoke_test.py` | 6 end-to-end smoke tests — run after any structural change |
 | `visualize.py` | Plots validation PPL, selection ratios, coverage, entropy, etc. |
 | `EXPERIMENTS.md` | Detailed CLI reference for `experiments.py` (all flags and field values) |
 
@@ -110,7 +110,7 @@ use the local HuggingFace cache (`~/.cache/huggingface/`).
 ### 1. Verify the install
 
 ```bash
-python smoke_test.py
+python tests/smoke_test.py
 ```
 Expected: `All 6 tests passed.`
 

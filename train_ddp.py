@@ -37,17 +37,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer, MixedLMDataset
-from distributed_utils import (
+from utils.distributed_utils import (
     build_and_cache_chunks,
     cleanup_distributed,
     setup_distributed,
     shard_and_truncate,
 )
-from model import TinyGPT
-from router import build_router, get_router_feature_dim
+from models.model import TinyGPT
+from models.router import build_router, get_router_feature_dim
 from training import train_baseline, compare_runs
 from rl_training import train_router_experiments
-from metrics import MetricsTracker, DiversityTracker
+from utils.metrics import MetricsTracker, DiversityTracker
 
 
 def set_seed(seed: int) -> None:

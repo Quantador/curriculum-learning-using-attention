@@ -43,10 +43,10 @@ from tqdm import tqdm
 
 from config import ExperimentConfig
 from data import make_index_loader, MixedLMDataset
-from model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
-from metrics import MetricsTracker, DiversityTracker
+from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
+from utils.metrics import MetricsTracker, DiversityTracker
 from training import evaluate  # keep using your existing evaluate()
-from router import extract_router_features
+from models.router import extract_router_features
 
 
 @torch.no_grad()
@@ -1375,7 +1375,7 @@ def train_aux_baseline(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             config=vars(cfg),
-            name="aux_baseline",
+            name=f"{cfg.experiment_name}_aux_baseline",
         )
         if cfg.config_path:
             wandb.save(cfg.config_path, policy="now")

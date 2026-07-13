@@ -18,11 +18,11 @@ import torch
 
 from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
-from model import build_model
-from router import build_router, get_router_feature_dim
+from models.model import build_model
+from models.router import build_router, get_router_feature_dim
 from training import train_baseline, train_router, compare_runs
 from rl_training import train_aux_baseline
-from metrics import MetricsTracker, DiversityTracker
+from utils.metrics import MetricsTracker, DiversityTracker
 
 
 def set_seed(seed: int):
