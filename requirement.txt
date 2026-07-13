@@ -1,3 +1,6 @@
+# PyTorch wheel index (cu121 build still ships sm_70 kernels for V100/Volta)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
 # Core
 transformers>=4.44
 datasets>=2.20
@@ -13,7 +16,7 @@ huggingface_hub>=0.24
 
 # Common utilities
 numpy>=1.26
-torch>=2.2
+torch==2.5.1
 tqdm>=4.66
 
 # (Optional, for local runs / notebooks)
