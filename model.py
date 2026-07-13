@@ -5,8 +5,15 @@ Model and router architecture definitions.
 TinyGPT:
   Small causal language model built on PyTorch's TransformerEncoder with a
   causal attention mask (upper-triangular -inf). Shares weights between the
-  token embedding and the LM head (weight tying). Used as the student LM
-  in all experiments.
+  token embedding and the LM head (weight tying). The default student LM.
+
+HFCausalLM:
+  Wraps a HuggingFace causal LM architecture (e.g. Qwen3-1.7B) behind the
+  same interface as TinyGPT, randomly initialized (not fine-tuned from a
+  checkpoint). Selected via Config.model_type == 'hf_pretrained'.
+
+build_model(vocab_size, cfg):
+  Factory that returns TinyGPT or HFCausalLM based on cfg.model_type.
 
 Router architectures (all produce a scalar score [B] per sample in the pool):
   AttentionRouter          — single (projection, query) pair; the baseline router
@@ -25,6 +32,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from config import Config
 
@@ -41,6 +49,8 @@ class TinyGPT(nn.Module):
     logits — used by extract_hierarchical_hidden() for feature extraction without
     a second full forward pass.
     """
+    supports_embedder_mode = True
+
     def __init__(self, vocab_size: int, cfg: Config):
         super().__init__()
         self.vocab_size = vocab_size
@@ -77,6 +87,90 @@ class TinyGPT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.forward_to_hidden(x)
         return self.lm_head(h)
+
+
+class HFCausalLM(nn.Module):
+    """
+    Wraps a HuggingFace causal LM architecture (e.g. Qwen3-1.7B) behind the
+    same interface TinyGPT exposes (forward, forward_to_hidden, d_model,
+    block, vocab_size), so it can be dropped into the existing curriculum
+    loop wherever a TinyGPT is expected.
+
+    Weights are randomly initialized from the architecture's config
+    (AutoModelForCausalLM.from_config) — this trains the architecture from
+    scratch, it does not load pretrained checkpoint weights.
+
+    'embedder' hierarchical_representation mode needs a learned absolute
+    positional embedding table. Architectures with one (e.g. GPT-2/GPT2-XL,
+    exposed as transformer.wpe) support it just like TinyGPT. RoPE-based
+    architectures (e.g. Qwen3) compute position inline in attention and have
+    no such table, so supports_embedder_mode is set dynamically per instance
+    based on whether one was actually found — extract_hierarchical_hidden()
+    checks this flag and raises a clear error rather than an AttributeError.
+    """
+    # Known (backbone_attr, pos_embed_attr) paths, in priority order.
+    _POS_EMBED_PATHS = [
+        ("transformer", "wpe"),  # GPT-2 family (gpt2, gpt2-xl, distilgpt2, ...)
+    ]
+
+    def __init__(self, model_name: str, vocab_size: int, block: int):
+        super().__init__()
+        hf_config = AutoConfig.from_pretrained(model_name)
+        hf_config.vocab_size = vocab_size
+        if hasattr(hf_config, "max_position_embeddings"):
+            hf_config.max_position_embeddings = max(
+                block, getattr(hf_config, "max_position_embeddings", block)
+            )
+        self.hf = AutoModelForCausalLM.from_config(hf_config)
+        self.vocab_size = vocab_size
+        self.block = block
+        self.d_model = hf_config.hidden_size
+
+        self._pos_embed_module = self._find_positional_embedding()
+        self.supports_embedder_mode = self._pos_embed_module is not None
+
+    def _find_positional_embedding(self) -> nn.Embedding | None:
+        for backbone_attr, pos_attr in self._POS_EMBED_PATHS:
+            backbone = getattr(self.hf, backbone_attr, None)
+            if backbone is not None and hasattr(backbone, pos_attr):
+                return getattr(backbone, pos_attr)
+        return None
+
+    @property
+    def tok_embed(self) -> nn.Embedding:
+        return self.hf.get_input_embeddings()
+
+    @property
+    def pos_embed(self) -> nn.Embedding:
+        if self._pos_embed_module is None:
+            raise AttributeError(
+                f"{type(self.hf).__name__} has no learned positional embedding table."
+            )
+        return self._pos_embed_module
+
+    def forward_to_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        # output_hidden_states works across HF causal LM architectures
+        # regardless of the backbone attribute name (Qwen3 uses `.model`,
+        # GPT-2 uses `.transformer`, etc.) — avoids hardcoding either.
+        return self.hf(input_ids=x, output_hidden_states=True).hidden_states[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.hf(input_ids=x).logits
+
+
+def build_model(vocab_size: int, cfg: Config) -> nn.Module:
+    """
+    Construct the student LM named by cfg.model_type:
+      'tiny_gpt'      — TinyGPT(vocab_size, cfg)
+      'hf_pretrained' — HFCausalLM(cfg.hf_model_name, vocab_size, cfg.block)
+    """
+    model_type = getattr(cfg, "model_type", "tiny_gpt")
+    if model_type == "tiny_gpt":
+        return TinyGPT(vocab_size=vocab_size, cfg=cfg)
+    elif model_type == "hf_pretrained":
+        return HFCausalLM(model_name=cfg.hf_model_name, vocab_size=vocab_size, block=cfg.block)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type!r}. Expected 'tiny_gpt' or 'hf_pretrained'.")
 
 
 class AttentionRouter(nn.Module):
@@ -201,6 +295,12 @@ def extract_hierarchical_hidden(
         if repr_mode == "full":
             h = m.forward_to_hidden(X)  # [B, L, D]
         elif repr_mode == "embedder":
+            if not getattr(m, "supports_embedder_mode", True):
+                raise ValueError(
+                    f"{type(m).__name__} does not support "
+                    "hierarchical_representation='embedder' (no separate "
+                    "learned positional embedding table). Use 'full' instead."
+                )
             b, L = X.size()
             pos = torch.arange(L, device=X.device).unsqueeze(0).expand(b, L)
             h = m.tok_embed(X) + m.pos_embed(pos)

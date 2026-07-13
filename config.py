@@ -34,6 +34,16 @@ class Config:
     # options: full (transformer hidden), embedder (token+pos embeddings)
     hierarchical_representation: str = "full"
 
+    # Student LM architecture, built via model.build_model():
+    #   'tiny_gpt'      — small from-scratch TransformerEncoder (default)
+    #   'hf_pretrained' — HuggingFace architecture named by hf_model_name
+    #                     (e.g. "Qwen/Qwen3-1.7B"), randomly initialized and
+    #                     trained from scratch, not fine-tuned from checkpoint
+    # When 'hf_pretrained' is used, get_tokenizer(cfg.hf_model_name) must be
+    # used too, since token ids must match the model's vocabulary.
+    model_type: str = "tiny_gpt"
+    hf_model_name: str = "Qwen/Qwen3-1.7B"
+
     # Training
     batch: int = 16
     pool_mult: int = 5
