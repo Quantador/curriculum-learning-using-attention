@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import random
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import torch
@@ -28,11 +29,33 @@ import torch.distributed as dist
 from torch import nn
 
 from tqdm import tqdm
-
+from time import perf_counter
 from config import Config
 from data import make_index_loader, MixedLMDataset
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_features
 from utils.metrics import MetricsTracker, DiversityTracker
+
+
+@contextmanager
+def _timed(stage_times: dict, name: str, device: str, active: bool):
+    """
+    Accumulate wall-clock time for a named stage into stage_times[name].
+
+    No-ops (near-zero overhead) unless `active`, so callers should only pass
+    active=True on the same steps they're about to log — a full CUDA sync on
+    every step would itself distort the measurements it's trying to take.
+    """
+    if not active:
+        yield
+        return
+    is_cuda = device.startswith("cuda")
+    if is_cuda:
+        torch.cuda.synchronize()
+    t0 = perf_counter()
+    yield
+    if is_cuda:
+        torch.cuda.synchronize()
+    stage_times[name] = stage_times.get(name, 0.0) + (perf_counter() - t0)
 
 
 def compute_loss_per_sample(
@@ -233,6 +256,7 @@ def train_router(
 
     total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
     global_step = 0
+    stage_times: dict = {}
 
     for epoch in range(cfg.epochs):
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
@@ -241,68 +265,81 @@ def train_router(
             if len(pool_indices) < cfg.batch:
                 continue
 
-            batch = [train_ds[i] for i in pool_indices]
-            xs, ys, diffs = zip(*batch)
+            # Time this step iff it's the one about to hit the log_every
+            # print/log below — see _timed()'s docstring for why.
+            profile_step = ((global_step + 1) % cfg.log_every == 0)
 
-            X = torch.stack(xs).to(cfg.device)  # [M, L]
-            Y = torch.stack(ys).to(cfg.device)  # [M, L]
-            M = X.size(0)
+            with _timed(stage_times, "data_gather", cfg.device, profile_step):
+                batch = [train_ds[i] for i in pool_indices]
+                xs, ys, diffs = zip(*batch)
 
-            feats = extract_hierarchical_features(
-                model=model,
-                X=X,
-                cfg=cfg,
-                pad_token_id=tokenizer.pad_token_id,
-                vocab_size=tokenizer.vocab_size,
-            )  # [M, d_in]
+                X = torch.stack(xs).to(cfg.device)  # [M, L]
+                Y = torch.stack(ys).to(cfg.device)  # [M, L]
+                M = X.size(0)
 
-            # Append pre-computed external embeddings when available.
-            if train_ds.embeddings is not None:
-                pool_embs = torch.stack(
-                    [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
-                feats = torch.cat([feats, pool_embs], dim=1)
+            with _timed(stage_times, "feature_extraction", cfg.device, profile_step):
+                feats = extract_hierarchical_features(
+                    model=model,
+                    X=X,
+                    cfg=cfg,
+                    pad_token_id=tokenizer.pad_token_id,
+                    vocab_size=tokenizer.vocab_size,
+                )  # [M, d_in]
 
-            scores = router(feats)  # [M]
-            probs = torch.softmax(scores / cfg.temp, dim=0)  # [M]
+                # Append pre-computed external embeddings when available.
+                if train_ds.embeddings is not None:
+                    pool_embs = torch.stack(
+                        [train_ds.embeddings[i] for i in pool_indices]
+                    ).to(cfg.device)
+                    feats = torch.cat([feats, pool_embs], dim=1)
 
-            topk = torch.topk(probs, k=cfg.batch)
-            sel_idx_local = topk.indices
-            sel_probs = probs[sel_idx_local].clamp_min(1e-12)
+            with _timed(stage_times, "router_select", cfg.device, profile_step):
+                scores = router(feats)  # [M]
+                probs = torch.softmax(scores / cfg.temp, dim=0)  # [M]
 
-            X_sel = X[sel_idx_local]
-            Y_sel = Y[sel_idx_local]
-            selected_diffs = [diffs[i] for i in sel_idx_local.tolist()]
-            selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
+                topk = torch.topk(probs, k=cfg.batch)
+                sel_idx_local = topk.indices
+                sel_probs = probs[sel_idx_local].clamp_min(1e-12)
 
-            loss_before = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
+                X_sel = X[sel_idx_local]
+                Y_sel = Y[sel_idx_local]
+                selected_diffs = [diffs[i] for i in sel_idx_local.tolist()]
+                selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
 
-            opt_lm.zero_grad()
-            logits_sel = model(X_sel)
-            loss_lm = loss_fn(
-                logits_sel.view(-1, logits_sel.size(-1)),
-                Y_sel.view(-1),
-            )
-            loss_lm.backward()
-            opt_lm.step()
+            with _timed(stage_times, "loss_before", cfg.device, profile_step):
+                loss_before = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
 
-            loss_after = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
-            improvement = (loss_before - loss_after).clamp(min=0.0)
-            baseline = improvement.mean().detach()
+            with _timed(stage_times, "lm_forward_backward", cfg.device, profile_step):
+                opt_lm.zero_grad()
+                logits_sel = model(X_sel)
+                loss_lm = loss_fn(
+                    logits_sel.view(-1, logits_sel.size(-1)),
+                    Y_sel.view(-1),
+                )
+                loss_lm.backward()
+                opt_lm.step()
 
-            reinforce = -((improvement - baseline) * sel_probs.log()).mean()
-            ent = (probs * probs.clamp_min(1e-12).log()).sum()
-            # ent = sum(p * log p) = -H(p), the *negative* Shannon entropy.
-            # Adding lambda_ent * ent to the loss penalises low-entropy distributions,
-            # so minimising the total loss pushes the router toward diverse selection.
+            with _timed(stage_times, "loss_after", cfg.device, profile_step):
+                loss_after = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
 
-            loss_router = reinforce + cfg.lambda_ent * ent
+            with _timed(stage_times, "router_update", cfg.device, profile_step):
+                improvement = (loss_before - loss_after).clamp(min=0.0)
+                baseline = improvement.mean().detach()
 
-            opt_router.zero_grad()
-            loss_router.backward()
-            opt_router.step()
+                reinforce = -((improvement - baseline) * sel_probs.log()).mean()
+                ent = (probs * probs.clamp_min(1e-12).log()).sum()
+                # ent = sum(p * log p) = -H(p), the *negative* Shannon entropy.
+                # Adding lambda_ent * ent to the loss penalises low-entropy distributions,
+                # so minimising the total loss pushes the router toward diverse selection.
 
-            diversity.update(selected_indices, selected_diffs)
+                loss_router = reinforce + cfg.lambda_ent * ent
+
+                opt_router.zero_grad()
+                loss_router.backward()
+                opt_router.step()
+
+            with _timed(stage_times, "diversity_update", cfg.device, profile_step):
+                diversity.update(selected_indices, selected_diffs)
 
             global_step += 1
             if global_step % cfg.log_every == 0:
@@ -318,10 +355,18 @@ def train_router(
                     entropy=-ent.item(),
                     avg_improvement=improvement.mean().item(),
                     curriculum_strength=curriculum_strength,
+                    **{f"time/{k}_ms": v * 1000 for k, v in stage_times.items()},
                     **div_metrics,
                 )
-                
+
+                total_t = sum(stage_times.values()) or 1e-12
+                breakdown = "  ".join(
+                    f"{k}={v / total_t * 100:.0f}%({v * 1000:.0f}ms)"
+                    for k, v in sorted(stage_times.items(), key=lambda kv: -kv[1])
+                )
                 print(f"[Router] Step {global_step} - loss_lm={loss_lm.item():.4f}, loss_router={loss_router.item():.4f}")
+                print(f"[Router] Step {global_step} timing (1 step, sums to {total_t*1000:.0f}ms): {breakdown}")
+                stage_times = {}
 
         val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
         metrics.log(

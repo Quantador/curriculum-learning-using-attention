@@ -56,9 +56,10 @@ def run_experiment(config_path: str | None = None):
     # Feature dimensionality for the router (accounts for all enabled feature groups)
     d_input = get_router_feature_dim(cfg)
 
+    """
     # --- Baseline training ---
     print("\n=== Baseline training ===")
-    model_base  = build_model(vocab_size=tokenizer.vocab_size, cfg=cfg)
+    model_base  = build_model(vocab_size=len(tokenizer), cfg=cfg)
     base_metrics = MetricsTracker("baseline", use_wandb=cfg.use_wandb)
     base_div     = DiversityTracker(len(train_ds))
 
@@ -71,12 +72,12 @@ def run_experiment(config_path: str | None = None):
         diversity=base_div,
     )
     base_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
-
+    """ 
     # --- Router training ---
     print("\n=== Router training ===")
     set_seed(cfg.seed)
 
-    model_router  = build_model(vocab_size=tokenizer.vocab_size, cfg=cfg)
+    model_router  = build_model(vocab_size=len(tokenizer), cfg=cfg)
     router = build_router(
         d_input=d_input,
         arch=cfg.router_architecture,
@@ -104,7 +105,7 @@ def run_experiment(config_path: str | None = None):
         print("\n=== Auxiliary network baseline training ===")
         set_seed(cfg.seed)
 
-        model_aux = build_model(vocab_size=tokenizer.vocab_size, cfg=cfg)
+        model_aux = build_model(vocab_size=len(tokenizer), cfg=cfg)
         aux_net   = build_router(
             d_input=d_input,
             arch="auxnet",
@@ -127,8 +128,8 @@ def run_experiment(config_path: str | None = None):
         aux_metrics.save(f"{cfg.save_dir}/aux_baseline_metrics.json")
 
     # --- Final comparison ---
-    print("\n=== Final comparison ===")
-    compare_runs(base_metrics, router_metrics, aux_metrics)
+    #print("\n=== Final comparison ===")
+    #compare_runs(base_metrics, router_metrics, aux_metrics)
 
 
 if __name__ == "__main__":
