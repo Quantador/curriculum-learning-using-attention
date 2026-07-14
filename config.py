@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, fields, replace
 import os
 import torch
 import yaml
+from transformers import AutoConfig
 
 @dataclass
 class Config:
@@ -80,6 +81,22 @@ class Config:
     # exact override file used for the run is attached alongside its metrics.
     config_path: str | None = None
 
+    def __post_init__(self):
+        # d_model/n_layers/n_heads/d_ff describe TinyGPT's architecture, but
+        # for 'hf_pretrained' the real architecture comes from the checkpoint
+        # itself (see HFCausalLM in models/model.py, which reads hf_config.*
+        # and ignores these fields entirely). Code that runs before the model
+        # is built — e.g. get_router_feature_dim() in models/router.py, which
+        # sizes the router from cfg.n_chunks * cfg.d_model — has no other way
+        # to know the checkpoint's real hidden size, so these are overwritten
+        # here to keep them truthful rather than left at the tiny_gpt defaults.
+        if self.model_type == "hf_pretrained":
+            hf_cfg = AutoConfig.from_pretrained(self.hf_model_name)
+            self.d_model = hf_cfg.hidden_size
+            self.n_layers = hf_cfg.num_hidden_layers
+            self.n_heads = hf_cfg.num_attention_heads
+            self.d_ff = getattr(hf_cfg, "intermediate_size", self.d_ff)
+
     @property
     def pool(self) -> int:
         return self.pool_mult * self.batch
@@ -108,10 +125,20 @@ class ExperimentConfig(Config):
       - Caching: feature_cache_epochs (0 = disabled)
     """
     experiment_name: str = "presentation_experiment"
-    
-    wandb_project: str = "curriculum-learning-"+experiment_name
-    
-    save_dir: str = "results/" + experiment_name
+
+    # None = derive from experiment_name in __post_init__ below. Fields are
+    # computed once at class-definition time from the *default* experiment_name,
+    # so a plain string default here would silently ignore any override of
+    # experiment_name (constructor kwarg, dataclasses.replace(), or YAML).
+    wandb_project: str | None = None
+    save_dir: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.wandb_project is None:
+            self.wandb_project = f"curriculum-learning-{self.experiment_name}"
+        if self.save_dir is None:
+            self.save_dir = f"results/{self.experiment_name}"
 
 
     # Data mixing
@@ -260,6 +287,17 @@ def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> Exp
         cfg = ExperimentConfig()
     with open(path) as f:
         overrides = yaml.safe_load(f) or {}
+
+    # save_dir/wandb_project are lazily derived from experiment_name in
+    # __post_init__, but only when still None; by this point cfg already has
+    # them resolved to concrete strings (from the ExperimentConfig() default
+    # above, or from the caller-supplied cfg). If the YAML overrides
+    # experiment_name without also overriding these, force them back to None
+    # so __post_init__ re-derives from the new name instead of keeping the
+    # stale resolved value from the old one.
+    if "experiment_name" in overrides:
+        overrides.setdefault("save_dir", None)
+        overrides.setdefault("wandb_project", None)
 
     valid_fields = {f.name for f in fields(cfg)}
     unknown = set(overrides) - valid_fields

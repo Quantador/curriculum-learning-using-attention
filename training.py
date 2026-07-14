@@ -283,9 +283,9 @@ def train_router(
                     X=X,
                     cfg=cfg,
                     pad_token_id=tokenizer.pad_token_id,
-                    vocab_size=tokenizer.vocab_size,
+                    vocab_size=len(tokenizer),
                 )  # [M, d_in]
-
+                print(f"{feats.shape=}")
                 # Append pre-computed external embeddings when available.
                 if train_ds.embeddings is not None:
                     pool_embs = torch.stack(
