@@ -266,6 +266,9 @@ def train_router(
         Xv, Yv, _ = zip(*(val_ds[i] for i in val_idx))
         X_val = torch.stack(Xv).to(cfg.device)
         Y_val = torch.stack(Yv).to(cfg.device)
+        
+        print(f"{X_val.shape=}, {Y_val.shape=}")
+
         ghost_engine = GhostEngineManager(
             config=SimpleNamespace(
                 method="GradDotProd",
