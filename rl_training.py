@@ -6,9 +6,9 @@ This is the experiment-grade router training loop used by experiments.py
 
 Key features over the reference loop in training.py:
   - Three policy gradient algorithms: REINFORCE, GRPO, PPO
-  - Eight reward signals: loss_improvement, neg_loss, relative_improvement,
+  - Nine reward signals: loss_improvement, neg_loss, relative_improvement,
     difficulty_weighted, uncertainty_reduction, gradient_norm,
-    gradient_alignment, combined
+    gradient_alignment, combined, greats_score
   - Four entropy formulations: Shannon, Rényi, Tsallis, KL-uniform
   - SAC-style entropy targeting (auto-adjusts lambda_ent to hit a target entropy)
   - Coverage regularisation (penalises repeated sample selection)
@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import time
+from types import SimpleNamespace
 from typing import Tuple
 
 import torch
@@ -47,6 +49,7 @@ from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, 
 from utils.metrics import MetricsTracker, DiversityTracker
 from training import evaluate  # keep using your existing evaluate()
 from models.router import extract_router_features
+from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 
 
 @torch.no_grad()
@@ -590,6 +593,7 @@ def compute_reward(
     entropy_before: torch.Tensor | None = None,
     entropy_after: torch.Tensor | None = None,
     gradient_reward: torch.Tensor | None = None,
+    greats_reward: torch.Tensor | None = None,
     cfg: ExperimentConfig | None = None,
 ) -> torch.Tensor:
     """
@@ -603,6 +607,8 @@ def compute_reward(
         entropy_before: Per-sample entropy before update [B] (optional)
         entropy_after: Per-sample entropy after update [B] (optional)
         gradient_reward: Scalar or per-sample gradient reward (optional)
+        greats_reward: Scalar GREATS ghost-gradient-dot-product score, summed over
+            the selected batch (optional; see reward_signal='greats_score' in Config)
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -644,6 +650,16 @@ def compute_reward(
         if gradient_reward.dim() == 0:
             return gradient_reward.expand_as(loss_before)
         return gradient_reward
+
+    elif reward_signal == "greats_score":
+        # A single scalar (sum of the ghost gradient-dot-product scores of the
+        # selected batch, against the fixed val batch) shared by every selected
+        # sample — the router's "action" is the joint selection, not per-sample.
+        if greats_reward is None:
+            return torch.zeros_like(loss_before)
+        if greats_reward.dim() == 0:
+            return greats_reward.expand_as(loss_before)
+        return greats_reward
 
     elif reward_signal == "combined":
         # Weighted combination of multiple signals
@@ -988,6 +1004,35 @@ def train_router_experiments(
     grad_param_count = sum(p.numel() for p in grad_params)
     grad_ema = None
 
+    # GREATS ghost gradient-dot-product scorer, built when reward_signal='greats_score'
+    # (GPT-2-family HF checkpoints only, validated in Config.__post_init__);
+    # GhostSuite's per-sample-gradient hooks can't see TinyGPT's nn.MultiheadAttention
+    # or Qwen3's RMSNorm/custom Linear stack.
+    ghost_engine = None
+    if cfg.reward_signal == "greats_score":
+        val_idx = random.sample(range(len(val_ds)), cfg.greats_val_batch_size)
+        Xv, Yv, _ = zip(*(val_ds[i] for i in val_idx))
+        X_val = torch.stack(Xv).to(cfg.device)
+        Y_val = torch.stack(Yv).to(cfg.device)
+        ghost_engine = GhostEngineManager(
+            config=SimpleNamespace(
+                method="GradDotProd",
+                result_dir=os.path.join(cfg.save_dir, "ghost"),
+                val_batch_size=cfg.greats_val_batch_size,
+                log_grad_norms=cfg.greats_log_grad_norms,
+                score_exclude_params=cfg.greats_score_exclude_params,
+                # Eager engine only: the decoupled/compiled fast path hardcodes
+                # GPT-2/nanoGPT-shaped model.transformer.h + forward(idx, idx)->.loss,
+                # which doesn't match build_model()'s HFCausalLM/TinyGPT forward signature.
+                decoupled_fn=False,
+                separate_val=False,
+            ),
+            model=model,
+            optimizer=opt_lm,
+            ddp_info={"master_process": cfg.rank == 0},
+            val_data=(X_val, Y_val),
+        )
+
     # Initialize moving average baseline if needed
     moving_avg_baseline = None
     if cfg.baseline_type == "moving_avg":
@@ -1128,7 +1173,30 @@ def train_router_experiments(
             selected_diffs = [diffs[i] for i in sel_idx.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx.tolist()]
 
+            # --- GREATS ghost-gradient scoring (before the real LM update: a separate
+            # scoring backward on X_sel/Y_sel against the fixed val batch, discarded
+            # afterwards) ---
+            greats_reward = None
+            if ghost_engine is not None and cfg.reward_signal == "greats_score":
+                ghost_engine.begin_step()
+                ghost_engine.attach_train_batch(X_sel, Y_sel, global_step)
+                with ghost_engine.saved_tensors_context():
+                    Xf, Yf = ghost_engine.prepare_forward_input(X_sel, Y_sel)
+                    logits_score = model(Xf)
+                    B_s, L_s, V_s = logits_score.shape
+                    loss_score = F.cross_entropy(
+                        logits_score.view(B_s * L_s, V_s), Yf.view(B_s * L_s),
+                    )
+                    loss_score.backward()
+                ghost_engine.collect_microbatch()
+                greats_reward = ghost_engine.read_scores(
+                    metric=cfg.greats_score_metric
+                ).to(cfg.device).sum()
+                ghost_engine.discard_scores()
+
             # --- LM forward and update ---
+            # Clears the GREATS scoring pass's leftover grads (if any) as well as
+            # zeroing for this real step.
             opt_lm.zero_grad()
 
             logits = model(X_sel)  # [B, L, V]
@@ -1181,6 +1249,7 @@ def train_router_experiments(
                 entropy_before=entropy_before,
                 entropy_after=entropy_after,
                 gradient_reward=gradient_reward,
+                greats_reward=greats_reward,
                 cfg=cfg,
             )
 

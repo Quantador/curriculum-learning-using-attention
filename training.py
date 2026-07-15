@@ -20,8 +20,10 @@ Entry points that call this module:
 from __future__ import annotations
 
 import math
+import os
 import random
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import torch
@@ -34,7 +36,7 @@ from config import Config
 from data import make_index_loader, MixedLMDataset
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_features
 from utils.metrics import MetricsTracker, DiversityTracker
-
+from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 
 @contextmanager
 def _timed(stage_times: dict, name: str, device: str, active: bool):
@@ -257,6 +259,32 @@ def train_router(
     total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
     global_step = 0
     stage_times: dict = {}
+    
+    ghost_engine = None
+    if cfg.reward_signal == "greats_score":
+        val_idx = random.sample(range(len(val_ds)), cfg.greats_val_batch_size)
+        Xv, Yv, _ = zip(*(val_ds[i] for i in val_idx))
+        X_val = torch.stack(Xv).to(cfg.device)
+        Y_val = torch.stack(Yv).to(cfg.device)
+        ghost_engine = GhostEngineManager(
+            config=SimpleNamespace(
+                method="GradDotProd",
+                result_dir=os.path.join(cfg.save_dir, "ghost"),
+                val_batch_size=cfg.greats_val_batch_size,
+                log_grad_norms=cfg.greats_log_grad_norms,
+                score_exclude_params=cfg.greats_score_exclude_params,
+                # Eager engine only: the decoupled/compiled fast path hardcodes
+                # GPT-2/nanoGPT-shaped model.transformer.h + forward(idx, idx)->.loss,
+                # which doesn't match build_model()'s HFCausalLM/TinyGPT forward signature.
+                decoupled_fn=False,
+                separate_val=False,
+            ),
+            model=model,
+            optimizer=opt_lm,
+            ddp_info={"master_process": cfg.rank == 0},
+            val_data=(X_val, Y_val),
+        )
+    greats_baseline = None  # EMA baseline for the GREATS-sum reward (see router_update below)
 
     for epoch in range(cfg.epochs):
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
@@ -285,7 +313,7 @@ def train_router(
                     pad_token_id=tokenizer.pad_token_id,
                     vocab_size=len(tokenizer),
                 )  # [M, d_in]
-                print(f"{feats.shape=}")
+
                 # Append pre-computed external embeddings when available.
                 if train_ds.embeddings is not None:
                     pool_embs = torch.stack(
@@ -306,10 +334,35 @@ def train_router(
                 selected_diffs = [diffs[i] for i in sel_idx_local.tolist()]
                 selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
 
-            with _timed(stage_times, "loss_before", cfg.device, profile_step):
-                loss_before = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
+
+            # GREATS ghost-gradient scoring: score the router's SELECTED batch against the
+            # fixed validation batch (a separate scoring backward, discarded afterwards — the
+            # real LM update below is an ordinary forward/backward on the same X_sel/Y_sel).
+            ghost_scores_sel = None
+            if ghost_engine is not None:
+                with _timed(stage_times, "greats_scoring", cfg.device, profile_step):
+                    ghost_engine.begin_step()
+                    ghost_engine.attach_train_batch(X_sel, Y_sel, global_step)
+                    with ghost_engine.saved_tensors_context():
+                        Xf, Yf = ghost_engine.prepare_forward_input(X_sel, Y_sel)
+                        logits_score = model(Xf)
+                        loss_score = loss_fn(
+                            logits_score.view(-1, logits_score.size(-1)),
+                            Yf.view(-1),
+                        )
+                        loss_score.backward()
+                    ghost_engine.collect_microbatch()
+                    ghost_scores_sel = ghost_engine.read_scores(
+                        metric=cfg.greats_score_metric
+                    ).to(cfg.device)
+                    ghost_engine.discard_scores()
+            else:
+                with _timed(stage_times, "loss_before", cfg.device, profile_step):
+                    loss_before = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
 
             with _timed(stage_times, "lm_forward_backward", cfg.device, profile_step):
+                # Clears the scoring pass's leftover grads (if any) as well as zeroing for
+                # this real step.
                 opt_lm.zero_grad()
                 logits_sel = model(X_sel)
                 loss_lm = loss_fn(
@@ -319,14 +372,30 @@ def train_router(
                 loss_lm.backward()
                 opt_lm.step()
 
-            with _timed(stage_times, "loss_after", cfg.device, profile_step):
-                loss_after = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
+            if ghost_engine is None:
+                with _timed(stage_times, "loss_after", cfg.device, profile_step):
+                    loss_after = compute_loss_per_sample(model, X_sel, Y_sel, loss_fn)
 
             with _timed(stage_times, "router_update", cfg.device, profile_step):
-                improvement = (loss_before - loss_after).clamp(min=0.0)
-                baseline = improvement.mean().detach()
+                if ghost_scores_sel is not None:
+                    # Reward = sum of the GREATS scores of the samples the router chose: a
+                    # single scalar shared by every selected sample (the "action" is the joint
+                    # selection). Baselined with an EMA across steps, since a per-step batch-mean
+                    # baseline would always cancel a scalar reward to zero.
+                    reward = ghost_scores_sel.sum()
+                    if greats_baseline is None:
+                        greats_baseline = reward.detach()
+                    else:
+                        m = cfg.baseline_momentum
+                        greats_baseline = m * greats_baseline + (1 - m) * reward.detach()
+                    advantage = reward - greats_baseline
+                    improvement_metric = reward.detach()
+                else:
+                    improvement = (loss_before - loss_after).clamp(min=0.0)
+                    advantage = improvement - improvement.mean().detach()
+                    improvement_metric = improvement.mean().detach()
 
-                reinforce = -((improvement - baseline) * sel_probs.log()).mean()
+                reinforce = -(advantage * sel_probs.log()).mean()
                 ent = (probs * probs.clamp_min(1e-12).log()).sum()
                 # ent = sum(p * log p) = -H(p), the *negative* Shannon entropy.
                 # Adding lambda_ent * ent to the loss penalises low-entropy distributions,
@@ -353,7 +422,7 @@ def train_router(
                     loss_router=loss_router.item(),
                     reinforce=reinforce.item(),
                     entropy=-ent.item(),
-                    avg_improvement=improvement.mean().item(),
+                    avg_improvement=improvement_metric.item(),
                     curriculum_strength=curriculum_strength,
                     **{f"time/{k}_ms": v * 1000 for k, v in stage_times.items()},
                     **div_metrics,

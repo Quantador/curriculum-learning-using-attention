@@ -140,6 +140,33 @@ class ExperimentConfig(Config):
         if self.save_dir is None:
             self.save_dir = f"results/{self.experiment_name}"
 
+        if self.reward_signal == "greats_score":
+            # GREATS-style ghost gradient-dot-product scoring (GhostSuite/ghostEngines,
+            # via GhostEngineManager). Only supported for GPT-2-family HF checkpoints:
+            # the scorer's per-sample-gradient hooks match nn.Linear / nn.Embedding /
+            # nn.LayerNorm / HF Conv1D by EXACT type, not isinstance. TinyGPT's attention
+            # is nn.MultiheadAttention (its in_proj_weight has no leaf-module hook target
+            # at all, and out_proj is a Linear *subclass* that fails the exact-type
+            # check), and Qwen3 uses a custom RMSNorm plus its own Linear stack — both
+            # leave most/all of the model's gradient invisible to the scorer.
+            if self.model_type != "hf_pretrained":
+                raise ValueError(
+                    "reward_signal='greats_score' requires model_type='hf_pretrained' "
+                    "with a GPT-2-family checkpoint; GhostSuite's ghost gradient-dot-"
+                    f"product hooks can't see {self.model_type!r}'s attention layers."
+                )
+            hf_arch = AutoConfig.from_pretrained(self.hf_model_name).model_type
+            if hf_arch != "gpt2":
+                raise ValueError(
+                    f"reward_signal='greats_score' only supports GPT-2-family "
+                    f"checkpoints; hf_model_name={self.hf_model_name!r} resolves to "
+                    f"architecture {hf_arch!r}. GhostSuite's hooks match nn.Linear/"
+                    "nn.Embedding/nn.LayerNorm/HF Conv1D by exact type, so e.g. "
+                    "Qwen3's RMSNorm layers are invisible to the scorer. Pick a "
+                    "GPT-2 checkpoint (gpt2, gpt2-medium, gpt2-large, ...) or a "
+                    "different reward_signal."
+                )
+
 
     # Data mixing
     easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
@@ -192,7 +219,18 @@ class ExperimentConfig(Config):
     #   - gradient_norm: ||∇θ L_LM(S_t)|| - batch gradient magnitude
     #   - gradient_alignment: <g_t, g_ema> - alignment with EMA gradient
     #   - combined: weighted sum of multiple signals
+    #   - greats_score: sum of ghost gradient-dot-product scores <g_i, g_val> over
+    #     the selected batch (one scalar shared by every sample) - GPT-2-family HF
+    #     checkpoint only (validated in __post_init__). A constant reward across
+    #     the batch makes baseline_type='batch_mean' always cancel to zero
+    #     advantage; use baseline_type='moving_avg' instead.
     reward_signal: str = "loss_improvement"
+
+    # GhostSuite/ghostEngines scoring knobs, used only when reward_signal='greats_score'.
+    greats_val_batch_size: int = 16
+    greats_score_metric: str = "dot"  # options: dot, cosine (cosine forces greats_log_grad_norms)
+    greats_log_grad_norms: bool = False
+    greats_score_exclude_params: list[str] = field(default_factory=list)
 
     # Weights for combined reward signal
     reward_weight_improvement: float = 1.0
