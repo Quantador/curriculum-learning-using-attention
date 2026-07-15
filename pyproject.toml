@@ -1,0 +1,43 @@
+[project]
+name = "curriculum-learning-using-attention"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    # --- from GhostSuite/pyproject.toml, torch re-pinned to cu121 (see below) ---
+    "torch==2.5.1+cu121",
+    "numpy==2.3.5",
+    "transformers==4.57.1",
+    "datasets==4.4.2",
+    "tqdm==4.67.1",
+    "wandb==0.23.1",
+    "jaxtyping==0.3.5",
+    "einops==0.8.1",
+    "tiktoken",
+    "matplotlib",
+    "torchtitan",
+    "peft>=0.19.1",
+    # --- from requirement.txt, not already covered above ---
+    "accelerate>=0.31",
+    "evaluate>=0.4",
+    "huggingface_hub>=0.24",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+notebook = ["jupyter"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchtitan = { path = "GhostSuite/examples/torchtitan", editable = true }
+
+# Dedicated CUDA 12.1 wheel index for torch; explicit so it is used only for
+# packages that opt in via [tool.uv.sources], not for general resolution.
+# cu121 is required by the target cluster's driver; torch tops out at 2.5.1
+# on this index (GhostSuite's own env uses 2.11.0+cu128 and is not
+# cluster-compatible, hence the downgrade here).
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
