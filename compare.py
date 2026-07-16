@@ -56,7 +56,7 @@ def run_experiment(config_path: str | None = None):
     # Feature dimensionality for the router (accounts for all enabled feature groups)
     d_input = get_router_feature_dim(cfg)
 
-    """
+    
     # --- Baseline training ---
     print("\n=== Baseline training ===")
     model_base  = build_model(vocab_size=len(tokenizer), cfg=cfg)
@@ -72,7 +72,7 @@ def run_experiment(config_path: str | None = None):
         diversity=base_div,
     )
     base_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
-    """ 
+    
     # --- Router training ---
     print("\n=== Router training ===")
     set_seed(cfg.seed)

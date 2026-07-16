@@ -107,7 +107,7 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 # Predefined experiment profiles (subset of ablations)
 FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # Neg loss, gradient magnitude
-    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["neg_loss", "gradient_norm"]),
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["neg_loss", "gradient_norm", "greats_score"]),
     # GRPO, PPO
     "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "reinforce"]),
     # Shannon fixed vs Shannon with decay (linear)
