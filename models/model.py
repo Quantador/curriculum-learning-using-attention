@@ -88,6 +88,19 @@ class TinyGPT(nn.Module):
         h = self.forward_to_hidden(x)
         return self.lm_head(h)
 
+    def forward_to_layer(self, x: torch.Tensor, num_layers: int) -> torch.Tensor:
+        """Hidden state after exactly `num_layers` transformer layers (0 =
+        embeddings only, self.tr's full layer count = same as forward_to_hidden)."""
+        b, L = x.size()
+        pos = torch.arange(L, device=x.device).unsqueeze(0).expand(b, L)
+        h = self.tok_embed(x) + self.pos_embed(pos)
+        if num_layers == 0:
+            return h
+        mask = self._causal_mask(L, x.device)
+        for layer in self.tr.layers[:num_layers]:
+            h = layer(h, src_mask=mask)
+        return h
+
 
 class HFCausalLM(nn.Module):
     """
@@ -176,6 +189,22 @@ class HFCausalLM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         position_ids = self._expanded_position_ids(x)
         return self.hf(input_ids=x, position_ids=position_ids).logits
+
+    def forward_to_layer(self, x: torch.Tensor, num_layers: int) -> torch.Tensor:
+        """Hidden state after exactly `num_layers` transformer layers.
+
+        HF's forward has no architecture-agnostic way to stop early, so this
+        still runs the full stack and reads out an intermediate hidden state
+        from output_hidden_states — same compute cost as forward_to_hidden,
+        unlike TinyGPT.forward_to_layer which actually skips later layers.
+        hidden_states[0] is the embedding output, hidden_states[-1] matches
+        forward_to_hidden's output.
+        """
+        position_ids = self._expanded_position_ids(x)
+        hidden_states = self.hf(
+            input_ids=x, position_ids=position_ids, output_hidden_states=True
+        ).hidden_states
+        return hidden_states[num_layers]
 
 
 def build_model(vocab_size: int, cfg: Config) -> nn.Module:
@@ -297,10 +326,15 @@ def extract_hierarchical_hidden(
     start (typically more predictable), later chunks encode content density.
     This is richer than a single mean-pool over the whole sequence.
 
-    Two modes (cfg.hierarchical_representation):
+    Three modes (cfg.hierarchical_representation):
       'full'     — uses full transformer hidden states (one LM forward pass)
       'embedder' — uses only token + positional embeddings, no transformer
                    (~10× faster but loses contextual information)
+      'layer'    — uses the hidden state after cfg.hierarchical_layer_index
+                   transformer layers (0 = embeddings only, cfg.n_layers =
+                   same as 'full'); for TinyGPT this also skips the later
+                   layers' compute, for HFCausalLM it does not (see
+                   HFCausalLM.forward_to_layer)
 
     Always runs under torch.no_grad() — never affects LM gradients.
 
@@ -324,6 +358,13 @@ def extract_hierarchical_hidden(
             b, L = X.size()
             pos = torch.arange(L, device=X.device).unsqueeze(0).expand(b, L)
             h = m.tok_embed(X) + m.pos_embed(pos)
+        elif repr_mode == "layer":
+            if not hasattr(m, "forward_to_layer"):
+                raise ValueError(
+                    f"{type(m).__name__} does not support "
+                    "hierarchical_representation='layer'."
+                )
+            h = m.forward_to_layer(X, num_layers=cfg.hierarchical_layer_index)
         else:
             raise ValueError(f"Unknown hierarchical_representation: {repr_mode}")
     B, L, D = h.shape

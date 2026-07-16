@@ -44,13 +44,13 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import yaml
 
-from config import ExperimentConfig
+from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer
 from experiments import (
     EXPERIMENTAL_FIELDS,
@@ -85,7 +85,7 @@ def memory_signature(cfg: ExperimentConfig) -> Tuple[Any, ...]:
         cfg.batch, cfg.block, cfg.pool_mult,
         cfg.training_algorithm, cfg.ppo_epochs, cfg.grpo_group_size,
         cfg.router_architecture, cfg.router_n_heads,
-        cfg.enable_text_hierarchical, cfg.hierarchical_representation,
+        cfg.enable_text_hierarchical, cfg.hierarchical_representation, cfg.hierarchical_layer_index,
         cfg.feature_cache_epochs > 0, cfg.feature_cache_batch_size,
     )
 
@@ -238,10 +238,25 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
         print("Error: --profile and --field cannot be used together.")
         sys.exit(1)
 
+    # base_cfg is what every generated experiment is built from. Fields NOT
+    # under ablation (i.e. not in selected_fields below) carry through from
+    # it unchanged; fields that ARE under ablation still get forced to their
+    # declared (baseline, [alternatives]) values regardless of base_cfg.
+    base_cfg = load_config_from_yaml(args.config) if args.config else None
+
     # The base config's experiment_name sets the shared wandb_project
     # (curriculum-learning-<name>) that every run in the sweep lands in.
-    # Without --name it falls back to ExperimentConfig()'s "presentation_experiment".
-    base_cfg = ExperimentConfig(experiment_name=args.name) if args.name else None
+    # Without --name it falls back to --config's (or ExperimentConfig()'s
+    # "presentation_experiment") experiment_name.
+    if args.name:
+        # save_dir/wandb_project only re-derive from experiment_name in
+        # __post_init__ while still None; base_cfg (if any) already has them
+        # resolved to concrete strings, so force both back to None or
+        # replace() would silently keep the stale values tied to the old name.
+        base_cfg = (
+            replace(base_cfg, experiment_name=args.name, save_dir=None, wandb_project=None)
+            if base_cfg else ExperimentConfig(experiment_name=args.name)
+        )
 
     try:
         profile_fields = get_profile_fields(args.profile)
@@ -278,7 +293,8 @@ def main() -> None:
     parser.add_argument("--field", type=str, action="append", help="Run experiments for specific field(s) only")
     parser.add_argument("--profile", type=str, help="Run a predefined experiment profile")
     parser.add_argument("--no-baseline", action="store_true", help="Skip the baseline experiment")
-    parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: presentation_experiment)")
+    parser.add_argument("--config", type=str, default=None, help="Path to a YAML file with ExperimentConfig field overrides, used as the base config every experiment is built from (fields under ablation are still forced to their declared values)")
+    parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: --config's, or presentation_experiment)")
     parser.add_argument("--list", action="store_true", help="List experiments that would run, without running them")
     parser.add_argument("--max-parallel", type=int, default=None, help="Skip GPU probing; always run exactly N workers")
     parser.add_argument("--safety-margin", type=float, default=0.85, help="Fraction of free GPU memory usable (default 0.85)")

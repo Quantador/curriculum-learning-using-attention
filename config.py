@@ -35,8 +35,14 @@ class Config:
     d_ff: int = 2048
     n_chunks: int = 8
     # Hierarchical feature source
-    # options: full (transformer hidden), embedder (token+pos embeddings)
+    # options: full (final transformer hidden state), embedder (token+pos
+    # embeddings only, no transformer layers), layer (hidden state after
+    # hierarchical_layer_index transformer layers)
     hierarchical_representation: str = "full"
+    # Required when hierarchical_representation='layer'. 0 = embeddings only
+    # (same as 'embedder'), n_layers = final layer (same as 'full'); anything
+    # in between reads out an intermediate layer's hidden state.
+    hierarchical_layer_index: int | None = None
 
     # Student LM architecture, built via model.build_model():
     #   'tiny_gpt'      — small from-scratch TransformerEncoder (default)
@@ -96,6 +102,19 @@ class Config:
             self.n_layers = hf_cfg.num_hidden_layers
             self.n_heads = hf_cfg.num_attention_heads
             self.d_ff = getattr(hf_cfg, "intermediate_size", self.d_ff)
+
+        if self.hierarchical_representation == "layer":
+            if self.hierarchical_layer_index is None:
+                raise ValueError(
+                    "hierarchical_representation='layer' requires "
+                    "hierarchical_layer_index to be set."
+                )
+            if not (0 <= self.hierarchical_layer_index <= self.n_layers):
+                raise ValueError(
+                    f"hierarchical_layer_index={self.hierarchical_layer_index} "
+                    f"out of range for n_layers={self.n_layers} (expected 0.."
+                    f"{self.n_layers})."
+                )
 
     @property
     def pool(self) -> int:
