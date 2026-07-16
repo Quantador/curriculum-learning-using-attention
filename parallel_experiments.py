@@ -238,6 +238,11 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
         print("Error: --profile and --field cannot be used together.")
         sys.exit(1)
 
+    # The base config's experiment_name sets the shared wandb_project
+    # (curriculum-learning-<name>) that every run in the sweep lands in.
+    # Without --name it falls back to ExperimentConfig()'s "presentation_experiment".
+    base_cfg = ExperimentConfig(experiment_name=args.name) if args.name else None
+
     try:
         profile_fields = get_profile_fields(args.profile)
     except ValueError as exc:
@@ -258,8 +263,9 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
         flat_fields = {
             f: [b] + a for f, (b, a) in (selected_fields or EXPERIMENTAL_FIELDS).items()
         }
-        return generate_combination_configs(experimental_fields=flat_fields)
+        return generate_combination_configs(base_cfg=base_cfg, experimental_fields=flat_fields)
     return generate_experiment_configs(
+        base_cfg=base_cfg,
         experimental_fields=selected_fields,
         include_baseline=not args.no_baseline,
     )
@@ -272,6 +278,7 @@ def main() -> None:
     parser.add_argument("--field", type=str, action="append", help="Run experiments for specific field(s) only")
     parser.add_argument("--profile", type=str, help="Run a predefined experiment profile")
     parser.add_argument("--no-baseline", action="store_true", help="Skip the baseline experiment")
+    parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: presentation_experiment)")
     parser.add_argument("--list", action="store_true", help="List experiments that would run, without running them")
     parser.add_argument("--max-parallel", type=int, default=None, help="Skip GPU probing; always run exactly N workers")
     parser.add_argument("--safety-margin", type=float, default=0.85, help="Fraction of free GPU memory usable (default 0.85)")

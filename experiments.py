@@ -118,6 +118,11 @@ FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "selection_strategy": (EXPERIMENTAL_FIELDS["selection_strategy"][0], ["sample", "epsilon_greedy"]),
 }
 
+COMPARE_GRPO_VS_GREATS: Dict[str, tuple[Any, List[Any]]] = {
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["greats_score"]),
+    # GRPO, PPO
+    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo"]),
+}
 FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # baseline=0 (no cache) is the reference; 2 is the experiment
     "feature_cache_epochs": (0, [2]),
@@ -147,6 +152,7 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "feature_cache": FEATURE_CACHE_FIELDS,
     "additional_experiments": ADDITIONAL_EXPERIMENTS_FIELDS,
     "additional-experiments": ADDITIONAL_EXPERIMENTS_FIELDS,  # alias
+    "grpo_vs_greats": COMPARE_GRPO_VS_GREATS
 }
 
 

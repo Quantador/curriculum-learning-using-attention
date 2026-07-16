@@ -128,8 +128,8 @@ def run_experiment(config_path: str | None = None):
         aux_metrics.save(f"{cfg.save_dir}/aux_baseline_metrics.json")
 
     # --- Final comparison ---
-    #print("\n=== Final comparison ===")
-    #compare_runs(base_metrics, router_metrics, aux_metrics)
+    print("\n=== Final comparison ===")
+    compare_runs(base_metrics, router_metrics, aux_metrics)
 
 
 if __name__ == "__main__":
