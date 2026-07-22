@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import torch
 
-from config import ExperimentConfig
+from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
-from model import TinyGPT
-from router import build_router, get_router_feature_dim
+from models.model import build_model
+from models.router import build_router, get_router_feature_dim
 from training import train_baseline, train_router, compare_runs
 from rl_training import train_aux_baseline
-from metrics import MetricsTracker, DiversityTracker
+from utils.metrics import MetricsTracker, DiversityTracker
 
 
 def set_seed(seed: int):
@@ -35,11 +35,11 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def run_experiment():
-    cfg = ExperimentConfig()
+def run_experiment(config_path: str | None = None):
+    cfg = load_config_from_yaml(config_path) if config_path else ExperimentConfig()
     set_seed(cfg.seed)
 
-    tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer(cfg.hf_model_name if cfg.model_type == "hf_pretrained" else "gpt2")
 
     # --- Dataset loading ---
     print("\n=== Building datasets ===")
@@ -56,9 +56,10 @@ def run_experiment():
     # Feature dimensionality for the router (accounts for all enabled feature groups)
     d_input = get_router_feature_dim(cfg)
 
+    
     # --- Baseline training ---
     print("\n=== Baseline training ===")
-    model_base  = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
+    model_base  = build_model(vocab_size=len(tokenizer), cfg=cfg)
     base_metrics = MetricsTracker("baseline", use_wandb=cfg.use_wandb)
     base_div     = DiversityTracker(len(train_ds))
 
@@ -71,12 +72,12 @@ def run_experiment():
         diversity=base_div,
     )
     base_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
-
+    
     # --- Router training ---
     print("\n=== Router training ===")
     set_seed(cfg.seed)
 
-    model_router  = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
+    model_router  = build_model(vocab_size=len(tokenizer), cfg=cfg)
     router = build_router(
         d_input=d_input,
         arch=cfg.router_architecture,
@@ -104,7 +105,7 @@ def run_experiment():
         print("\n=== Auxiliary network baseline training ===")
         set_seed(cfg.seed)
 
-        model_aux = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
+        model_aux = build_model(vocab_size=len(tokenizer), cfg=cfg)
         aux_net   = build_router(
             d_input=d_input,
             arch="auxnet",
@@ -132,4 +133,13 @@ def run_experiment():
 
 
 if __name__ == "__main__":
-    run_experiment()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a YAML file with ExperimentConfig field overrides "
+             "(defaults to ExperimentConfig() if omitted).",
+    )
+    args = parser.parse_args()
+    run_experiment(config_path=args.config)

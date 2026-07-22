@@ -6,9 +6,9 @@ This is the experiment-grade router training loop used by experiments.py
 
 Key features over the reference loop in training.py:
   - Three policy gradient algorithms: REINFORCE, GRPO, PPO
-  - Eight reward signals: loss_improvement, neg_loss, relative_improvement,
+  - Nine reward signals: loss_improvement, neg_loss, relative_improvement,
     difficulty_weighted, uncertainty_reduction, gradient_norm,
-    gradient_alignment, combined
+    gradient_alignment, combined, greats_score
   - Four entropy formulations: Shannon, Rényi, Tsallis, KL-uniform
   - SAC-style entropy targeting (auto-adjusts lambda_ent to hit a target entropy)
   - Coverage regularisation (penalises repeated sample selection)
@@ -32,20 +32,24 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import time
+from types import SimpleNamespace
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from tqdm import tqdm
 
 from config import ExperimentConfig
 from data import make_index_loader, MixedLMDataset
-from model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
-from metrics import MetricsTracker, DiversityTracker
+from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
+from utils.metrics import MetricsTracker, DiversityTracker
 from training import evaluate  # keep using your existing evaluate()
-from router import extract_router_features
+from models.router import extract_router_features
+from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 
 
 @torch.no_grad()
@@ -589,6 +593,7 @@ def compute_reward(
     entropy_before: torch.Tensor | None = None,
     entropy_after: torch.Tensor | None = None,
     gradient_reward: torch.Tensor | None = None,
+    greats_reward: torch.Tensor | None = None,
     cfg: ExperimentConfig | None = None,
 ) -> torch.Tensor:
     """
@@ -602,6 +607,8 @@ def compute_reward(
         entropy_before: Per-sample entropy before update [B] (optional)
         entropy_after: Per-sample entropy after update [B] (optional)
         gradient_reward: Scalar or per-sample gradient reward (optional)
+        greats_reward: Scalar GREATS ghost-gradient-dot-product score, summed over
+            the selected batch (optional; see reward_signal='greats_score' in Config)
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -643,6 +650,16 @@ def compute_reward(
         if gradient_reward.dim() == 0:
             return gradient_reward.expand_as(loss_before)
         return gradient_reward
+
+    elif reward_signal == "greats_score":
+        # A single scalar (sum of the ghost gradient-dot-product scores of the
+        # selected batch, against the fixed val batch) shared by every selected
+        # sample — the router's "action" is the joint selection, not per-sample.
+        if greats_reward is None:
+            return torch.zeros_like(loss_before)
+        if greats_reward.dim() == 0:
+            return greats_reward.expand_as(loss_before)
+        return greats_reward
 
     elif reward_signal == "combined":
         # Weighted combination of multiple signals
@@ -966,7 +983,7 @@ def train_router_experiments(
     configured via ExperimentConfig.
     """
 
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.init(
             project=cfg.wandb_project,
@@ -974,6 +991,8 @@ def train_router_experiments(
             config=vars(cfg),
             name=cfg.experiment_name,
         )
+        if cfg.config_path:
+            wandb.save(cfg.config_path, policy="now")
 
     model.to(cfg.device).train()
     router.to(cfg.device).train()
@@ -984,6 +1003,35 @@ def train_router_experiments(
     grad_params = [p for p in model.parameters() if p.requires_grad]
     grad_param_count = sum(p.numel() for p in grad_params)
     grad_ema = None
+
+    # GREATS ghost gradient-dot-product scorer, built when reward_signal='greats_score'
+    # (GPT-2-family HF checkpoints only, validated in Config.__post_init__);
+    # GhostSuite's per-sample-gradient hooks can't see TinyGPT's nn.MultiheadAttention
+    # or Qwen3's RMSNorm/custom Linear stack.
+    ghost_engine = None
+    if cfg.reward_signal == "greats_score":
+        val_idx = random.sample(range(len(val_ds)), cfg.greats_val_batch_size)
+        Xv, Yv, _ = zip(*(val_ds[i] for i in val_idx))
+        X_val = torch.stack(Xv).to(cfg.device)
+        Y_val = torch.stack(Yv).to(cfg.device)
+        ghost_engine = GhostEngineManager(
+            config=SimpleNamespace(
+                method="GradDotProd",
+                result_dir=os.path.join(cfg.save_dir, "ghost"),
+                val_batch_size=cfg.greats_val_batch_size,
+                log_grad_norms=cfg.greats_log_grad_norms,
+                score_exclude_params=cfg.greats_score_exclude_params,
+                # Eager engine only: the decoupled/compiled fast path hardcodes
+                # GPT-2/nanoGPT-shaped model.transformer.h + forward(idx, idx)->.loss,
+                # which doesn't match build_model()'s HFCausalLM/TinyGPT forward signature.
+                decoupled_fn=False,
+                separate_val=False,
+            ),
+            model=model,
+            optimizer=opt_lm,
+            ddp_info={"master_process": cfg.rank == 0},
+            val_data=(X_val, Y_val),
+        )
 
     # Initialize moving average baseline if needed
     moving_avg_baseline = None
@@ -1046,7 +1094,7 @@ def train_router_experiments(
         #   5. Compute reward signal (loss improvement, gradient norm, etc.).
         #   6. Router RL update (REINFORCE / GRPO / PPO + entropy regularisation).
         # ─────────────────────────────────────────────────────────────────────
-        for pool_indices in tqdm(idx_loader):
+        for pool_indices in tqdm(idx_loader, disable=(cfg.rank != 0)):
             if len(pool_indices) < cfg.batch:
                 continue
 
@@ -1125,7 +1173,30 @@ def train_router_experiments(
             selected_diffs = [diffs[i] for i in sel_idx.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx.tolist()]
 
+            # --- GREATS ghost-gradient scoring (before the real LM update: a separate
+            # scoring backward on X_sel/Y_sel against the fixed val batch, discarded
+            # afterwards) ---
+            greats_reward = None
+            if ghost_engine is not None and cfg.reward_signal == "greats_score":
+                ghost_engine.begin_step()
+                ghost_engine.attach_train_batch(X_sel, Y_sel, global_step)
+                with ghost_engine.saved_tensors_context():
+                    Xf, Yf = ghost_engine.prepare_forward_input(X_sel, Y_sel)
+                    logits_score = model(Xf)
+                    B_s, L_s, V_s = logits_score.shape
+                    loss_score = F.cross_entropy(
+                        logits_score.view(B_s * L_s, V_s), Yf.view(B_s * L_s),
+                    )
+                    loss_score.backward()
+                ghost_engine.collect_microbatch()
+                greats_reward = ghost_engine.read_scores(
+                    metric=cfg.greats_score_metric
+                ).to(cfg.device).sum()
+                ghost_engine.discard_scores()
+
             # --- LM forward and update ---
+            # Clears the GREATS scoring pass's leftover grads (if any) as well as
+            # zeroing for this real step.
             opt_lm.zero_grad()
 
             logits = model(X_sel)  # [B, L, V]
@@ -1178,6 +1249,7 @@ def train_router_experiments(
                 entropy_before=entropy_before,
                 entropy_after=entropy_after,
                 gradient_reward=gradient_reward,
+                greats_reward=greats_reward,
                 cfg=cfg,
             )
 
@@ -1269,7 +1341,7 @@ def train_router_experiments(
 
             # --- Logging ---
             global_step += 1
-            if global_step % cfg.log_every == 0:
+            if global_step % cfg.log_every == 0 and cfg.rank == 0:
                 curriculum_strength = 1.0 - progress
 
                 log_data = {
@@ -1302,25 +1374,31 @@ def train_router_experiments(
                 )
 
         # --- Validation ---
-        loss_fn = nn.CrossEntropyLoss()
-        val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+        # Only rank 0 evaluates (val_ds is small and identical on every rank);
+        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
+        # .backward() calls before rank 0 has finished its forward-only pass.
+        if cfg.rank == 0:
+            loss_fn = nn.CrossEntropyLoss()
+            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
 
-        epoch_time = time.perf_counter() - epoch_start
-        metrics.log(
-            epoch=epoch,
-            step=global_step,
-            val_loss=val_loss,
-            val_ppl=val_ppl,
-            epoch_time_s=epoch_time,
-        )
+            epoch_time = time.perf_counter() - epoch_start
+            metrics.log(
+                epoch=epoch,
+                step=global_step,
+                val_loss=val_loss,
+                val_ppl=val_ppl,
+                epoch_time_s=epoch_time,
+            )
 
-        print(
-            f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
-            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
-            f"epoch_time={epoch_time:.1f}s"
-        )
+            print(
+                f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
+                f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
+                f"epoch_time={epoch_time:.1f}s"
+            )
+        if cfg.world_size > 1:
+            dist.barrier()
 
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.finish()
 
@@ -1366,14 +1444,17 @@ def train_aux_baseline(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             config=vars(cfg),
-            name="aux_baseline",
+            name=f"{cfg.experiment_name}_aux_baseline",
         )
+        if cfg.config_path:
+            wandb.save(cfg.config_path, policy="now")
 
     model.to(cfg.device)
     aux_net.to(cfg.device)
     model.train()
     aux_net.train()
 
+    print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
     mse_fn  = nn.MSELoss()
     opt_lm  = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
@@ -1404,7 +1485,7 @@ def train_aux_baseline(
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=tokenizer.vocab_size,
             )  # [M, F]
-
+            
             if train_ds.embeddings is not None:
                 pool_embs = torch.stack(
                     [train_ds.embeddings[i] for i in pool_indices]

@@ -1,0 +1,14 @@
+# Usage:
+#   python compare.py --config configs/example.yaml
+#   torchrun --standalone --nproc_per_node=2 train_ddp.py --config configs/example.yaml
+
+experiment_name: greats_test
+epochs: 10
+batch: 16
+lr_lm: 0.0003
+training_algorithm: grpo
+reward_signal: greats_score
+use_wandb: true
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+use_single_dataset: true 

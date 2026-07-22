@@ -12,9 +12,13 @@ Two dataclasses:
 Typical usage:
     cfg = ExperimentConfig()           # sensible defaults
     cfg = replace(cfg, epochs=5, ...)  # override via dataclasses.replace
+    cfg = load_config_from_yaml("configs/my_run.yaml")  # override via YAML file
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
+import os
 import torch
+import yaml
+from transformers import AutoConfig
 
 @dataclass
 class Config:
@@ -31,8 +35,24 @@ class Config:
     d_ff: int = 2048
     n_chunks: int = 8
     # Hierarchical feature source
-    # options: full (transformer hidden), embedder (token+pos embeddings)
+    # options: full (final transformer hidden state), embedder (token+pos
+    # embeddings only, no transformer layers), layer (hidden state after
+    # hierarchical_layer_index transformer layers)
     hierarchical_representation: str = "full"
+    # Required when hierarchical_representation='layer'. 0 = embeddings only
+    # (same as 'embedder'), n_layers = final layer (same as 'full'); anything
+    # in between reads out an intermediate layer's hidden state.
+    hierarchical_layer_index: int | None = None
+
+    # Student LM architecture, built via model.build_model():
+    #   'tiny_gpt'      — small from-scratch TransformerEncoder (default)
+    #   'hf_pretrained' — HuggingFace architecture named by hf_model_name
+    #                     (e.g. "Qwen/Qwen3-1.7B"), randomly initialized and
+    #                     trained from scratch, not fine-tuned from checkpoint
+    # When 'hf_pretrained' is used, get_tokenizer(cfg.hf_model_name) must be
+    # used too, since token ids must match the model's vocabulary.
+    model_type: str = "tiny_gpt"
+    hf_model_name: str = "Qwen/Qwen3-1.7B"
 
     # Training
     batch: int = 16
@@ -48,12 +68,53 @@ class Config:
     seed: int = 0
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
+    # Distributed (DDP). Defaults are the single-process case; train_ddp.py
+    # overrides these after torch.distributed.init_process_group().
+    rank: int = 0
+    world_size: int = 1
+    local_rank: int = 0
+
     # Logging
     use_wandb: bool = True
     wandb_project: str = "curriculum-learning-final"
     wandb_entity: str | None = None
     save_dir: str = "results"
     log_every: int = 100
+
+    # Set automatically by load_config_from_yaml() to the source YAML path;
+    # not a hyperparameter. When set, training loops upload this file to the
+    # W&B run (see wandb.save() calls in training.py / rl_training.py) so the
+    # exact override file used for the run is attached alongside its metrics.
+    config_path: str | None = None
+
+    def __post_init__(self):
+        # d_model/n_layers/n_heads/d_ff describe TinyGPT's architecture, but
+        # for 'hf_pretrained' the real architecture comes from the checkpoint
+        # itself (see HFCausalLM in models/model.py, which reads hf_config.*
+        # and ignores these fields entirely). Code that runs before the model
+        # is built — e.g. get_router_feature_dim() in models/router.py, which
+        # sizes the router from cfg.n_chunks * cfg.d_model — has no other way
+        # to know the checkpoint's real hidden size, so these are overwritten
+        # here to keep them truthful rather than left at the tiny_gpt defaults.
+        if self.model_type == "hf_pretrained":
+            hf_cfg = AutoConfig.from_pretrained(self.hf_model_name)
+            self.d_model = hf_cfg.hidden_size
+            self.n_layers = hf_cfg.num_hidden_layers
+            self.n_heads = hf_cfg.num_attention_heads
+            self.d_ff = getattr(hf_cfg, "intermediate_size", self.d_ff)
+
+        if self.hierarchical_representation == "layer":
+            if self.hierarchical_layer_index is None:
+                raise ValueError(
+                    "hierarchical_representation='layer' requires "
+                    "hierarchical_layer_index to be set."
+                )
+            if not (0 <= self.hierarchical_layer_index <= self.n_layers):
+                raise ValueError(
+                    f"hierarchical_layer_index={self.hierarchical_layer_index} "
+                    f"out of range for n_layers={self.n_layers} (expected 0.."
+                    f"{self.n_layers})."
+                )
 
     @property
     def pool(self) -> int:
@@ -83,10 +144,47 @@ class ExperimentConfig(Config):
       - Caching: feature_cache_epochs (0 = disabled)
     """
     experiment_name: str = "presentation_experiment"
-    
-    wandb_project: str = "curriculum-learning-"+experiment_name
-    
-    save_dir: str = "results/" + experiment_name
+
+    # None = derive from experiment_name in __post_init__ below. Fields are
+    # computed once at class-definition time from the *default* experiment_name,
+    # so a plain string default here would silently ignore any override of
+    # experiment_name (constructor kwarg, dataclasses.replace(), or YAML).
+    wandb_project: str | None = None
+    save_dir: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.wandb_project is None:
+            self.wandb_project = f"curriculum-learning-{self.experiment_name}"
+        if self.save_dir is None:
+            self.save_dir = f"results/{self.experiment_name}"
+
+        if self.reward_signal == "greats_score":
+            # GREATS-style ghost gradient-dot-product scoring (GhostSuite/ghostEngines,
+            # via GhostEngineManager). Only supported for GPT-2-family HF checkpoints:
+            # the scorer's per-sample-gradient hooks match nn.Linear / nn.Embedding /
+            # nn.LayerNorm / HF Conv1D by EXACT type, not isinstance. TinyGPT's attention
+            # is nn.MultiheadAttention (its in_proj_weight has no leaf-module hook target
+            # at all, and out_proj is a Linear *subclass* that fails the exact-type
+            # check), and Qwen3 uses a custom RMSNorm plus its own Linear stack — both
+            # leave most/all of the model's gradient invisible to the scorer.
+            if self.model_type != "hf_pretrained":
+                raise ValueError(
+                    "reward_signal='greats_score' requires model_type='hf_pretrained' "
+                    "with a GPT-2-family checkpoint; GhostSuite's ghost gradient-dot-"
+                    f"product hooks can't see {self.model_type!r}'s attention layers."
+                )
+            hf_arch = AutoConfig.from_pretrained(self.hf_model_name).model_type
+            if hf_arch != "gpt2":
+                raise ValueError(
+                    f"reward_signal='greats_score' only supports GPT-2-family "
+                    f"checkpoints; hf_model_name={self.hf_model_name!r} resolves to "
+                    f"architecture {hf_arch!r}. GhostSuite's hooks match nn.Linear/"
+                    "nn.Embedding/nn.LayerNorm/HF Conv1D by exact type, so e.g. "
+                    "Qwen3's RMSNorm layers are invisible to the scorer. Pick a "
+                    "GPT-2 checkpoint (gpt2, gpt2-medium, gpt2-large, ...) or a "
+                    "different reward_signal."
+                )
 
 
     # Data mixing
@@ -116,7 +214,7 @@ class ExperimentConfig(Config):
     # External pre-computed embeddings (e.g. epfml/FineWeb-HQ).
     # The HuggingFace dataset must have a 'text' and an 'embeddings' column.
     # Only used when use_single_dataset=True.
-    use_external_embeddings: bool = True
+    use_external_embeddings: bool = False
     external_embeddings_dataset: str = "epfml/FineWeb-HQ"
     external_embedding_dim: int = 768
     
@@ -140,7 +238,18 @@ class ExperimentConfig(Config):
     #   - gradient_norm: ||∇θ L_LM(S_t)|| - batch gradient magnitude
     #   - gradient_alignment: <g_t, g_ema> - alignment with EMA gradient
     #   - combined: weighted sum of multiple signals
+    #   - greats_score: sum of ghost gradient-dot-product scores <g_i, g_val> over
+    #     the selected batch (one scalar shared by every sample) - GPT-2-family HF
+    #     checkpoint only (validated in __post_init__). A constant reward across
+    #     the batch makes baseline_type='batch_mean' always cancel to zero
+    #     advantage; use baseline_type='moving_avg' instead.
     reward_signal: str = "loss_improvement"
+
+    # GhostSuite/ghostEngines scoring knobs, used only when reward_signal='greats_score'.
+    greats_val_batch_size: int = 16
+    greats_score_metric: str = "dot"  # options: dot, cosine (cosine forces greats_log_grad_norms)
+    greats_log_grad_norms: bool = False
+    greats_score_exclude_params: list[str] = field(default_factory=list)
 
     # Weights for combined reward signal
     reward_weight_improvement: float = 1.0
@@ -212,4 +321,50 @@ class ExperimentConfig(Config):
     # alternative to policy-gradient curriculum learning.
     run_aux_baseline: bool = False
     aux_net_hidden: int = 256
+
+
+def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> ExperimentConfig:
+    """
+    Apply field overrides from a YAML file on top of `cfg` (defaults to
+    ExperimentConfig() if not given). YAML keys must match ExperimentConfig
+    field names exactly, e.g.:
+
+        epochs: 5
+        training_algorithm: grpo
+        lambda_ent: 0.01
+
+    Only fields already present on `cfg` are accepted; an unrecognised key
+    raises ValueError immediately rather than silently doing nothing (the
+    likely outcome of a typo'd field name).
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    if cfg is None:
+        cfg = ExperimentConfig()
+    with open(path) as f:
+        overrides = yaml.safe_load(f) or {}
+
+    # save_dir/wandb_project are lazily derived from experiment_name in
+    # __post_init__, but only when still None; by this point cfg already has
+    # them resolved to concrete strings (from the ExperimentConfig() default
+    # above, or from the caller-supplied cfg). If the YAML overrides
+    # experiment_name without also overriding these, force them back to None
+    # so __post_init__ re-derives from the new name instead of keeping the
+    # stale resolved value from the old one.
+    if "experiment_name" in overrides:
+        overrides.setdefault("save_dir", None)
+        overrides.setdefault("wandb_project", None)
+
+    valid_fields = {f.name for f in fields(cfg)}
+    unknown = set(overrides) - valid_fields
+    if unknown:
+        raise ValueError(
+            f"Unknown config field(s) in {path}: {sorted(unknown)}. "
+            f"Valid fields: {sorted(valid_fields)}"
+        )
+    cfg = replace(cfg, **overrides)
+    # Always set from the real path, overriding any (unlikely) config_path
+    # key the YAML file itself tried to set.
+    return replace(cfg, config_path=path)
 

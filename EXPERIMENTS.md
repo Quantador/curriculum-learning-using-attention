@@ -102,9 +102,9 @@ python experiments.py --combinations --field training_algorithm --field reward_s
 |-------|----------|-------------|
 | `enable_text_stat` | True | False |
 | `enable_text_hierarchical` | True | False |
-| `hierarchical_representation` | `full` | `embedder` |
+| `hierarchical_representation` | `full` | `embedder`, `layer` |
 
-`hierarchical_representation=full` uses transformer hidden states, while `embedder` uses only token+positional embeddings.
+`hierarchical_representation=full` uses the final transformer hidden state, `embedder` uses only token+positional embeddings (no transformer layers), and `layer` reads out the hidden state after `hierarchical_layer_index` transformer layers (requires setting that field; 0 = same as `embedder`, `n_layers` = same as `full`).
 
 ### Training Algorithm
 | Value | Description |

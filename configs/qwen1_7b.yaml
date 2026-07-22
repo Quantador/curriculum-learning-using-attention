@@ -1,0 +1,16 @@
+# Usage:
+#   python compare.py --config configs/example.yaml
+#   torchrun --standalone --nproc_per_node=2 train_ddp.py --config configs/example.yaml
+
+experiment_name: qwen1_7b
+epochs: 5
+batch: 16
+easy_samples: 3000
+hard_samples: 200 
+lr_lm: 0.0003
+training_algorithm: grpo
+reward_signal: loss_improvement
+use_wandb: true
+model_type: hf_pretrained
+hf_model_name: Qwen/Qwen3-1.7B
+use_single_dataset: false 

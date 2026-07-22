@@ -9,6 +9,9 @@ is accepted.
 Run after any structural change:
     python smoke_test.py
 
+Run a single test by number:
+    python smoke_test.py --test 5
+
 Tests:
   1. Default mixed datasets (TinyStories + OpenWebText2)
   2. Custom datasets (WikiText easy + ML-ArXiv hard)
@@ -19,19 +22,23 @@ Tests:
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import traceback
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config import ExperimentConfig
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
-from model import TinyGPT
-from router import build_router, get_router_feature_dim
+from models.model import TinyGPT
+from models.router import build_router, get_router_feature_dim
 from training import train_baseline, train_router, compare_runs
 from rl_training import train_aux_baseline
-from metrics import MetricsTracker, DiversityTracker
+from utils.metrics import MetricsTracker, DiversityTracker
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -165,6 +172,7 @@ def test_4_single_dataset():
         use_single_dataset=True,
         single_dataset="Geralt-Targaryen/openwebtext2",
         single_dataset_samples=300,
+        use_external_embeddings=False
     )
     tok = get_tokenizer()
     set_seed()
@@ -195,11 +203,12 @@ def test_4_single_dataset():
 
 def test_5_aux_baseline():
     tok, train_ds, val_ds, d_input = shared_data()
-    cfg = tiny_cfg(aux_net_hidden=64)
+    cfg = tiny_cfg(aux_net_hidden=64, use_external_embeddings = False)
     set_seed()
-
     model   = TinyGPT(vocab_size=tok.vocab_size, cfg=cfg)
-    aux_net = build_router(d_input=d_input, arch="auxnet", d_hidden=64)
+    aux_net = build_router(d_input=get_router_feature_dim(cfg), 
+                           arch="auxnet", 
+                           d_hidden=64)
     m   = MetricsTracker("aux", use_wandb=False)
     div = DiversityTracker(len(train_ds))
     train_aux_baseline(cfg, model, aux_net, train_ds, val_ds, tok, m, div)
@@ -216,7 +225,7 @@ def test_5_aux_baseline():
 
 def test_6_full_comparison():
     tok, train_ds, val_ds, d_input = shared_data()
-    cfg = tiny_cfg(aux_net_hidden=64)
+    cfg = tiny_cfg(aux_net_hidden=64, use_external_embeddings = False)
 
     # Baseline
     set_seed()
@@ -250,13 +259,26 @@ def test_6_full_comparison():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+TESTS = [
+    (1, "Default mixed datasets (TinyStories + OpenWebText2)", test_1_default_datasets),
+    (2, "Custom datasets       (WikiText easy + ML-ArXiv hard)", test_2_custom_datasets),
+    (3, "Multi-head router     (n_heads = 2 and 4)",             test_3_multihead_router),
+    (4, "Single-dataset mode   (OpenWebText2, no easy/hard)",    test_4_single_dataset),
+    (5, "Auxiliary net baseline",                                test_5_aux_baseline),
+    (6, "Full comparison       (baseline + router + aux-net)",   test_6_full_comparison),
+]
+
 if __name__ == "__main__":
-    run_test("1. Default mixed datasets (TinyStories + OpenWebText2)", test_1_default_datasets)
-    run_test("2. Custom datasets       (WikiText easy + ML-ArXiv hard)", test_2_custom_datasets)
-    run_test("3. Multi-head router     (n_heads = 2 and 4)",             test_3_multihead_router)
-    run_test("4. Single-dataset mode   (OpenWebText2, no easy/hard)",    test_4_single_dataset)
-    run_test("5. Auxiliary net baseline",                                test_5_aux_baseline)
-    run_test("6. Full comparison       (baseline + router + aux-net)",   test_6_full_comparison)
+    parser = argparse.ArgumentParser(description="Smoke tests for curriculum learning code paths.")
+    parser.add_argument(
+        "--test", type=int, default=None, choices=[n for n, _, _ in TESTS],
+        help="Run only this test number (default: run all tests).",
+    )
+    args = parser.parse_args()
+
+    selected = [t for t in TESTS if args.test is None or t[0] == args.test]
+    for n, label, fn in selected:
+        run_test(f"{n}. {label}", fn)
 
     print(f"\n{'='*55}\n  RESULTS\n{'='*55}")
     all_pass = True

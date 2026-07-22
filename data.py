@@ -16,7 +16,8 @@ Validation always uses WikiText-2 regardless of training dataset config,
 keeping the eval set fixed across all experiments for fair comparison.
 
 Key exports:
-  get_tokenizer()       — shared GPT-2 BPE tokeniser
+  get_tokenizer()       — tokeniser matching the student LM (GPT-2 BPE by
+                          default; pass a HF model name for other models)
   make_mixed_chunks()   — builds labelled train/val chunks for mixed mode
   make_single_chunks()  — builds chunks for single-dataset mode
   MixedLMDataset        — PyTorch Dataset yielding (x, y, difficulty) triples
@@ -30,7 +31,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
-from transformers import GPT2TokenizerFast
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from tqdm import tqdm
 from config import Config
@@ -74,8 +75,15 @@ def load_dataset_by_name(name: str, n_samples: int):
     return ds.take(n_samples), meta["text_col"]
 
 
-def get_tokenizer() -> GPT2TokenizerFast:
-    tok = GPT2TokenizerFast.from_pretrained("gpt2")
+def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
+    """
+    Load the tokenizer matching the student LM's vocabulary.
+
+    Defaults to GPT-2 BPE (used by TinyGPT). Pass a HuggingFace model name
+    (e.g. "Qwen/Qwen3-1.7B") to get the matching tokenizer instead — required
+    whenever the token ids must line up with that model's embedding table.
+    """
+    tok = AutoTokenizer.from_pretrained(model_name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok
@@ -185,7 +193,7 @@ def make_mixed_chunks(
     else:
         # Validation always uses WikiText-2, not the configured training datasets.
         # This keeps the eval signal identical across all experiment variants.
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="validation")
         text = tokenizer.eos_token.join(ds["text"])
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         L = (len(ids) // (cfg.block + 1)) * (cfg.block + 1)

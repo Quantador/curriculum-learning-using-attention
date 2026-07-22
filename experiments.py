@@ -31,12 +31,12 @@ from dataclasses import replace
 from itertools import product
 from typing import Dict, List, Any
 
-from config import ExperimentConfig
+from config import ExperimentConfig, load_config_from_yaml
 from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
-from model import TinyGPT, AttentionRouter
-from metrics import MetricsTracker, DiversityTracker
+from models.model import TinyGPT, AttentionRouter
+from utils.metrics import MetricsTracker, DiversityTracker
 
-from router import *
+from models.router import *
 from rl_training import *
 
 
@@ -107,7 +107,7 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 # Predefined experiment profiles (subset of ablations)
 FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # Neg loss, gradient magnitude
-    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["neg_loss", "gradient_norm"]),
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["neg_loss", "gradient_norm", "greats_score"]),
     # GRPO, PPO
     "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "reinforce"]),
     # Shannon fixed vs Shannon with decay (linear)
@@ -118,6 +118,11 @@ FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "selection_strategy": (EXPERIMENTAL_FIELDS["selection_strategy"][0], ["sample", "epsilon_greedy"]),
 }
 
+COMPARE_GRPO_VS_GREATS: Dict[str, tuple[Any, List[Any]]] = {
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["greats_score"]),
+    # GRPO, PPO
+    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo"]),
+}
 FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # baseline=0 (no cache) is the reference; 2 is the experiment
     "feature_cache_epochs": (0, [2]),
@@ -147,6 +152,7 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "feature_cache": FEATURE_CACHE_FIELDS,
     "additional_experiments": ADDITIONAL_EXPERIMENTS_FIELDS,
     "additional-experiments": ADDITIONAL_EXPERIMENTS_FIELDS,  # alias
+    "grpo_vs_greats": COMPARE_GRPO_VS_GREATS
 }
 
 
@@ -173,8 +179,9 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def run_experiment():
-    cfg = ExperimentConfig()
+def run_experiment(cfg: ExperimentConfig | None = None):
+    if cfg is None:
+        cfg = ExperimentConfig()
     set_seed(cfg.seed)
 
     tokenizer = get_tokenizer()
@@ -409,6 +416,7 @@ def run_all_experiments(
     experimental_fields: Dict[str, tuple[Any, List[Any]]] | None = None,
     use_combinations: bool = False,
     include_baseline: bool = True,
+    base_cfg: ExperimentConfig | None = None,
 ):
     """
     Run ablation-style experiments (one-factor-at-a-time by default).
@@ -418,8 +426,16 @@ def run_all_experiments(
                            If None, uses EXPERIMENTAL_FIELDS.
         use_combinations: If True, run full grid search instead of ablation.
         include_baseline: Whether to include baseline experiment.
+        base_cfg:          Starting config every generated experiment is built from
+                           (defaults to ExperimentConfig()). Fields NOT under ablation
+                           (i.e. not in experimental_fields) carry through from base_cfg
+                           unchanged. Fields that ARE under ablation still get forced to
+                           their declared (baseline, [alternatives]) values regardless of
+                           base_cfg — that fixed reference point is what makes the
+                           one-factor-at-a-time comparison meaningful.
     """
-    base_cfg = ExperimentConfig()
+    if base_cfg is None:
+        base_cfg = ExperimentConfig()
     set_seed(base_cfg.seed)
 
     tokenizer = get_tokenizer()
@@ -504,6 +520,16 @@ if __name__ == "__main__":
         help="Run a predefined experiment profile (e.g., final_presentation)"
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a YAML file with ExperimentConfig field overrides, used as the "
+             "base config every experiment is built from. Fields under ablation "
+             "(swept by --all/--field/--profile/--combinations) still get forced to "
+             "their declared baseline/alternative values; every other field carries "
+             "through from this config."
+    )
+    parser.add_argument(
         "--no-baseline",
         action="store_true",
         help="Skip the baseline experiment"
@@ -514,6 +540,8 @@ if __name__ == "__main__":
         help="List all experiments that would be run without actually running them"
     )
     args = parser.parse_args()
+
+    base_cfg = load_config_from_yaml(args.config) if args.config else None
 
     if args.list:
         # Just list the experiments
@@ -535,9 +563,10 @@ if __name__ == "__main__":
 
         if args.combinations:
             flat_fields = {f: [b] + a for f, (b, a) in selected_fields.items()}
-            configs = generate_combination_configs(experimental_fields=flat_fields)
+            configs = generate_combination_configs(base_cfg=base_cfg, experimental_fields=flat_fields)
         else:
             configs = generate_experiment_configs(
+                base_cfg=base_cfg,
                 experimental_fields=selected_fields,
                 include_baseline=not args.no_baseline
             )
@@ -570,7 +599,8 @@ if __name__ == "__main__":
         run_all_experiments(
             experimental_fields=selected_fields,
             use_combinations=args.combinations,
-            include_baseline=not args.no_baseline
+            include_baseline=not args.no_baseline,
+            base_cfg=base_cfg,
         )
     else:
-        run_experiment()
+        run_experiment(cfg=base_cfg)

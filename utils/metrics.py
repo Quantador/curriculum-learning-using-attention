@@ -60,11 +60,20 @@ class MetricsTracker:
         return vals[-1]
     
     def load(path: str | Path) -> MetricsTracker:
-        """Load a MetricsTracker from a JSON file previously saved by .save()."""
+        """
+        Load a MetricsTracker from a JSON file previously saved by .save().
+
+        Returns an empty tracker if the file doesn't exist yet (e.g. no
+        compare.py baseline/router run has been done in this save_dir) --
+        callers only use this for optional comparison printouts, which
+        already handle missing val_ppl history gracefully.
+        """
         path = Path(path)
+        tracker = MetricsTracker(name=path.stem)
+        if not path.exists():
+            return tracker
         with path.open("r") as f:
             history = json.load(f)
-        tracker = MetricsTracker(name=path.stem)
         tracker.history = {k: v for k, v in history.items()}
         return tracker
 
