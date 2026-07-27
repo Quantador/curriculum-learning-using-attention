@@ -55,6 +55,7 @@ See EXPERIMENTS.md for the full CLI reference and field descriptions.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -66,18 +67,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from config import ExperimentConfig, load_config_from_yaml
-from data import get_tokenizer, make_mixed_chunks, make_single_chunks, MixedLMDataset
+from data import get_tokenizer
 
-from utils.metrics import MetricsTracker
-from utils.shared_dataset import build_dataset_cache
+from utils.shared_dataset import dataset_signature, get_or_build_dataset_cache
 from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
 from utils.general_utils import (get_profile_fields, safe_name, 
                                  query_free_memory_bytes, compute_costs, dump_config)
-
-def get_baseline_config() -> Dict[str, Any]:
-    """Get the baseline values for all experimental fields."""
-    return {field: values[0] for field, values in EXPERIMENTAL_FIELDS.items()}
-
 
 def generate_experiment_configs(
     base_cfg: ExperimentConfig | None = None,
@@ -194,7 +189,7 @@ def run_scheduler(
     configs: List[ExperimentConfig],
     cost_by_name: Dict[str, int],
     usable_bytes: int,
-    dataset_cache: Path,
+    dataset_cache_by_name: Dict[str, Path],
     scratch_dir: Path,
     gpu_index: int,
     poll_interval: float,
@@ -222,7 +217,7 @@ def run_scheduler(
             [
                 sys.executable, "utils/experiment_worker.py",
                 "--config", str(cfg_path),
-                "--dataset-cache", str(dataset_cache),
+                "--dataset-cache", str(dataset_cache_by_name[cfg.experiment_name]),
             ],
             stdout=log_f, stderr=subprocess.STDOUT, env=env,
         )
@@ -347,12 +342,27 @@ def main() -> None:
 
     scratch_dir = SCRATCH_DIR
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    dataset_cache = scratch_dir / "dataset_cache.pt"
 
-    base_cfg = ExperimentConfig()
     tokenizer = get_tokenizer()
-    print("\n=== Building dataset cache (once, shared by every worker) ===")
-    build_dataset_cache(base_cfg, tokenizer, str(dataset_cache))
+    print("\n=== Resolving dataset cache per config (one tokenize per distinct dataset signature) ===")
+    signature_of_name = {cfg.experiment_name: dataset_signature(cfg) for cfg in configs}
+    representative_by_signature: Dict[Any, ExperimentConfig] = {}
+    for cfg in configs:
+        sig_key = json.dumps(signature_of_name[cfg.experiment_name], sort_keys=True)
+        representative_by_signature.setdefault(sig_key, cfg)
+
+    cache_path_by_signature = {
+        sig_key: get_or_build_dataset_cache(rep_cfg, tokenizer)
+        for sig_key, rep_cfg in representative_by_signature.items()
+    }
+    dataset_cache_by_name = {
+        cfg.experiment_name: cache_path_by_signature[json.dumps(signature_of_name[cfg.experiment_name], sort_keys=True)]
+        for cfg in configs
+    }
+    print(
+        f"{len(configs)} config(s) map to {len(representative_by_signature)} "
+        f"distinct dataset signature(s)"
+    )
 
     if args.max_parallel is not None:
         cost_by_name = {cfg.experiment_name: 1 for cfg in configs}
@@ -362,13 +372,13 @@ def main() -> None:
         free_bytes = query_free_memory_bytes(args.gpu)
         usable = int(free_bytes * args.safety_margin)
         print(f"\nGPU {args.gpu}: {free_bytes / 1e9:.2f} GB free, {usable / 1e9:.2f} GB usable budget")
-        cost_by_name = compute_costs(configs, dataset_cache, scratch_dir, args.gpu)
+        cost_by_name = compute_costs(configs, dataset_cache_by_name, scratch_dir, args.gpu)
         avg_cost = sum(cost_by_name.values()) / len(cost_by_name)
         print(f"Estimated max concurrency: ~{max(1, int(usable / avg_cost))} experiments")
 
     print(f"\n=== Running {len(configs)} experiments (parallel) ===\n")
     results = run_scheduler(
-        configs, cost_by_name, usable, dataset_cache, scratch_dir, args.gpu, args.poll_interval
+        configs, cost_by_name, usable, dataset_cache_by_name, scratch_dir, args.gpu, args.poll_interval
     )
 
     print(f"\n{'=' * 60}")

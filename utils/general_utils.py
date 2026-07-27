@@ -6,9 +6,14 @@ import subprocess
 import yaml 
 from pathlib import Path 
 from typing import Any, Dict, List, Tuple 
-from consts import EXPERIMENT_PROFILES, PER_PROC_BUFFER, CONTEXT_OVERHEAD_BYTES
+from consts import EXPERIMENT_PROFILES, PER_PROC_BUFFER, CONTEXT_OVERHEAD_BYTES, EXPERIMENTAL_FIELDS
 from config import ExperimentConfig
-from dataclasses import replace, asdict 
+from dataclasses import asdict 
+
+def get_baseline_config() -> Dict[str, Any]:
+    """Get the baseline values for all experimental fields."""
+    return {field: values[0] for field, values in EXPERIMENTAL_FIELDS.items()}
+
 def set_seed(seed: int):
     import random
     import numpy as np
@@ -65,6 +70,7 @@ def query_free_memory_bytes(gpu_index: int) -> int:
     return int(out.decode().strip()) * 1024 * 1024
 
 def probe_signature(cfg: ExperimentConfig, dataset_cache: Path, scratch_dir: Path, gpu_index: int) -> int:
+    """dataset_cache is the chunks.pt path matching cfg's own dataset signature."""
     cfg_path = scratch_dir / "probe_configs" / f"{safe_name(cfg.experiment_name)}.yaml"
     dump_config(cfg, cfg_path)
 
@@ -96,9 +102,14 @@ def probe_signature(cfg: ExperimentConfig, dataset_cache: Path, scratch_dir: Pat
     )
 
 def compute_costs(
-    configs: List[ExperimentConfig], dataset_cache: Path, scratch_dir: Path, gpu_index: int
+    configs: List[ExperimentConfig], dataset_cache_by_name: Dict[str, Path], scratch_dir: Path, gpu_index: int
 ) -> Dict[str, int]:
-    """Returns {experiment_name: cost_bytes}, probing once per distinct memory signature."""
+    """Returns {experiment_name: cost_bytes}, probing once per distinct memory signature.
+
+    dataset_cache_by_name maps each config's experiment_name to the chunks.pt
+    path matching that config's own dataset signature (see
+    utils/shared_dataset.get_or_build_dataset_cache).
+    """
     signature_of = {cfg.experiment_name: memory_signature(cfg) for cfg in configs}
     representatives: Dict[Tuple[Any, ...], ExperimentConfig] = {}
     for cfg in configs:
@@ -107,7 +118,7 @@ def compute_costs(
     print(f"\n=== Probing GPU memory for {len(representatives)} distinct config signature(s) ===")
     peak_by_signature: Dict[Tuple[Any, ...], int] = {}
     for i, (sig, rep_cfg) in enumerate(representatives.items(), 1):
-        peak = probe_signature(rep_cfg, dataset_cache, scratch_dir, gpu_index)
+        peak = probe_signature(rep_cfg, dataset_cache_by_name[rep_cfg.experiment_name], scratch_dir, gpu_index)
         peak_by_signature[sig] = peak
         print(f"  [{i}/{len(representatives)}] like '{rep_cfg.experiment_name}': {peak / 1e9:.2f} GB peak")
 

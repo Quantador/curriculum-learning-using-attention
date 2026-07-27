@@ -123,3 +123,9 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
 SCRATCH_DIR = Path("results/_parallel_run")
 CONTEXT_OVERHEAD_BYTES = 400 * 1024 * 1024  # per-process CUDA context overhead
 PER_PROC_BUFFER = 1.15  # safety factor over the measured probe peak
+
+# Persists across sweeps (unlike SCRATCH_DIR, which is only reused, not
+# versioned): one subdirectory per distinct dataset signature (see
+# utils/shared_dataset.dataset_signature), so re-running the same dataset
+# config skips re-tokenizing even across separate script invocations.
+DATASET_CACHE_DIR = Path("results/dataset_cache")

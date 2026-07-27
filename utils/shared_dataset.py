@@ -7,10 +7,73 @@ HuggingFace dataset once per process.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
 import torch
+import yaml
 
 from config import ExperimentConfig
+from consts import DATASET_CACHE_DIR
 from data import make_mixed_chunks, make_single_chunks, MixedLMDataset
+
+
+def dataset_signature(cfg: ExperimentConfig) -> dict:
+    """Fields that actually change the tokenized chunks produced for cfg.
+
+    Configs sharing a signature are assumed to need the same chunks, so
+    get_or_build_dataset_cache() only tokenizes once per distinct signature
+    instead of once per config. Tokenizer choice is deliberately excluded:
+    every caller in this sweep path uses get_tokenizer() with no argument
+    (always GPT-2), regardless of cfg.hf_model_name.
+    """
+    sig = {"block": cfg.block, "use_single_dataset": cfg.use_single_dataset}
+    if cfg.use_single_dataset:
+        sig.update(
+            single_dataset=cfg.single_dataset,
+            single_dataset_samples=cfg.single_dataset_samples,
+            single_dataset_val_split=cfg.single_dataset_val_split,
+            use_external_embeddings=cfg.use_external_embeddings,
+        )
+        if cfg.use_external_embeddings:
+            sig["external_embeddings_dataset"] = cfg.external_embeddings_dataset
+    else:
+        sig.update(
+            easy_dataset=cfg.easy_dataset,
+            hard_dataset=cfg.hard_dataset,
+            easy_samples=cfg.easy_samples,
+            hard_samples=cfg.hard_samples,
+            max_chunks=cfg.max_chunks,
+            easy_proportion=cfg.easy_proportion,
+        )
+    return sig
+
+
+def _signature_hash(sig: dict) -> str:
+    blob = json.dumps(sig, sort_keys=True).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def get_or_build_dataset_cache(
+    cfg: ExperimentConfig, tokenizer, cache_root: Path = DATASET_CACHE_DIR
+) -> Path:
+    """Return the chunks.pt path for cfg's dataset signature, building it
+    (and a signature.yaml sidecar for debugging) only on a cache miss."""
+    sig = dataset_signature(cfg)
+    entry_dir = cache_root / _signature_hash(sig)
+    chunks_path = entry_dir / "chunks.pt"
+
+    if chunks_path.exists():
+        print(f"[dataset cache] hit  {entry_dir.name} -> reusing {chunks_path}")
+        return chunks_path
+
+    print(f"[dataset cache] miss {entry_dir.name} -> tokenizing for signature {sig}")
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    with (entry_dir / "signature.yaml").open("w") as f:
+        yaml.safe_dump(sig, f)
+    build_dataset_cache(cfg, tokenizer, str(chunks_path))
+    return chunks_path
 
 
 def build_dataset_cache(cfg: ExperimentConfig, tokenizer, cache_path: str) -> None:
