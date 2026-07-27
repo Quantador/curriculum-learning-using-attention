@@ -829,6 +829,7 @@ def train_router_experiments(
             batch = [train_ds[i] for i in pool_indices]
             xs, ys, diffs = zip(*batch)
 
+            diffs_hard_ratio = sum(diffs) / len(diffs)  # fraction of the M-sized pool that's hard, pre-selection
             X = torch.stack(xs).to(cfg.device)  # [M, L]
             Y = torch.stack(ys).to(cfg.device)  # [M, L]
             diffs_t = torch.tensor(diffs, device=cfg.device)  # [M]
@@ -1098,6 +1099,12 @@ def train_router_experiments(
                 # forwards gated by is_log_step above.
                 # log_data.update(pool_difficulty_stats(scores.detach(), diffs_t, "pool_score"))
                 log_data.update(pool_difficulty_stats(probs.detach(), diffs_t, "pool_prob"))
+
+                # Composition of the M-sized candidate pool itself (before any
+                # selection), so a low hard selection rate can be told apart
+                # from hard samples simply being rare in the sampled pool.
+                log_data["pool_hard_ratio"] = diffs_hard_ratio
+                log_data["pool_easy_ratio"] = 1.0 - diffs_hard_ratio
                 if pool_loss_before is not None and pool_loss_after is not None:
                     pool_improvement = (pool_loss_before - pool_loss_after).clamp(min=0.0)
                     #log_data.update(pool_difficulty_stats(pool_loss_before, diffs_t, "pool_loss_before"))
@@ -1110,7 +1117,8 @@ def train_router_experiments(
                     f"[{cfg.training_algorithm.upper()}] Step {global_step} | "
                     f"loss_lm={loss_lm.item():.4f} | "
                     f"loss_router={loss_router.item():.4f} | "
-                    f"temp={current_temp:.3f}"
+                    f"temp={current_temp:.3f} | "
+                    f"pool_hard_ratio={log_data['pool_hard_ratio']:.3f}"
                 )
                 if "pool_score_hard_mean" in log_data:
                     print(
