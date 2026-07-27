@@ -60,7 +60,7 @@ def main() -> None:
 
     model = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=probe_cfg)
     router = build_router(
-        d_input=get_router_feature_dim(probe_cfg),
+        d_input=get_router_feature_dim(probe_cfg, model.block),
         arch=probe_cfg.router_architecture,
         d_k=128,
         n_heads=getattr(probe_cfg, "router_n_heads", 1),

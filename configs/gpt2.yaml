@@ -8,6 +8,8 @@
 
 experiment_name: yaml_example
 epochs: 10
+easy_samples: 20000
+hard_samples: 4000
 batch: 16
 use_single_dataset: false 
 use_wandb: true 

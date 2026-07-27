@@ -186,6 +186,20 @@ class ExperimentConfig(Config):
                     "different reward_signal."
                 )
 
+        if self.use_original_sequence and self.feature_cache_epochs > 0:
+            # build_feature_cache() (rl_training.py) always caches
+            # extract_hierarchical_hidden() output, so the cached-features
+            # branch in the training loop would silently ignore
+            # use_original_sequence and feed the router hierarchical hidden
+            # states instead of the raw token sequence.
+            raise ValueError(
+                "use_original_sequence=True is incompatible with "
+                f"feature_cache_epochs={self.feature_cache_epochs} (>0): the "
+                "feature cache only ever stores hierarchical hidden states, "
+                "so caching would silently override use_original_sequence. "
+                "Set feature_cache_epochs=0 or use_original_sequence=False."
+            )
+
 
     # Data mixing
     easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
@@ -225,7 +239,8 @@ class ExperimentConfig(Config):
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
-
+    use_original_sequence: bool = True # This uses the original tokens sequence, not passed through the model. 
+    
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo
 

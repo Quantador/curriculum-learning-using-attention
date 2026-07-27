@@ -10,7 +10,7 @@ validation perplexity for each:
                only runs when cfg.run_aux_baseline=True
 
 Results are printed by compare_runs() and saved to cfg.save_dir/.
-For running many ablation experiments sequentially, see experiments.py.
+For running many ablation experiments, see parallel_experiments.py.
 """
 from __future__ import annotations
 
@@ -53,31 +53,13 @@ def run_experiment(config_path: str | None = None):
         train_ds = MixedLMDataset(train_chunks)
         val_ds   = MixedLMDataset(val_chunks)
 
-    # Feature dimensionality for the router (accounts for all enabled feature groups)
-    d_input = get_router_feature_dim(cfg)
-
-    
-    # --- Baseline training ---
-    print("\n=== Baseline training ===")
-    model_base  = build_model(vocab_size=len(tokenizer), cfg=cfg)
-    base_metrics = MetricsTracker("baseline", use_wandb=cfg.use_wandb)
-    base_div     = DiversityTracker(len(train_ds))
-
-    model_base = train_baseline(
-        cfg=cfg,
-        model=model_base,
-        train_ds=train_ds,
-        val_ds=val_ds,
-        metrics=base_metrics,
-        diversity=base_div,
-    )
-    base_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
-    
     # --- Router training ---
     print("\n=== Router training ===")
     set_seed(cfg.seed)
 
     model_router  = build_model(vocab_size=len(tokenizer), cfg=cfg)
+    # Feature dimensionality for the router (accounts for all enabled feature groups)
+    d_input = get_router_feature_dim(cfg, model_router.block)
     router = build_router(
         d_input=d_input,
         arch=cfg.router_architecture,
@@ -99,6 +81,22 @@ def run_experiment(config_path: str | None = None):
     )
     router_metrics.save(f"{cfg.save_dir}/router_metrics.json")
 
+    # --- Baseline training ---
+    print("\n=== Baseline training ===")
+    model_base  = build_model(vocab_size=len(tokenizer), cfg=cfg)
+    base_metrics = MetricsTracker("baseline", use_wandb=cfg.use_wandb)
+    base_div     = DiversityTracker(len(train_ds))
+
+    model_base = train_baseline(
+        cfg=cfg,
+        model=model_base,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        metrics=base_metrics,
+        diversity=base_div,
+    )
+    base_metrics.save(f"{cfg.save_dir}/baseline_metrics.json")
+        
     # --- Auxiliary network baseline (optional) ---
     aux_metrics = None
     if cfg.run_aux_baseline:

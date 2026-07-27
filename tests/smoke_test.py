@@ -81,10 +81,9 @@ def shared_data():
         _shared["tok"]      = tok
         _shared["train_ds"] = MixedLMDataset(train_chunks)
         _shared["val_ds"]   = MixedLMDataset(val_chunks)
-        _shared["d_input"]  = get_router_feature_dim(cfg)
         print(f"  [shared] {len(_shared['train_ds'])} train  |  "
               f"{len(_shared['val_ds'])} val chunks")
-    return _shared["tok"], _shared["train_ds"], _shared["val_ds"], _shared["d_input"]
+    return _shared["tok"], _shared["train_ds"], _shared["val_ds"]
 
 
 results: dict[str, str] = {}
@@ -139,11 +138,12 @@ def test_2_custom_datasets():
 # ── Test 3: Multi-head router (n_heads = 2 and 4) ────────────────────────────
 
 def test_3_multihead_router():
-    tok, train_ds, val_ds, d_input = shared_data()
+    tok, train_ds, val_ds = shared_data()
 
     for n_heads in [2, 4]:
         cfg    = tiny_cfg(router_n_heads=n_heads)
         model  = TinyGPT(vocab_size=tok.vocab_size, cfg=cfg)
+        d_input = get_router_feature_dim(cfg, model.block)
         router = build_router(d_input=d_input, arch="attention", n_heads=n_heads)
 
         n_params_multi = sum(p.numel() for p in router.parameters())
@@ -188,7 +188,7 @@ def test_4_single_dataset():
     assert all(d == -1 for d in val_ds.difficulty),   "all val labels should be -1"
     print(f"  {len(train_ds)} train | {len(val_ds)} val chunks  (all difficulty=0)")
 
-    d_input = get_router_feature_dim(cfg)
+    d_input = get_router_feature_dim(cfg, cfg.block)
     model  = TinyGPT(vocab_size=tok.vocab_size, cfg=cfg)
     router = build_router(d_input=d_input, arch="attention")
     m      = MetricsTracker("single_ds", use_wandb=False)
@@ -206,8 +206,8 @@ def test_5_aux_baseline():
     cfg = tiny_cfg(aux_net_hidden=64, use_external_embeddings = False)
     set_seed()
     model   = TinyGPT(vocab_size=tok.vocab_size, cfg=cfg)
-    aux_net = build_router(d_input=get_router_feature_dim(cfg), 
-                           arch="auxnet", 
+    aux_net = build_router(d_input=get_router_feature_dim(cfg, model.block),
+                           arch="auxnet",
                            d_hidden=64)
     m   = MetricsTracker("aux", use_wandb=False)
     div = DiversityTracker(len(train_ds))

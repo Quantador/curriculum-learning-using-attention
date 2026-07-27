@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_config_from_yaml
 from data import get_tokenizer
 from utils.metrics import MetricsTracker
-from experiments import run_single_experiment, set_seed
+from parallel_experiments import run_single_experiment, set_seed
 from utils.shared_dataset import load_dataset_cache
 
 

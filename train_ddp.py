@@ -136,7 +136,7 @@ def run() -> None:
             f"Val: {len(val_ds)} chunks (shared)."
         )
 
-    d_input = get_router_feature_dim(cfg)
+    d_input = get_router_feature_dim(cfg, cfg.block)
     print(f"Input size: {d_input=}")
     use_ddp = world_size > 1
     ddp_kwargs = {"device_ids": [local_rank]} if torch.cuda.is_available() else {}

@@ -115,7 +115,8 @@ def extract_router_features(
     Returns [B, F] where F == get_router_feature_dim(cfg).
     """
     features = []
-
+    if cfg.use_original_sequence:
+        return X.float()
     if cfg.enable_text_hierarchical:
         hidden_feat = extract_hierarchical_hidden(model, X, cfg)  # [B, n_chunks*D]
         features.append(hidden_feat)
@@ -145,7 +146,7 @@ def extract_router_features(
     return torch.cat(features, dim=1)  # [B, F]
 
 
-def get_router_feature_dim(cfg: ExperimentConfig) -> int:
+def get_router_feature_dim(cfg: ExperimentConfig, sequence_size: int) -> int:
     """
     Compute the router's expected input dimensionality from config flags.
 
@@ -158,6 +159,8 @@ def get_router_feature_dim(cfg: ExperimentConfig) -> int:
     dimension n_chunks * d_model + 4 to match the random-feature path in
     extract_router_features().
     """
+    if cfg.use_original_sequence:
+        return sequence_size 
     full_dim = cfg.n_chunks * cfg.d_model + 4
     if not cfg.enable_text_hierarchical and not cfg.enable_text_stat:
         return full_dim

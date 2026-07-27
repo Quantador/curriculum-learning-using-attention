@@ -300,13 +300,20 @@ def train_router(
             # print/log below — see _timed()'s docstring for why.
             profile_step = ((global_step + 1) % cfg.log_every == 0)
 
-            with _timed(stage_times, "data_gather", cfg.device, profile_step):
-                batch = [train_ds[i] for i in pool_indices]
-                xs, ys, diffs = zip(*batch)
+            batch = [train_ds[i] for i in pool_indices] 
+            xs, ys, diffs = zip(*batch)
 
-                X = torch.stack(xs).to(cfg.device)  # [M, L]
-                Y = torch.stack(ys).to(cfg.device)  # [M, L]
-                M = X.size(0)
+            easy = 0
+            difficult = 0 
+            for b in diffs:
+                if b == 0:
+                    easy+=1
+                else:
+                    difficult+=1
+
+            X = torch.stack(xs).to(cfg.device)  # [M, L]
+            Y = torch.stack(ys).to(cfg.device)  # [M, L]
+            M = X.size(0)
 
             with _timed(stage_times, "feature_extraction", cfg.device, profile_step):
                 feats = extract_hierarchical_features(

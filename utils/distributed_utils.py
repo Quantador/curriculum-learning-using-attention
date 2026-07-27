@@ -4,7 +4,7 @@ Single-node PyTorch DDP setup helpers for train_ddp.py.
 
 setup_distributed() / cleanup_distributed() wrap torch.distributed process
 group lifecycle, falling back to a single-process no-op when launched
-without torchrun so every other entry point (compare.py, experiments.py,
+without torchrun so every other entry point (compare.py, parallel_experiments.py,
 smoke_test.py) is unaffected.
 
 build_and_cache_chunks() / shard_and_truncate() implement the dataset

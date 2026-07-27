@@ -1,18 +1,18 @@
 # Experiments Guide
 
-This document describes how to use `experiments.py` to run curriculum learning experiments with various configurations.
+This document describes how to use `parallel_experiments.py` to run curriculum learning experiments with various configurations.
 
 ## Quick Start
 
 ```bash
 # Run default single experiment
-python experiments.py
+python parallel_experiments.py
 
 # List all available ablation experiments
-python experiments.py --list
+python parallel_experiments.py --list
 
 # Run all ablation experiments
-python experiments.py --all
+python parallel_experiments.py --all
 ```
 
 ## Command Line Options
@@ -25,6 +25,14 @@ python experiments.py --all
 | `--profile PROFILE` | Run a predefined experiment profile (e.g., `final_presentation`) |
 | `--no-baseline` | Skip the baseline experiment |
 | `--list` | List experiments without running them |
+| `--config PATH` | YAML file with `ExperimentConfig` overrides, used as the base config |
+| `--name NAME` | Sweep name; sets the shared wandb project `curriculum-learning-<name>` |
+| `--max-parallel N` | Skip GPU probing; always run exactly N workers concurrently |
+| `--safety-margin F` | Fraction of free GPU memory treated as usable (default 0.85) |
+| `--poll-interval S` | Seconds between checks on running workers (default 5) |
+| `--gpu INDEX` | Physical GPU index to target (default 0) |
+
+Bare `python parallel_experiments.py` (no sweep flag) runs a single experiment in-process — no GPU probing, no subprocess. Any of `--all`/`--field`/`--combinations`/`--profile` switches to sweep mode: configs are scheduled across one GPU by probing memory per config and running workers as `experiment_worker.py` subprocesses.
 
 ## Experiment Modes
 
@@ -33,7 +41,7 @@ python experiments.py --all
 Runs one experiment with the default `ExperimentConfig` settings.
 
 ```bash
-python experiments.py
+python parallel_experiments.py
 ```
 
 ### 2. Ablation Study (Recommended)
@@ -41,7 +49,7 @@ python experiments.py
 Runs one-factor-at-a-time experiments where each experiment varies only ONE field from the baseline. This is the recommended approach for systematic evaluation.
 
 ```bash
-python experiments.py --all
+python parallel_experiments.py --all
 ```
 
 **Current ablation experiments (~37 total):**
@@ -67,13 +75,13 @@ Run ablations for specific experimental fields only.
 
 ```bash
 # Only training algorithm variants
-python experiments.py --field training_algorithm
+python parallel_experiments.py --field training_algorithm
 
 # Multiple fields
-python experiments.py --field training_algorithm --field reward_signal
+python parallel_experiments.py --field training_algorithm --field reward_signal
 
 # Skip baseline when running specific fields
-python experiments.py --field reward_signal --no-baseline
+python parallel_experiments.py --field reward_signal --no-baseline
 ```
 
 ### 4. Full Grid Search
@@ -82,10 +90,10 @@ Run all combinations of experimental values (use with caution - exponential grow
 
 ```bash
 # Full grid search (thousands of experiments!)
-python experiments.py --combinations
+python parallel_experiments.py --combinations
 
 # Grid search for specific fields only
-python experiments.py --combinations --field training_algorithm --field reward_signal
+python parallel_experiments.py --combinations --field training_algorithm --field reward_signal
 ```
 
 ## Experimental Fields
@@ -210,31 +218,31 @@ Encourages the router to select diverse samples over time by penalizing repeated
 ### Preview Experiments
 ```bash
 # See what would run without actually running
-python experiments.py --list
-python experiments.py --list --field training_algorithm
-python experiments.py --list --combinations --field training_algorithm --field baseline_type
+python parallel_experiments.py --list
+python parallel_experiments.py --list --field training_algorithm
+python parallel_experiments.py --list --combinations --field training_algorithm --field baseline_type
 ```
 
 ### Common Experiment Sets
 ```bash
 # Compare training algorithms
-python experiments.py --field training_algorithm
+python parallel_experiments.py --field training_algorithm
 
 # Compare reward signals
-python experiments.py --field reward_signal
+python parallel_experiments.py --field reward_signal
 
 # Compare datasets
-python experiments.py --field easy_dataset --field hard_dataset
+python parallel_experiments.py --field easy_dataset --field hard_dataset
 
 # Full ablation study
-python experiments.py --all
+python parallel_experiments.py --all
 
 # Final presentation profile (curated subset)
-python experiments.py --profile final_presentation
-python experiments.py --list --profile final_presentation
+python parallel_experiments.py --profile final_presentation
+python parallel_experiments.py --list --profile final_presentation
 
 # Training algorithm x reward signal grid
-python experiments.py --combinations --field training_algorithm --field reward_signal
+python parallel_experiments.py --combinations --field training_algorithm --field reward_signal
 ```
 
 ## Output
@@ -293,7 +301,7 @@ gradient_reward_clip: float | None = 10.0
 To add a new experimental field:
 
 1. Add the field to `ExperimentConfig` in `config.py`
-2. Add the field to `EXPERIMENTAL_FIELDS` in `experiments.py`:
+2. Add the field to `EXPERIMENTAL_FIELDS` in `parallel_experiments.py`:
    ```python
    "new_field": ("baseline_value", ["alt1", "alt2"]),
    ```
