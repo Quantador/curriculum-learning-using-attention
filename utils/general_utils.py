@@ -1,0 +1,118 @@
+import torch 
+import re 
+import os
+import sys
+import subprocess 
+import yaml 
+from pathlib import Path 
+from typing import Any, Dict, List, Tuple 
+from consts import EXPERIMENT_PROFILES, PER_PROC_BUFFER, CONTEXT_OVERHEAD_BYTES
+from config import ExperimentConfig
+from dataclasses import replace, asdict 
+def set_seed(seed: int):
+    import random
+    import numpy as np
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def get_profile_fields(profile: str | None) -> Dict[str, tuple[Any, List[Any]]] | None:
+    if not profile:
+        return None
+    if profile in EXPERIMENT_PROFILES:
+        return EXPERIMENT_PROFILES[profile]
+    normalized = profile.replace("-", "_").replace(" ", "_")
+    if normalized in EXPERIMENT_PROFILES:
+        return EXPERIMENT_PROFILES[normalized]
+    raise ValueError(
+        f"Unknown profile '{profile}'. Available: {', '.join(sorted(set(EXPERIMENT_PROFILES.keys())))}"
+    )
+
+def safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def dump_config(cfg: ExperimentConfig, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        yaml.safe_dump(asdict(cfg), f)
+
+def memory_signature(cfg: ExperimentConfig) -> Tuple[Any, ...]:
+    """Fields that plausibly change GPU memory use. Configs sharing a
+    signature are assumed to need the same amount of GPU memory, so we only
+    probe once per signature instead of once per config."""
+    return (
+        cfg.model_type, cfg.hf_model_name,
+        cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.n_chunks,
+        cfg.batch, cfg.block, cfg.pool_mult,
+        cfg.training_algorithm, cfg.ppo_epochs, cfg.grpo_group_size,
+        cfg.router_architecture, cfg.router_n_heads,
+        cfg.enable_text_hierarchical, cfg.hierarchical_representation, cfg.hierarchical_layer_index,
+        cfg.feature_cache_epochs > 0, cfg.feature_cache_batch_size,
+    )
+
+def query_free_memory_bytes(gpu_index: int) -> int:
+    out = subprocess.check_output(
+        [
+            "nvidia-smi",
+            f"--id={gpu_index}",
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    return int(out.decode().strip()) * 1024 * 1024
+
+def probe_signature(cfg: ExperimentConfig, dataset_cache: Path, scratch_dir: Path, gpu_index: int) -> int:
+    cfg_path = scratch_dir / "probe_configs" / f"{safe_name(cfg.experiment_name)}.yaml"
+    dump_config(cfg, cfg_path)
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    proc = subprocess.run(
+        [
+            sys.executable, "utils/gpu_memory_probe.py",
+            "--config", str(cfg_path),
+            "--dataset-cache", str(dataset_cache),
+        ],
+        env=env, capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(proc.stdout)
+        print(proc.stderr, file=sys.stderr)
+        raise RuntimeError(
+            f"GPU memory probe failed for a config like '{cfg.experiment_name}' "
+            f"(exit {proc.returncode}). See output above."
+        )
+
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith("PROBE_PEAK_BYTES="):
+            return int(line.split("=", 1)[1])
+
+    raise RuntimeError(
+        f"GPU memory probe for '{cfg.experiment_name}' did not report PROBE_PEAK_BYTES. "
+        f"stdout:\n{proc.stdout}"
+    )
+
+def compute_costs(
+    configs: List[ExperimentConfig], dataset_cache: Path, scratch_dir: Path, gpu_index: int
+) -> Dict[str, int]:
+    """Returns {experiment_name: cost_bytes}, probing once per distinct memory signature."""
+    signature_of = {cfg.experiment_name: memory_signature(cfg) for cfg in configs}
+    representatives: Dict[Tuple[Any, ...], ExperimentConfig] = {}
+    for cfg in configs:
+        representatives.setdefault(signature_of[cfg.experiment_name], cfg)
+
+    print(f"\n=== Probing GPU memory for {len(representatives)} distinct config signature(s) ===")
+    peak_by_signature: Dict[Tuple[Any, ...], int] = {}
+    for i, (sig, rep_cfg) in enumerate(representatives.items(), 1):
+        peak = probe_signature(rep_cfg, dataset_cache, scratch_dir, gpu_index)
+        peak_by_signature[sig] = peak
+        print(f"  [{i}/{len(representatives)}] like '{rep_cfg.experiment_name}': {peak / 1e9:.2f} GB peak")
+
+    return {
+        cfg.experiment_name: int(peak_by_signature[signature_of[cfg.experiment_name]] * PER_PROC_BUFFER)
+        + CONTEXT_OVERHEAD_BYTES
+        for cfg in configs
+    }

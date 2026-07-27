@@ -10,16 +10,79 @@ from __future__ import annotations
 
 import argparse
 import sys
+import os 
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import load_config_from_yaml
 from data import get_tokenizer
-from utils.metrics import MetricsTracker
-from parallel_experiments import run_single_experiment, set_seed
-from utils.shared_dataset import load_dataset_cache
+from metrics import MetricsTracker
+from shared_dataset import load_dataset_cache
+from models.router import build_router, get_router_feature_dim
+from rl_training import train_router_experiments, compare_runs_experiments
+from models.model import TinyGPT
+from metrics import MetricsTracker, DiversityTracker
+from config import ExperimentConfig, load_config_from_yaml
+from general_utils import set_seed
+def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics):
+    """Run a single experiment with the given configuration.
 
+    Shared by the bare in-process run_experiment() below and by
+    utils/experiment_worker.py, which calls this once per config inside its
+    own subprocess when running a sweep via run_scheduler().
+    """
+    print(f"\n{'='*60}")
+    print(f"=== Running experiment: {cfg.experiment_name} ===")
+    print(f"{'='*60}")
+    print(f"  router_architecture: {cfg.router_architecture}")
+    print(f"  enable_text_stat: {cfg.enable_text_stat}")
+    print(f"  enable_text_hierarchical: {cfg.enable_text_hierarchical}")
+    print(f"  hierarchical_representation: {cfg.hierarchical_representation}")
+    print(f"  training_algorithm: {cfg.training_algorithm}")
+    print(f"  reward_signal: {cfg.reward_signal}")
+    print(f"  selection_strategy: {cfg.selection_strategy}")
+    print(f"  baseline_type: {cfg.baseline_type}")
+    print(f"  temp_schedule: {cfg.temp_schedule}")
+    print(f"  entropy_schedule: {cfg.entropy_schedule}")
+
+    set_seed(cfg.seed)
+
+    # Ensure save directory exists
+    os.makedirs(cfg.save_dir, exist_ok=True)
+
+    model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
+    router = build_router(
+        d_input=get_router_feature_dim(cfg, model_router.block),
+        arch=cfg.router_architecture,
+        d_k=128,
+        n_heads=getattr(cfg, "router_n_heads", 1),
+    )
+
+    experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
+    router_div = DiversityTracker(len(train_ds))
+
+    model_router, router = train_router_experiments(
+        cfg=cfg,
+        model=model_router,
+        router=router,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        tokenizer=tokenizer,
+        metrics=experiment_metrics,
+        diversity=router_div,
+    )
+
+    experiment_metrics.save(f"{cfg.save_dir}/{cfg.experiment_name}.json")
+
+    print("\n=== Comparing runs ===")
+    compare_runs_experiments(
+        base_metrics,
+        router_metrics,
+        experiment_metrics,
+    )
+
+    return experiment_metrics
 
 def main() -> None:
     parser = argparse.ArgumentParser()
