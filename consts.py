@@ -64,6 +64,23 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     # Feature caching
     "feature_cache_epochs": (0, [1, 2]),
 }
+# New experiments added for NeurIPS:
+#   1. Multi-head attention router (n_heads = 2 and 4)
+#   2. Harder easy datasets (WikiText, Children-Stories)
+#   3. Harder hard datasets (scientific papers, ML-ArXiv, FineWeb-Edu)
+# Note: single-dataset mode and aux-net baseline use a different training loop
+# and must be run via compare.py with use_single_dataset / run_aux_baseline.
+ADDITIONAL_EXPERIMENTS_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
+    "router_n_heads": (1, [2, 4]),
+    "easy_dataset": (
+        "roneneldan/TinyStories",
+        ["ajibawa-2023/Children-Stories-Collection", "Salesforce/wikitext"],
+    ),
+    "hard_dataset": (
+        "Geralt-Targaryen/openwebtext2",
+        ["armanc/scientific_papers", "CShorten/ML-ArXiv-Papers", "HuggingFaceFW/fineweb-edu"],
+    ),
+}
 
 # Predefined experiment profiles (subset of ablations)
 FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
@@ -95,23 +112,6 @@ FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 LOSS_IMPROVEMENT_LOGGING: Dict[str, tuple[Any, List[Any]]] = {
     "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["loss_improvement"])
 }
-# New experiments added for NeurIPS:
-#   1. Multi-head attention router (n_heads = 2 and 4)
-#   2. Harder easy datasets (WikiText, Children-Stories)
-#   3. Harder hard datasets (scientific papers, ML-ArXiv, FineWeb-Edu)
-# Note: single-dataset mode and aux-net baseline use a different training loop
-# and must be run via compare.py with use_single_dataset / run_aux_baseline.
-ADDITIONAL_EXPERIMENTS_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
-    "router_n_heads": (1, [2, 4]),
-    "easy_dataset": (
-        "roneneldan/TinyStories",
-        ["ajibawa-2023/Children-Stories-Collection", "Salesforce/wikitext"],
-    ),
-    "hard_dataset": (
-        "Geralt-Targaryen/openwebtext2",
-        ["armanc/scientific_papers", "CShorten/ML-ArXiv-Papers", "HuggingFaceFW/fineweb-edu"],
-    ),
-}
 
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
@@ -121,7 +121,7 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "additional-experiments": ADDITIONAL_EXPERIMENTS_FIELDS,  # alias
     "grpo_vs_greats": COMPARE_GRPO_VS_GREATS,
     "compare_reward_signals": COMPARE_REWARD_SIGNALS,
-    "loss_improvement": LOSS_IMPROVEMENT_LOGGING
+    "loss_improvement_logging": LOSS_IMPROVEMENT_LOGGING
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

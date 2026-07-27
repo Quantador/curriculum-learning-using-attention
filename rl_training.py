@@ -1096,12 +1096,12 @@ def train_router_experiments(
                 # already computed for the full pool every step (free); the
                 # loss-improvement stats need the extra pool_loss_before/after
                 # forwards gated by is_log_step above.
-                log_data.update(pool_difficulty_stats(scores.detach(), diffs_t, "pool_score"))
+                # log_data.update(pool_difficulty_stats(scores.detach(), diffs_t, "pool_score"))
                 log_data.update(pool_difficulty_stats(probs.detach(), diffs_t, "pool_prob"))
                 if pool_loss_before is not None and pool_loss_after is not None:
                     pool_improvement = (pool_loss_before - pool_loss_after).clamp(min=0.0)
-                    log_data.update(pool_difficulty_stats(pool_loss_before, diffs_t, "pool_loss_before"))
-                    log_data.update(pool_difficulty_stats(pool_loss_after, diffs_t, "pool_loss_after"))
+                    #log_data.update(pool_difficulty_stats(pool_loss_before, diffs_t, "pool_loss_before"))
+                    #og_data.update(pool_difficulty_stats(pool_loss_after, diffs_t, "pool_loss_after"))
                     log_data.update(pool_difficulty_stats(pool_improvement, diffs_t, "pool_improvement"))
 
                 metrics.log(**log_data)
