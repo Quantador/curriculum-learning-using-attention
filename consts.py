@@ -92,6 +92,9 @@ FEATURE_CACHE_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "feature_cache_epochs": (0, [2]),
 }
 
+LOSS_IMPROVEMENT_LOGGING: Dict[str, tuple[Any, List[Any]]] = {
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["loss_improvement"])
+}
 # New experiments added for NeurIPS:
 #   1. Multi-head attention router (n_heads = 2 and 4)
 #   2. Harder easy datasets (WikiText, Children-Stories)
@@ -117,7 +120,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "additional_experiments": ADDITIONAL_EXPERIMENTS_FIELDS,
     "additional-experiments": ADDITIONAL_EXPERIMENTS_FIELDS,  # alias
     "grpo_vs_greats": COMPARE_GRPO_VS_GREATS,
-    "compare_reward_signals": COMPARE_REWARD_SIGNALS
+    "compare_reward_signals": COMPARE_REWARD_SIGNALS,
+    "loss_improvement": LOSS_IMPROVEMENT_LOGGING
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

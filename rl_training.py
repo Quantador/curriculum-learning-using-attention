@@ -410,6 +410,25 @@ def compute_entropy_per_sample(logits: torch.Tensor) -> torch.Tensor:
     return entropy.mean(dim=1)  # [B]
 
 
+def pool_difficulty_stats(values: torch.Tensor, diffs: torch.Tensor, name: str) -> dict:
+    """min/max/mean/count of `values` (aligned with the full candidate pool,
+    not just the selected batch), split by difficulty label (0=easy, 1=hard).
+
+    Used to diagnose curriculum collapse: whether hard samples are getting
+    low router scores/probs, or low measured loss-improvement, or both.
+    """
+    stats = {}
+    for label, group in (("easy", 0), ("hard", 1)):
+        mask = diffs == group
+        if mask.any():
+            group_vals = values[mask]
+            stats[f"{name}_{label}_min"] = group_vals.min().item()
+            stats[f"{name}_{label}_max"] = group_vals.max().item()
+            stats[f"{name}_{label}_mean"] = group_vals.mean().item()
+            stats[f"{name}_{label}_count"] = float(mask.sum().item())
+    return stats
+
+
 def compute_gradient_reward(
     params: list[torch.nn.Parameter],
     grad_ema: list[torch.Tensor] | None,
@@ -812,6 +831,13 @@ def train_router_experiments(
 
             X = torch.stack(xs).to(cfg.device)  # [M, L]
             Y = torch.stack(ys).to(cfg.device)  # [M, L]
+            diffs_t = torch.tensor(diffs, device=cfg.device)  # [M]
+
+            # Full-pool loss-before/after is only computed on log steps: it
+            # needs two extra whole-pool forward passes (no backward) beyond
+            # the selected-batch ones already done below, so it's gated to
+            # avoid paying that cost on every step.
+            is_log_step = (global_step + 1) % cfg.log_every == 0 and cfg.rank == 0
 
             # --- Router features over the full pool ---
             feat_start = time.perf_counter()
@@ -897,6 +923,13 @@ def train_router_experiments(
                 loss_before = compute_loss_per_sample_vectorized(logits, Y_sel)
                 entropy_before = compute_entropy_per_sample(logits) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
 
+                # Whole-pool loss BEFORE update (diagnostic only): what this
+                # step's LM update does to every pool sample, not just the
+                # selected ones, split by difficulty below.
+                pool_loss_before = None
+                if is_log_step:
+                    pool_loss_before = compute_loss_per_sample_vectorized(model(X), Y)
+
             # scalar loss for LM update
             B, L, V = logits.shape
             loss_lm = F.cross_entropy(
@@ -927,6 +960,10 @@ def train_router_experiments(
                 logits_after = model(X_sel)
                 loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
                 entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
+
+                pool_loss_after = None
+                if is_log_step:
+                    pool_loss_after = compute_loss_per_sample_vectorized(model(X), Y)
 
             # Get difficulty scores for selected samples
             difficulty_tensor = torch.tensor(selected_diffs, device=cfg.device, dtype=torch.float32) if cfg.reward_signal in ("difficulty_weighted", "combined") else None
@@ -1055,6 +1092,18 @@ def train_router_experiments(
                 if coverage_tracker is not None:
                     log_data.update(coverage_tracker.get_coverage_stats())
 
+                # Pool-wide diagnostics, split easy vs hard: score/prob are
+                # already computed for the full pool every step (free); the
+                # loss-improvement stats need the extra pool_loss_before/after
+                # forwards gated by is_log_step above.
+                log_data.update(pool_difficulty_stats(scores.detach(), diffs_t, "pool_score"))
+                log_data.update(pool_difficulty_stats(probs.detach(), diffs_t, "pool_prob"))
+                if pool_loss_before is not None and pool_loss_after is not None:
+                    pool_improvement = (pool_loss_before - pool_loss_after).clamp(min=0.0)
+                    log_data.update(pool_difficulty_stats(pool_loss_before, diffs_t, "pool_loss_before"))
+                    log_data.update(pool_difficulty_stats(pool_loss_after, diffs_t, "pool_loss_after"))
+                    log_data.update(pool_difficulty_stats(pool_improvement, diffs_t, "pool_improvement"))
+
                 metrics.log(**log_data)
 
                 print(
@@ -1063,6 +1112,20 @@ def train_router_experiments(
                     f"loss_router={loss_router.item():.4f} | "
                     f"temp={current_temp:.3f}"
                 )
+                if "pool_score_hard_mean" in log_data:
+                    print(
+                        f"  pool score  easy=[{log_data.get('pool_score_easy_min', float('nan')):.3f}, "
+                        f"{log_data.get('pool_score_easy_max', float('nan')):.3f}]  "
+                        f"hard=[{log_data.get('pool_score_hard_min', float('nan')):.3f}, "
+                        f"{log_data.get('pool_score_hard_max', float('nan')):.3f}]"
+                    )
+                if "pool_improvement_hard_mean" in log_data:
+                    print(
+                        f"  pool improvement  easy=[{log_data.get('pool_improvement_easy_min', float('nan')):.4f}, "
+                        f"{log_data.get('pool_improvement_easy_max', float('nan')):.4f}]  "
+                        f"hard=[{log_data.get('pool_improvement_hard_min', float('nan')):.4f}, "
+                        f"{log_data.get('pool_improvement_hard_max', float('nan')):.4f}]"
+                    )
 
         # --- Validation ---
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
