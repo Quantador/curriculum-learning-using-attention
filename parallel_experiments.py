@@ -61,6 +61,7 @@ import subprocess
 import sys
 import time
 
+from datetime import datetime
 from dataclasses import replace
 from itertools import product
 from pathlib import Path
@@ -340,8 +341,9 @@ def main() -> None:
             print(f"  {i}. {cfg.experiment_name}")
         return
 
-    scratch_dir = SCRATCH_DIR
-    scratch_dir.mkdir(parents=True, exist_ok=True)
+    scratch_dir = SCRATCH_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+    scratch_dir.mkdir(parents=True, exist_ok=False)
+    print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
 
     tokenizer = get_tokenizer()
     print("\n=== Resolving dataset cache per config (one tokenize per distinct dataset signature) ===")
@@ -384,7 +386,7 @@ def main() -> None:
     print(f"\n{'=' * 60}")
     print(f"=== {len(results['succeeded'])} succeeded, {len(results['failed'])} failed ===")
     if results["failed"]:
-        print("Failed experiments (see results/_parallel_run/logs/<name>.log):")
+        print(f"Failed experiments (see {scratch_dir}/logs/<name>.log):")
         for name in results["failed"]:
             print(f"  - {name}")
     print(f"{'=' * 60}")
