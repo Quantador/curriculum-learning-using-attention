@@ -16,7 +16,7 @@ import yaml
 
 from config import ExperimentConfig
 from consts import DATASET_CACHE_DIR
-from data import make_mixed_chunks, make_single_chunks, MixedLMDataset
+from data import make_chunks, MixedLMDataset
 
 
 def dataset_signature(cfg: ExperimentConfig) -> dict:
@@ -78,12 +78,9 @@ def get_or_build_dataset_cache(
 
 def build_dataset_cache(cfg: ExperimentConfig, tokenizer, cache_path: str) -> None:
     """Tokenize the configured dataset(s) once and save chunks+embeddings to disk."""
-    if cfg.use_single_dataset:
-        train_chunks, val_chunks, train_embs, val_embs = make_single_chunks(cfg, tokenizer)
-    else:
-        train_chunks = make_mixed_chunks("train", cfg, tokenizer)
-        val_chunks = make_mixed_chunks("validation", cfg, tokenizer)
-        train_embs = val_embs = None
+
+    # Need to unite the logic for sampling the chunks and ratios for every dataset 
+    train_chunks, val_chunks, train_embs, val_embs = make_chunks(cfg, tokenizer) 
 
     torch.save(
         {

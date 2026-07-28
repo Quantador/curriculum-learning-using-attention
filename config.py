@@ -24,9 +24,7 @@ from transformers import AutoConfig
 class Config:
     # Data
     block: int = 256
-    easy_samples: int = 100_000
-    hard_samples: int = 20_000
-    max_chunks: int = 500_000
+    max_chunks: int = 500_000 # Can be overriden by -1 
 
     # Model
     d_model: int = 512
@@ -200,11 +198,6 @@ class ExperimentConfig(Config):
                 "Set feature_cache_epochs=0 or use_original_sequence=False."
             )
 
-
-    # Data mixing
-    easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
-    hard_proportion: float = 0.3  # Proportion of hard samples in mixed chunks
-
     # Dataset options by difficulty (see DATASET_REGISTRY in data.py):
     # Easy:         roneneldan/TinyStories
     #               ajibawa-2023/Children-Stories-Collection
@@ -214,20 +207,18 @@ class ExperimentConfig(Config):
     #               allenai/c4
     # Hard:         armanc/scientific_papers
     #               CShorten/ML-ArXiv-Papers
-    # Unstructured: HuggingFaceFW/fineweb  (use with use_single_dataset=True)
-    easy_dataset: str = "roneneldan/TinyStories"
-    hard_dataset: str = "Geralt-Targaryen/openwebtext2"
+    # Unstructured: HuggingFaceFW/fineweb  (use with use_single_dataset=True) 
 
-    # Single-dataset mode (no easy/hard split).
-    # When True, trains on one dataset only; easy/hard fields above are ignored.
-    use_single_dataset: bool = True
-    single_dataset: str = "HuggingFaceFW/fineweb"
-    single_dataset_samples: int = 120_000
-    single_dataset_val_split: float = 0.05
+    split_dataset: bool = False # Needs to be true when used with SlimPajama. Also overrides dataset proportions. 
+    split_column: str = "" # Make sure a split column is specified to create different datasets 
+    dataset_list: list[str] = field(default_factory=list)  # All datasets used
+    dataset_proportions: list[str] = field(default_factory=list) # The proportion for datasets in order 
+
+    single_dataset_val_split: float = 0.05 # Confused what this is 
 
     # External pre-computed embeddings (e.g. epfml/FineWeb-HQ).
     # The HuggingFace dataset must have a 'text' and an 'embeddings' column.
-    # Only used when use_single_dataset=True.
+    # Only used when len(dataset_list)=1.
     use_external_embeddings: bool = False
     external_embeddings_dataset: str = "epfml/FineWeb-HQ"
     external_embedding_dim: int = 768

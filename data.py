@@ -31,10 +31,10 @@ from typing import List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, GPT2TokenizerFast, PreTrainedTokenizerBase
 
 from tqdm import tqdm
-from config import Config
+from config import Config, ExperimentConfig
 
 
 # Registry mapping HuggingFace dataset names to their split/text-column metadata.
@@ -56,24 +56,8 @@ DATASET_REGISTRY: dict[str, dict] = {
     "HuggingFaceFW/fineweb-edu":                {"split": "train", "text_col": "text"},
     "HuggingFaceFW/fineweb":                    {"split": "train", "name": "sample-10BT", "text_col": "text"},
     "allenai/c4":                               {"split": "train", "name": "en", "text_col": "text"},
+    "DKYoon/SlimPajama-6B": {"split": "train", "text_col": "text"}
 }
-
-
-def load_dataset_by_name(name: str, n_samples: int):
-    """Load n_samples from a registered HuggingFace dataset.
-
-    Uses streaming=True so only the requested records are fetched - no need to
-    download every shard just to slice the first N rows.
-    """
-    if name not in DATASET_REGISTRY:
-        raise ValueError(f"Unknown dataset '{name}'. Add it to DATASET_REGISTRY in data.py.")
-    meta = DATASET_REGISTRY[name]
-    kwargs: dict = {"split": meta["split"], "streaming": True}
-    if "name" in meta:
-        kwargs["name"] = meta["name"]
-    ds = load_dataset(name, **kwargs)
-    return ds.take(n_samples), meta["text_col"]
-
 
 def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
     """
@@ -88,27 +72,6 @@ def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
         tok.pad_token = tok.eos_token
     return tok
 
-
-def load_mixed_dataset(cfg: Config):
-    print("\n" + "=" * 70)
-    print("Loading Mixed Difficulty Dataset")
-    print("=" * 70)
-
-    easy_name = getattr(cfg, "easy_dataset", "roneneldan/TinyStories")
-    hard_name = getattr(cfg, "hard_dataset", "Geralt-Targaryen/openwebtext2")
-
-    print(f"Loading {easy_name} (easy)... target: {cfg.easy_samples} samples")
-    easy_ds, easy_col = load_dataset_by_name(easy_name, cfg.easy_samples)
-
-    print(f"Loading {hard_name} (hard)... target: {cfg.hard_samples} samples")
-    hard_ds, hard_col = load_dataset_by_name(hard_name, cfg.hard_samples)
-
-    print(f"OK Requested {cfg.easy_samples} easy samples (streaming)")
-    print(f"OK Requested {cfg.hard_samples} hard samples (streaming)")
-
-    return easy_ds, easy_col, hard_ds, hard_col
-
-
 def tokenize_and_chunk(
     text: str,
     tokenizer: GPT2TokenizerFast,
@@ -121,88 +84,6 @@ def tokenize_and_chunk(
         if len(chunk) == max_length:
             chunks.append(chunk)
     return chunks
-
-
-def make_mixed_chunks(
-    split: str,
-    cfg: Config,
-    tokenizer: GPT2TokenizerFast,
-) -> List[Tuple[List[int], int]]:
-    if split == "train":
-        easy_ds, easy_col, hard_ds, hard_col = load_mixed_dataset(cfg)
-
-        print("\nTokenizing and chunking...")
-        easy_chunks: List[List[int]] = []
-        for item in tqdm(easy_ds):
-            easy_chunks.extend(
-                tokenize_and_chunk(item[easy_col], tokenizer, cfg.block + 1)
-            )
-
-        hard_chunks: List[List[int]] = []
-        for item in tqdm(hard_ds):
-            hard_chunks.extend(
-                tokenize_and_chunk(item[hard_col], tokenizer, cfg.block + 1)
-            )
-
-        print(f"Raw chunks - Easy: {len(easy_chunks)}, Hard: {len(hard_chunks)}")
-
-        target_easy_ratio = getattr(cfg, "easy_proportion", 0.7)
-        if len(easy_chunks) > 0 and len(hard_chunks) > 0:
-            total_chunks = len(easy_chunks) + len(hard_chunks)
-            current_easy_ratio = len(easy_chunks) / total_chunks
-            print(
-                f"WARNING: Current ratio - Easy: {current_easy_ratio:.2f}, "
-                f"Hard: {1 - current_easy_ratio:.2f}"
-            )
-
-            target_total = min(cfg.max_chunks, total_chunks)
-            target_easy = int(target_total * target_easy_ratio)
-            target_hard = target_total - target_easy
-
-            if len(easy_chunks) >= target_easy:
-                easy_sampled = random.sample(easy_chunks, target_easy)
-            else:
-                easy_sampled = random.choices(easy_chunks, k=target_easy)
-
-            if len(hard_chunks) >= target_hard:
-                hard_sampled = random.sample(hard_chunks, target_hard)
-            else:
-                hard_sampled = random.choices(hard_chunks, k=target_hard)
-
-            print(
-                f"OK Rebalanced to {len(easy_sampled)} easy, "
-                f"{len(hard_sampled)} hard"
-            )
-            print(
-                "OK New ratio - Easy: "
-                f"{len(easy_sampled)/(len(easy_sampled)+len(hard_sampled)):.2f}"
-            )
-        else:
-            easy_sampled = easy_chunks
-            hard_sampled = hard_chunks
-
-        easy_labeled = [(chunk, 0) for chunk in easy_sampled]
-        hard_labeled = [(chunk, 1) for chunk in hard_sampled]
-
-        all_chunks: List[Tuple[List[int], int]] = easy_labeled + hard_labeled
-        random.shuffle(all_chunks)
-
-        print(f"OK Final dataset: {len(all_chunks)} chunks")
-        return all_chunks
-
-    else:
-        # Validation always uses WikiText-2, not the configured training datasets.
-        # This keeps the eval signal identical across all experiment variants.
-        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="validation")
-        text = tokenizer.eos_token.join(ds["text"])
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        L = (len(ids) // (cfg.block + 1)) * (cfg.block + 1)
-        ids = ids[:L]
-        chunks = [
-            ids[i : i + cfg.block + 1] for i in range(0, L, cfg.block + 1)
-        ]
-        return [(chunk, -1) for chunk in chunks]
-
 
 def load_dataset_with_embeddings(
     dataset_name: str,
@@ -219,9 +100,11 @@ def load_dataset_with_embeddings(
     to each token chunk produced from that document.
 
     Returns (texts, embeddings) where embeddings[i] is a 1-D float32 tensor
-    aligned with texts[i].
+    aligned with texts[i]. n_samples=-1 means no cap (stream the whole split).
     """
-    ds = load_dataset(dataset_name, split="train", streaming=True).take(n_samples)
+    ds = load_dataset(dataset_name, split="train", streaming=True)
+    if n_samples != -1:
+        ds = ds.take(n_samples)
     texts = []
     embeddings = []
     for row in ds:
@@ -234,82 +117,185 @@ def load_dataset_with_embeddings(
         embeddings.append(emb)
     return texts, embeddings
 
+def load_hf_datasets(cfg: ExperimentConfig, split = "train") -> list: # A list of (domain_name, texts, embeddings_or_None)
+    if cfg.use_external_embeddings:
+        # Backward-compat with the old make_single_chunks() external-embeddings
+        # path: embeddings datasets like epfml/FineWeb-HQ only expose a 'train'
+        # split, so there's no real "validation" split to request from HF.
+        # Instead -- exactly like make_single_chunks() used to -- we stream the
+        # whole (capped) dataset and carve off cfg.single_dataset_val_split of
+        # it for validation. Since load_hf_datasets() has no state shared
+        # between the separate "train" and "validation" calls make_chunks()
+        # makes, the full stream is re-fetched on each call; a fixed (not
+        # shuffled) split point keeps the two calls' outputs disjoint.
+        assert len(cfg.dataset_list) <= 1, (
+            "use_external_embeddings only supports a single dataset "
+            "(cfg.external_embeddings_dataset), not cfg.dataset_list"
+        )
+        n_samples = cfg.max_chunks
+        texts, embeddings = load_dataset_with_embeddings(cfg.external_embeddings_dataset, n_samples)
+        n_val = int(len(texts) * cfg.single_dataset_val_split)
+        if split == "train":
+            texts, embeddings = texts[n_val:], embeddings[n_val:]
+        else:
+            texts, embeddings = texts[:n_val], embeddings[:n_val]
 
-def make_single_chunks(
-    cfg: Config,
+        print(f"OK Loaded {len(texts)} documents ({split}) from {cfg.external_embeddings_dataset}")
+        return [(cfg.external_embeddings_dataset, texts, embeddings)]
+
+    buckets: dict[str, list[str]] = {}
+    total = 0
+
+    if cfg.split_dataset:
+        assert (len(cfg.dataset_list) == 1), "If you want to split a dataset, make sure it is just one"
+        assert cfg.split_column, "cfg.split_column must be set when cfg.split_dataset=True"
+        name = cfg.dataset_list[0]
+
+        text_col = DATASET_REGISTRY.get(name).get("text_col")
+        ds = load_dataset(name, split = split,  streaming = True) # Make sure you load the correct split
+
+        print("\n" + "=" * 70)
+        print(f"Loading {name}, splitting by column '{cfg.split_column}'")
+        print(f"(auto-discovering domains, up to {cfg.max_chunks} rows total)")
+        print("=" * 70)
+
+        for row in tqdm(ds, total=cfg.max_chunks):
+            if cfg.max_chunks != -1 and total >= cfg.max_chunks:
+                break
+            domain = row[cfg.split_column]
+            buckets.setdefault(domain, []).append(row[text_col])
+            total += 1
+
+        return [(name, texts, None) for name, texts in buckets.items()]
+    else:
+        for name in cfg.dataset_list:
+            text_col = DATASET_REGISTRY.get(name).get("text_col")
+            ds = load_dataset(name, split = split,  streaming = True) # Make sure you load the correct split
+            for row in tqdm(ds, total=cfg.max_chunks):
+                if cfg.max_chunks != -1 and total >= cfg.max_chunks:
+                    break
+                buckets.setdefault(name, []).append(row[text_col])
+                total += 1
+
+    print(
+        f"OK Found {len(buckets)} different datasets: "
+        + ", ".join(f"{name} ({len(texts)})" for name, texts in buckets.items())
+    )
+
+    return [(name, texts, None) for name, texts in buckets.items()]
+
+
+def chunk_datasets(
+    datasets: list,
+    cfg: ExperimentConfig,
     tokenizer: GPT2TokenizerFast,
-) -> Tuple[
-    List[Tuple[List[int], int]],
-    List[Tuple[List[int], int]],
-    Optional[List[torch.Tensor]],
-    Optional[List[torch.Tensor]],
-]:
+) -> Tuple[List[Tuple[List[int], int]], Optional[List[torch.Tensor]]]:
+    """Tokenize/chunk each (domain_name, texts, embeddings) triple from
+    load_hf_datasets() and label every resulting chunk with its domain's
+    index (0..N-1, in the order domains appear in `datasets`) -- the same
+    (chunk, label) shape make_mixed_chunks() used to produce, so the result
+    is ready to hand straight to MixedLMDataset(chunks, embeddings=embs).
+
+    When cfg.split_dataset is False, each domain's chunk count is rebalanced
+    to match cfg.dataset_proportions (oversampling/undersampling exactly like
+    the old easy/hard rebalancing), capped at cfg.max_chunks total chunks
+    (cfg.max_chunks=-1 means no cap). When cfg.split_dataset is True, no
+    rebalancing happens -- domains already keep their natural proportions
+    from load_hf_datasets() (see its docstring), since dataset_proportions
+    doesn't apply to an auto-discovered domain list.
+
+    When a domain carries per-text embeddings (cfg.use_external_embeddings),
+    each chunk produced from a text inherits that text's embedding -- a
+    document that splits into multiple chunks replicates its embedding
+    across all of them, exactly like make_single_chunks() used to. Returns
+    (chunks, embeddings) where embeddings is None unless at least one domain
+    had embeddings attached.
     """
-    Load a single dataset (no easy/hard split), tokenize, and split into
-    train/val. All training difficulty labels are 0 (unlabeled).
-
-    When cfg.use_external_embeddings is True, loads text + embeddings from
-    cfg.external_embeddings_dataset (a HuggingFace dataset with 'text' and
-    'embedding' columns). Document embeddings are replicated to all chunks
-    produced from that document.
-
-    Returns (train_chunks, val_chunks, train_embeddings, val_embeddings).
-    Embedding lists are None when use_external_embeddings is False.
-    """
-    use_ext = getattr(cfg, "use_external_embeddings", False)
-    n_samples = getattr(cfg, "single_dataset_samples", 120_000)
-    val_split = getattr(cfg, "single_dataset_val_split", 0.05)
-
-    print("\n" + "=" * 70)
-
-    if use_ext:
-        ext_dataset = getattr(cfg, "external_embeddings_dataset", "")
-        if not ext_dataset:
-            raise ValueError("cfg.external_embeddings_dataset must be set when use_external_embeddings=True")
-        print(f"Loading Single Dataset with External Embeddings: {ext_dataset}")
-        print("=" * 70)
-        texts, doc_embeddings = load_dataset_with_embeddings(ext_dataset, n_samples)
-        print(f"OK Loaded {len(texts)} documents")
-
-        print("\nTokenizing and chunking...")
-        all_chunks: List[List[int]] = []
-        all_embeddings: List[torch.Tensor] = []
-        for text, emb in tqdm(zip(texts, doc_embeddings), total=len(texts)):
+    print("\nTokenizing and chunking...")
+    per_domain_chunks: List[List[List[int]]] = []
+    per_domain_embs: List[Optional[List[torch.Tensor]]] = []
+    for name, texts, embeddings in datasets:
+        chunks: List[List[int]] = []
+        embs: Optional[List[torch.Tensor]] = [] if embeddings is not None else None
+        text_embs = zip(texts, embeddings) if embeddings is not None else zip(texts, [None] * len(texts))
+        for text, emb in tqdm(text_embs, total=len(texts), desc=name):
             doc_chunks = tokenize_and_chunk(text, tokenizer, cfg.block + 1)
-            for chunk in doc_chunks:
-                all_chunks.append(chunk)
-                all_embeddings.append(emb)
+            chunks.extend(doc_chunks)
+            if embs is not None:
+                embs.extend([emb] * len(doc_chunks))
+        per_domain_chunks.append(chunks)
+        per_domain_embs.append(embs)
+
+    print(
+        "Raw chunks - "
+        + ", ".join(f"{name}: {len(c)}" for (name, _, _), c in zip(datasets, per_domain_chunks))
+    )
+
+    if not cfg.split_dataset and cfg.dataset_proportions:
+        if len(cfg.dataset_proportions) != len(datasets):
+            raise ValueError(
+                f"cfg.dataset_proportions has {len(cfg.dataset_proportions)} entries "
+                f"but {len(datasets)} datasets were loaded from cfg.dataset_list; "
+                "they must be the same length and in the same order."
+            )
+        total_chunks = sum(len(c) for c in per_domain_chunks)
+        target_total = total_chunks if cfg.max_chunks == -1 else min(cfg.max_chunks, total_chunks)
+
+        sampled_chunks = []
+        sampled_embs = []
+        for (name, _, _), chunks, embs, proportion in zip(
+            datasets, per_domain_chunks, per_domain_embs, cfg.dataset_proportions
+        ):
+            target_n = int(target_total * float(proportion))
+            # Sample by index (not by value) so a domain's embeddings, if any,
+            # can be subsampled in lockstep with its chunks.
+            if len(chunks) >= target_n:
+                idx = random.sample(range(len(chunks)), target_n)
+            else:
+                idx = random.choices(range(len(chunks)), k=target_n)
+            sampled_chunks.append([chunks[i] for i in idx])
+            sampled_embs.append([embs[i] for i in idx] if embs is not None else None)
+            print(f"OK Rebalanced {name} to {target_n} chunks (target {target_n})")
     else:
-        single_name = getattr(cfg, "single_dataset", "HuggingFaceFW/fineweb")
-        print(f"Loading Single Dataset: {single_name}")
-        print("=" * 70)
-        ds, text_col = load_dataset_by_name(single_name, n_samples)
-        print(f"OK Streaming up to {n_samples} samples")
+        sampled_chunks = per_domain_chunks
+        sampled_embs = per_domain_embs
 
-        print("\nTokenizing and chunking...")
-        all_chunks = []
-        for item in tqdm(ds):
-            all_chunks.extend(tokenize_and_chunk(item[text_col], tokenizer, cfg.block + 1))
+    has_embeddings = any(embs is not None for embs in sampled_embs)
 
-    combined = list(zip(all_chunks, all_embeddings)) if use_ext else [(c, None) for c in all_chunks]
-    random.shuffle(combined)
+    all_chunks: List[Tuple[List[int], int]] = []
+    all_embs: Optional[List[torch.Tensor]] = [] if has_embeddings else None
+    for domain_id, chunks in enumerate(sampled_chunks):
+        embs = sampled_embs[domain_id]
+        for i, chunk in enumerate(chunks):
+            all_chunks.append((chunk, domain_id))
+            if has_embeddings:
+                # Domains without embeddings (mixed with an embedded domain)
+                # contribute None placeholders so all_chunks/all_embs stay
+                # aligned 1:1.
+                all_embs.append(embs[i] if embs is not None else None)
 
-    n_val = int(len(combined) * val_split)
-    val_pairs   = combined[:n_val]
-    train_pairs = combined[n_val:]
-
-    val_chunks   = [(c, -1) for c, _ in val_pairs]
-    train_chunks = [(c,  0) for c, _ in train_pairs]
-
-    if use_ext:
-        val_embs   = [e for _, e in val_pairs]
-        train_embs = [e for _, e in train_pairs]
+    if has_embeddings:
+        combined = list(zip(all_chunks, all_embs))
+        random.shuffle(combined)
+        all_chunks = [c for c, _ in combined]
+        all_embs = [e for _, e in combined]
     else:
-        val_embs = train_embs = None
+        random.shuffle(all_chunks)
 
-    print(f"OK Train: {len(train_chunks)} chunks, Val: {len(val_chunks)} chunks")
-    return train_chunks, val_chunks, train_embs, val_embs
+    print(f"OK Final dataset: {len(all_chunks)} chunks across {len(datasets)} domains")
+    return all_chunks, all_embs
 
+
+def make_chunks(cfg: ExperimentConfig,
+    tokenizer: GPT2TokenizerFast):
+
+    train_datasets = load_hf_datasets(cfg, "train")
+    validation_datasets = load_hf_datasets(cfg, "validation")
+
+    train_chunks, train_embs = chunk_datasets(train_datasets, cfg, tokenizer)
+    validation_chunks, val_embs = chunk_datasets(validation_datasets, cfg, tokenizer)
+
+    return train_chunks, validation_chunks, train_embs, val_embs
 
 class MixedLMDataset(Dataset):
     def __init__(

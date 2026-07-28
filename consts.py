@@ -116,6 +116,7 @@ LOSS_IMPROVEMENT_LOGGING: Dict[str, tuple[Any, List[Any]]] = {
 COMPARE_USE_ORIGINAL_SEQUENCE: Dict[str, tuple[Any, List[Any]]] = {
     "use_original_sequence": (False, [True])
 }
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
