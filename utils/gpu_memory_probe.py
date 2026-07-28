@@ -67,7 +67,7 @@ def main() -> None:
     )
 
     metrics = MetricsTracker(f"probe_{probe_cfg.experiment_name}", use_wandb=False)
-    diversity = DiversityTracker(len(train_ds))
+    diversity = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
 
     torch.cuda.reset_peak_memory_stats()
     train_router_experiments(

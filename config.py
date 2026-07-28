@@ -157,6 +157,10 @@ class ExperimentConfig(Config):
         if self.save_dir is None:
             self.save_dir = f"results/{self.experiment_name}"
 
+        if self.reward_signal in ("difficulty_weighted", "combined") and len(self.dataset_list) != 2:
+            raise ValueError("In order to use difficulty scoring, you need to use 2 datasets, the first one "
+                             "being the easy one and the second one the hard one.")
+        
         if self.reward_signal == "greats_score":
             # GREATS-style ghost gradient-dot-product scoring (GhostSuite/ghostEngines,
             # via GhostEngineManager). Only supported for GPT-2-family HF checkpoints:

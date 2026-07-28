@@ -47,7 +47,7 @@ from config import ExperimentConfig
 from data import make_index_loader, MixedLMDataset
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from utils.metrics import MetricsTracker, DiversityTracker
-from training import evaluate  # keep using your existing evaluate()
+from training import evaluate, evaluate_per_domain  # keep using your existing evaluate()
 from models.router import extract_router_features
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 from utils.rl_utils import grpo_update, ppo_update, reinforce_update
@@ -827,18 +827,10 @@ def train_router_experiments(
                 )
 
             batch = [train_ds[i] for i in pool_indices]
-            xs, ys, diffs = zip(*batch)
+            xs, ys, domains = zip(*batch)
 
-            diffs_hard_ratio = sum(diffs) / len(diffs)  # fraction of the M-sized pool that's hard, pre-selection
             X = torch.stack(xs).to(cfg.device)  # [M, L]
             Y = torch.stack(ys).to(cfg.device)  # [M, L]
-            diffs_t = torch.tensor(diffs, device=cfg.device)  # [M]
-
-            # Full-pool loss-before/after is only computed on log steps: it
-            # needs two extra whole-pool forward passes (no backward) beyond
-            # the selected-batch ones already done below, so it's gated to
-            # avoid paying that cost on every step.
-            is_log_step = (global_step + 1) % cfg.log_every == 0 and cfg.rank == 0
 
             # --- Router features over the full pool ---
             feat_start = time.perf_counter()
@@ -888,7 +880,7 @@ def train_router_experiments(
 
             X_sel = X[sel_idx]  # [B, L]
             Y_sel = Y[sel_idx]  # [B, L]
-            selected_diffs = [diffs[i] for i in sel_idx.tolist()]
+            selected_domains = [domains[i] for i in sel_idx.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx.tolist()]
 
             # --- GREATS ghost-gradient scoring (before the real LM update: a separate
@@ -924,13 +916,6 @@ def train_router_experiments(
                 loss_before = compute_loss_per_sample_vectorized(logits, Y_sel)
                 entropy_before = compute_entropy_per_sample(logits) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
 
-                # Whole-pool loss BEFORE update (diagnostic only): what this
-                # step's LM update does to every pool sample, not just the
-                # selected ones, split by difficulty below.
-                pool_loss_before = None
-                if is_log_step:
-                    pool_loss_before = compute_loss_per_sample_vectorized(model(X), Y)
-
             # scalar loss for LM update
             B, L, V = logits.shape
             loss_lm = F.cross_entropy(
@@ -961,13 +946,11 @@ def train_router_experiments(
                 logits_after = model(X_sel)
                 loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
                 entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
-
-                pool_loss_after = None
-                if is_log_step:
-                    pool_loss_after = compute_loss_per_sample_vectorized(model(X), Y)
-
+    
             # Get difficulty scores for selected samples
-            difficulty_tensor = torch.tensor(selected_diffs, device=cfg.device, dtype=torch.float32) if cfg.reward_signal in ("difficulty_weighted", "combined") else None
+            # Conditions for selected_domains to act as difficulty markers 
+            # are checked in config.py in post_init
+            difficulty_tensor = torch.tensor(selected_domains, device=cfg.device, dtype=torch.float32) if cfg.reward_signal in ("difficulty_weighted", "combined") else None
 
             # --- Compute reward ---
             reward = compute_reward(
@@ -1066,7 +1049,7 @@ def train_router_experiments(
             if coverage_tracker is not None:
                 coverage_tracker.update(selected_indices, loss_after)
 
-            diversity.update(selected_indices, selected_diffs)
+            diversity.update(selected_indices, selected_domains)
 
             # --- Logging ---
             global_step += 1
@@ -1093,24 +1076,6 @@ def train_router_experiments(
                 if coverage_tracker is not None:
                     log_data.update(coverage_tracker.get_coverage_stats())
 
-                # Pool-wide diagnostics, split easy vs hard: score/prob are
-                # already computed for the full pool every step (free); the
-                # loss-improvement stats need the extra pool_loss_before/after
-                # forwards gated by is_log_step above.
-                # log_data.update(pool_difficulty_stats(scores.detach(), diffs_t, "pool_score"))
-                log_data.update(pool_difficulty_stats(probs.detach(), diffs_t, "pool_prob"))
-
-                # Composition of the M-sized candidate pool itself (before any
-                # selection), so a low hard selection rate can be told apart
-                # from hard samples simply being rare in the sampled pool.
-                log_data["pool_hard_ratio"] = diffs_hard_ratio
-                log_data["pool_easy_ratio"] = 1.0 - diffs_hard_ratio
-                if pool_loss_before is not None and pool_loss_after is not None:
-                    pool_improvement = (pool_loss_before - pool_loss_after).clamp(min=0.0)
-                    #log_data.update(pool_difficulty_stats(pool_loss_before, diffs_t, "pool_loss_before"))
-                    #log_data.update(pool_difficulty_stats(pool_loss_after, diffs_t, "pool_loss_after"))
-                    log_data.update(pool_difficulty_stats(pool_improvement, diffs_t, "pool_improvement"))
-
                 metrics.log(**log_data)
 
                 print(
@@ -1118,22 +1083,7 @@ def train_router_experiments(
                     f"loss_lm={loss_lm.item():.4f} | "
                     f"loss_router={loss_router.item():.4f} | "
                     f"temp={current_temp:.3f} | "
-                    f"pool_hard_ratio={log_data['pool_hard_ratio']:.3f}"
                 )
-                if "pool_score_hard_mean" in log_data:
-                    print(
-                        f"  pool score  easy=[{log_data.get('pool_score_easy_min', float('nan')):.3f}, "
-                        f"{log_data.get('pool_score_easy_max', float('nan')):.3f}]  "
-                        f"hard=[{log_data.get('pool_score_hard_min', float('nan')):.3f}, "
-                        f"{log_data.get('pool_score_hard_max', float('nan')):.3f}]"
-                    )
-                if "pool_improvement_hard_mean" in log_data:
-                    print(
-                        f"  pool improvement  easy=[{log_data.get('pool_improvement_easy_min', float('nan')):.4f}, "
-                        f"{log_data.get('pool_improvement_easy_max', float('nan')):.4f}]  "
-                        f"hard=[{log_data.get('pool_improvement_hard_min', float('nan')):.4f}, "
-                        f"{log_data.get('pool_improvement_hard_max', float('nan')):.4f}]"
-                    )
 
         # --- Validation ---
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
@@ -1159,6 +1109,19 @@ def train_router_experiments(
             )
         if cfg.world_size > 1:
             dist.barrier()
+
+    # --- Final per-domain perplexity, fully trained model ---
+    if cfg.rank == 0:
+        loss_fn = nn.CrossEntropyLoss()
+        per_domain_ppl = evaluate_per_domain(model, val_ds, loss_fn, cfg)
+        metrics.log(
+            step=global_step,
+            **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+        )
+        print(
+            "[Final per-domain val perplexity] "
+            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+        )
 
     if cfg.use_wandb and cfg.rank == 0:
         import wandb

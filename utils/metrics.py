@@ -81,13 +81,22 @@ class MetricsTracker:
 
 
 class DiversityTracker:
-    def __init__(self, dataset_size: int, window: int = 100):
+    def __init__(self, dataset_size: int, domain_names: Optional[List[str]] = None, window: int = 100):
         self.dataset_size = dataset_size
         self.window = window
+        # domain_id -> name (e.g. train_ds.domain_names), used to label
+        # domain_ratio/{name} metrics with real names instead of bare ids.
+        # None falls back to the id itself (str(domain_id)).
+        self.domain_names = domain_names
 
         self.selection_counts = torch.zeros(dataset_size, dtype=torch.long)
         self.step_selections: List[List[int]] = []
         self.domain_counts = {}
+
+    def _domain_label(self, domain_id: int) -> str:
+        if self.domain_names is not None and 0 <= domain_id < len(self.domain_names):
+            return self.domain_names[domain_id]
+        return str(domain_id)
 
     def update(self, indices: List[int], domains) -> None:
         if not indices:
@@ -113,8 +122,11 @@ class DiversityTracker:
           coverage      — fraction of dataset samples selected at least once [0,1]
           balance_std   — std of selection counts (lower = more uniform coverage)
           unique_ratio  — fraction of unique samples in the last `window` steps [0,1]
-          domain_ratio/{id} — fraction of selected samples from domain `id` [0,1],
-                              one key per distinct domain id observed so far
+          domain_ratio/{name} — fraction of selected samples from that domain
+                              [0,1], one key per distinct domain observed so
+                              far. Sharing the "domain_ratio/" prefix across
+                              domains groups them into one section/panel in
+                              the W&B UI automatically.
         """
         counts = self.selection_counts
         selected_mask = counts > 0
@@ -134,7 +146,7 @@ class DiversityTracker:
 
         total_sel = sum(self.domain_counts.values())
         domain_ratios = {
-            f"domain_ratio/{domain_id}": (count / total_sel if total_sel > 0 else 0.0)
+            f"domain_ratio/{self._domain_label(domain_id)}": (count / total_sel if total_sel > 0 else 0.0)
             for domain_id, count in sorted(self.domain_counts.items())
         }
 

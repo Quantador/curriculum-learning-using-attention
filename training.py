@@ -22,9 +22,10 @@ from __future__ import annotations
 import math
 import os
 import random
+from collections import defaultdict
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -111,6 +112,57 @@ def evaluate(
     model.train()
     avg_loss = total_loss / max(total_tok, 1)
     return avg_loss, math.exp(avg_loss)
+
+
+def evaluate_per_domain(
+    model: TinyGPT,
+    ds: MixedLMDataset,
+    loss_fn: nn.Module,
+    cfg: Config,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Like evaluate(), but broken out per domain: one (avg_loss, perplexity)
+    pair per distinct domain in ds, computed in a single pass over ds.
+
+    Meant for a one-off "final perplexity per domain" report on the fully
+    trained model (e.g. at the end of training), not per-epoch logging --
+    call evaluate() for the cheap aggregate val_loss/val_ppl tracked every
+    epoch instead.
+
+    Keyed by domain name (ds.domain_names[domain_id]) when ds carries one,
+    falling back to str(domain_id) otherwise -- matches DiversityTracker's
+    domain_ratio/{name} convention so the two line up in W&B.
+    """
+    model.eval()
+    domain_loss: Dict[int, float] = defaultdict(float)
+    domain_tok: Dict[int, int] = defaultdict(int)
+    with torch.no_grad():
+        for i in range(len(ds)):
+            x, y, domain = ds[i]
+            x = x.unsqueeze(0).to(cfg.device)
+            y = y.unsqueeze(0).to(cfg.device)
+            logits = model(x)
+            loss = loss_fn(
+                logits.view(-1, logits.size(-1)),
+                y.view(-1),
+            )
+            n_tok = y.numel()
+            domain_loss[domain] += loss.item() * n_tok
+            domain_tok[domain] += n_tok
+    model.train()
+
+    domain_names = getattr(ds, "domain_names", None)
+
+    def label(domain_id: int) -> str:
+        if domain_names is not None and 0 <= domain_id < len(domain_names):
+            return domain_names[domain_id]
+        return str(domain_id)
+
+    results = {}
+    for domain_id, loss_sum in domain_loss.items():
+        avg_loss = loss_sum / max(1, domain_tok[domain_id])
+        results[label(domain_id)] = (avg_loss, math.exp(avg_loss))
+    return results
 
 
 def train_baseline(

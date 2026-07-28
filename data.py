@@ -295,13 +295,22 @@ def make_chunks(cfg: ExperimentConfig,
     train_chunks, train_embs = chunk_datasets(train_datasets, cfg, tokenizer)
     validation_chunks, val_embs = chunk_datasets(validation_datasets, cfg, tokenizer)
 
-    return train_chunks, validation_chunks, train_embs, val_embs
+    # domain_id -> name, in the same order chunk_datasets() assigned ids --
+    # used to label per-domain metrics/plots with real names instead of bare
+    # ids. Tracked separately for train/val: in cfg.split_dataset mode,
+    # domains are auto-discovered per stream, so the validation split isn't
+    # guaranteed to discover the same domains in the same order as train.
+    train_domain_names = [name for name, _, _ in train_datasets]
+    val_domain_names = [name for name, _, _ in validation_datasets]
+
+    return train_chunks, validation_chunks, train_embs, val_embs, train_domain_names, val_domain_names
 
 class MixedLMDataset(Dataset):
     def __init__(
         self,
         labeled_chunks: List[Tuple[List[int], int]],
         embeddings: Optional[List[torch.Tensor]] = None,
+        domain_names: Optional[List[str]] = None,
     ):
         self.x = [
             torch.tensor(c[:-1], dtype=torch.long) for c, _ in labeled_chunks
@@ -309,14 +318,18 @@ class MixedLMDataset(Dataset):
         self.y = [
             torch.tensor(c[1:], dtype=torch.long) for c, _ in labeled_chunks
         ]
-        self.domains = [d for _, d in labeled_chunks] 
+        self.domains = [d for _, d in labeled_chunks]
         self.embeddings = embeddings
+        # domain_id -> name (e.g. domain_names[0] == "wikipedia"), for
+        # labeling per-domain metrics with real names. None when unknown to
+        # the caller (e.g. validation sets, or older cached datasets).
+        self.domain_names = domain_names
 
     def __len__(self) -> int:
         return len(self.x)
 
     def __getitem__(self, i: int):
-        return self.x[i], self.y[i], self.domains[i] # In certain cases the difficulty can match the domain 
+        return self.x[i], self.y[i], self.domains[i] # In certain cases the difficulty can match the domain
 
 
 def make_index_loader(ds_len: int, pool_size: int):

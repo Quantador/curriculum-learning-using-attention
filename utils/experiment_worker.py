@@ -61,7 +61,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     )
 
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
-    router_div = DiversityTracker(len(train_ds))
+    router_div = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
 
     model_router, router = train_router_experiments(
         cfg=cfg,
