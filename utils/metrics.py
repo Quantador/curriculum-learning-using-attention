@@ -10,9 +10,11 @@ MetricsTracker:
 
 DiversityTracker:
   Records which samples (by dataset index) were selected at each step.
-  Computes coverage (fraction of dataset ever seen), easy/hard selection
-  ratio (curriculum direction), unique_ratio (short-window diversity), and
-  balance_std (selection uniformity across the dataset).
+  Computes coverage (fraction of dataset ever seen), per-domain selection
+  ratio (curriculum direction across however many domains are configured,
+  one domain_ratio/{id} key per domain id observed), unique_ratio
+  (short-window diversity), and balance_std (selection uniformity across
+  the dataset).
   Logged every cfg.log_every steps via MetricsTracker.log().
 """
 from __future__ import annotations
@@ -85,9 +87,9 @@ class DiversityTracker:
 
         self.selection_counts = torch.zeros(dataset_size, dtype=torch.long)
         self.step_selections: List[List[int]] = []
-        self.difficulty_counts = {0: 0, 1: 0}
+        self.domain_counts = {}
 
-    def update(self, indices: List[int], difficulties) -> None:
+    def update(self, indices: List[int], domains) -> None:
         if not indices:
             return
 
@@ -98,9 +100,10 @@ class DiversityTracker:
         if len(self.step_selections) > self.window:
             self.step_selections.pop(0)
 
-        for d in difficulties:
-            if d in self.difficulty_counts:
-                self.difficulty_counts[d] += 1
+        for d in domains:
+            if d not in self.domain_counts:
+                self.domain_counts[d] = 0
+            self.domain_counts[d] += 1
 
     def get_metrics(self) -> Dict[str, float]:
         """
@@ -110,8 +113,8 @@ class DiversityTracker:
           coverage      — fraction of dataset samples selected at least once [0,1]
           balance_std   — std of selection counts (lower = more uniform coverage)
           unique_ratio  — fraction of unique samples in the last `window` steps [0,1]
-          easy_ratio    — fraction of selected samples with difficulty=0 [0,1]
-          hard_ratio    — fraction of selected samples with difficulty=1 [0,1]
+          domain_ratio/{id} — fraction of selected samples from domain `id` [0,1],
+                              one key per distinct domain id observed so far
         """
         counts = self.selection_counts
         selected_mask = counts > 0
@@ -129,21 +132,16 @@ class DiversityTracker:
         unique_recent = len(set(recent)) if total_recent > 0 else 0
         unique_ratio = unique_recent / max(1, total_recent)
 
-        total_easy = self.difficulty_counts.get(0, 0)
-        total_hard = self.difficulty_counts.get(1, 0)
-        total_sel = total_easy + total_hard
-        if total_sel > 0:
-            easy_ratio = total_easy / total_sel
-            hard_ratio = total_hard / total_sel
-        else:
-            easy_ratio = 0.0
-            hard_ratio = 0.0
+        total_sel = sum(self.domain_counts.values())
+        domain_ratios = {
+            f"domain_ratio/{domain_id}": (count / total_sel if total_sel > 0 else 0.0)
+            for domain_id, count in sorted(self.domain_counts.items())
+        }
 
         return {
             "coverage": coverage,
             "balance_std": balance_std,
             "unique_ratio": unique_ratio,
-            "easy_ratio": easy_ratio,
-            "hard_ratio": hard_ratio,
+            **domain_ratios,
         }
         

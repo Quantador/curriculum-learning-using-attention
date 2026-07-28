@@ -48,15 +48,15 @@ from config import Config, ExperimentConfig
 # Unstructured (single-dataset): HuggingFaceFW/fineweb
 DATASET_REGISTRY: dict[str, dict] = {
     "roneneldan/TinyStories":                   {"split": "train", "text_col": "text"},
-    "ajibawa-2023/Children-Stories-Collection":  {"split": "train", "text_col": "text"},
+    "ajibawa-2023/Children-Stories-Collection": {"split": "train", "text_col": "text"},
     "Salesforce/wikitext":                      {"split": "train", "name": "wikitext-103-raw-v1", "text_col": "text"},
-    "Geralt-Targaryen/openwebtext2":             {"split": "train", "text_col": "text"},
+    "Geralt-Targaryen/openwebtext2":            {"split": "train", "text_col": "text"},
     "armanc/scientific_papers":                 {"split": "train", "text_col": "abstract"},
     "CShorten/ML-ArXiv-Papers":                 {"split": "train", "text_col": "abstract"},
     "HuggingFaceFW/fineweb-edu":                {"split": "train", "text_col": "text"},
     "HuggingFaceFW/fineweb":                    {"split": "train", "name": "sample-10BT", "text_col": "text"},
     "allenai/c4":                               {"split": "train", "name": "en", "text_col": "text"},
-    "DKYoon/SlimPajama-6B": {"split": "train", "text_col": "text"}
+    "DKYoon/SlimPajama-6B":                     {"split": "train", "text_col": "text"}
 }
 
 def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
@@ -309,18 +309,14 @@ class MixedLMDataset(Dataset):
         self.y = [
             torch.tensor(c[1:], dtype=torch.long) for c, _ in labeled_chunks
         ]
-        self.difficulty = [d for _, d in labeled_chunks]
-        # Labels: 0 = easy, 1 = hard, -1 = validation set (no curriculum label).
-        # Pre-computed external embeddings aligned with each chunk (or None).
-        # Access via dataset.embeddings[i] rather than __getitem__ so that
-        # existing training loops unpacking (x, y, diff) don't break.
+        self.domains = [d for _, d in labeled_chunks] 
         self.embeddings = embeddings
 
     def __len__(self) -> int:
         return len(self.x)
 
     def __getitem__(self, i: int):
-        return self.x[i], self.y[i], self.difficulty[i]
+        return self.x[i], self.y[i], self.domains[i] # In certain cases the difficulty can match the domain 
 
 
 def make_index_loader(ds_len: int, pool_size: int):
