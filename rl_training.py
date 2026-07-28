@@ -1108,7 +1108,7 @@ def train_router_experiments(
                 if pool_loss_before is not None and pool_loss_after is not None:
                     pool_improvement = (pool_loss_before - pool_loss_after).clamp(min=0.0)
                     #log_data.update(pool_difficulty_stats(pool_loss_before, diffs_t, "pool_loss_before"))
-                    #og_data.update(pool_difficulty_stats(pool_loss_after, diffs_t, "pool_loss_after"))
+                    #log_data.update(pool_difficulty_stats(pool_loss_after, diffs_t, "pool_loss_after"))
                     log_data.update(pool_difficulty_stats(pool_improvement, diffs_t, "pool_improvement"))
 
                 metrics.log(**log_data)

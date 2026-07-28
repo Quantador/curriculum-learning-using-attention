@@ -113,6 +113,9 @@ LOSS_IMPROVEMENT_LOGGING: Dict[str, tuple[Any, List[Any]]] = {
     "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["loss_improvement"])
 }
 
+COMPARE_USE_ORIGINAL_SEQUENCE: Dict[str, tuple[Any, List[Any]]] = {
+    "use_original_sequence": (False, [True])
+}
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -121,7 +124,9 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "additional-experiments": ADDITIONAL_EXPERIMENTS_FIELDS,  # alias
     "grpo_vs_greats": COMPARE_GRPO_VS_GREATS,
     "compare_reward_signals": COMPARE_REWARD_SIGNALS,
-    "loss_improvement_logging": LOSS_IMPROVEMENT_LOGGING
+    "loss_improvement_logging": LOSS_IMPROVEMENT_LOGGING,
+    "compare_use_original_sequence": COMPARE_USE_ORIGINAL_SEQUENCE,
+    "compare-use-original-sequence": COMPARE_USE_ORIGINAL_SEQUENCE,  # alias
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

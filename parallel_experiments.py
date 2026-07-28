@@ -328,7 +328,7 @@ def main() -> None:
     parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: --config's, or presentation_experiment)")
     parser.add_argument("--list", action="store_true", help="List experiments that would run, without running them")
     parser.add_argument("--max-parallel", type=int, default=None, help="Skip GPU probing; always run exactly N workers")
-    parser.add_argument("--safety-margin", type=float, default=0.85, help="Fraction of free GPU memory usable (default 0.85)")
+    parser.add_argument("--safety-margin", type=float, default=0.6, help="Fraction of free GPU memory usable (default 0.6)")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="Seconds between polls of running workers")
     parser.add_argument("--gpu", type=int, default=0, help="Physical GPU index to target (default 0)")
     args = parser.parse_args()
