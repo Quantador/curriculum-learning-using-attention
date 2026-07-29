@@ -1,6 +1,29 @@
 from typing import Any, Dict, List, Tuple
 from pathlib import Path 
 
+
+# Registry mapping HuggingFace dataset names to their split/text-column metadata.
+# Easier datasets produce simpler, shorter text; harder ones contain dense or
+# domain-specific language.
+#
+# Easy:   roneneldan/TinyStories, ajibawa-2023/Children-Stories-Collection,
+#         Salesforce/wikitext
+# Medium: Geralt-Targaryen/openwebtext2, HuggingFaceFW/fineweb-edu, allenai/c4
+# Hard:   armanc/scientific_papers, CShorten/ML-ArXiv-Papers
+# Unstructured (single-dataset): HuggingFaceFW/fineweb
+DATASET_REGISTRY: dict[str, dict] = {
+    "roneneldan/TinyStories":                   {"split": "train", "text_col": "text"},
+    "ajibawa-2023/Children-Stories-Collection": {"split": "train", "text_col": "text"},
+    "Salesforce/wikitext":                      {"split": "train", "name": "wikitext-103-raw-v1", "text_col": "text"},
+    "Geralt-Targaryen/openwebtext2":            {"split": "train", "text_col": "text"},
+    "armanc/scientific_papers":                 {"split": "train", "text_col": "abstract"},
+    "CShorten/ML-ArXiv-Papers":                 {"split": "train", "text_col": "abstract"},
+    "HuggingFaceFW/fineweb-edu":                {"split": "train", "text_col": "text"},
+    "HuggingFaceFW/fineweb":                    {"split": "train", "name": "sample-10BT", "text_col": "text"},
+    "allenai/c4":                               {"split": "train", "name": "en", "text_col": "text"},
+    "DKYoon/SlimPajama-6B":                     {"split": "train", "text_col": "text"}
+}
+
 # Maps each experimental dimension to (baseline_value, [alternative_values]).
 # The baseline_value is used in the control experiment (experiment_name="baseline").
 # Each alternative generates one experiment that changes only this single field.

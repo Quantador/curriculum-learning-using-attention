@@ -54,10 +54,18 @@ def _signature_hash(sig: dict) -> str:
 
 
 def get_or_build_dataset_cache(
-    cfg: ExperimentConfig, tokenizer, cache_root: Path = DATASET_CACHE_DIR
+    cfg: ExperimentConfig,
+    tokenizer,
+    cache_root: Path = DATASET_CACHE_DIR,
+    num_workers: int = 0,
 ) -> Path:
     """Return the chunks.pt path for cfg's dataset signature, building it
-    (and a signature.yaml sidecar for debugging) only on a cache miss."""
+    (and a signature.yaml sidecar for debugging) only on a cache miss.
+
+    num_workers controls tokenization parallelism on a cache miss (see
+    data.tokenize_documents); it only affects build speed, never the
+    resulting chunks, so it is deliberately excluded from dataset_signature().
+    """
     sig = dataset_signature(cfg)
     entry_dir = cache_root / _signature_hash(sig)
     chunks_path = entry_dir / "chunks.pt"
@@ -70,14 +78,18 @@ def get_or_build_dataset_cache(
     entry_dir.mkdir(parents=True, exist_ok=True)
     with (entry_dir / "signature.yaml").open("w") as f:
         yaml.safe_dump(sig, f)
-    build_dataset_cache(cfg, tokenizer, str(chunks_path))
+    build_dataset_cache(cfg, tokenizer, str(chunks_path), num_workers=num_workers)
     return chunks_path
 
 
-def build_dataset_cache(cfg: ExperimentConfig, tokenizer, cache_path: str) -> None:
+def build_dataset_cache(
+    cfg: ExperimentConfig, tokenizer, cache_path: str, num_workers: int = 0
+) -> None:
     """Tokenize the configured dataset(s) once and save chunks+embeddings to disk."""
 
-    train_chunks, val_chunks, train_embs, val_embs, train_domain_names, val_domain_names = make_chunks(cfg, tokenizer)
+    train_chunks, val_chunks, train_embs, val_embs, train_domain_names, val_domain_names = make_chunks(
+        cfg, tokenizer, num_workers=num_workers
+    )
 
     torch.save(
         {

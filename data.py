@@ -25,7 +25,9 @@ Key exports:
 """
 from __future__ import annotations
 
+import os
 import random
+import multiprocessing
 from typing import List, Optional, Tuple
 
 import torch
@@ -34,30 +36,12 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, GPT2TokenizerFast, PreTrainedTokenizerBase
 
 from tqdm import tqdm
-from config import Config, ExperimentConfig
+from config import ExperimentConfig
+from consts import DATASET_REGISTRY
 
-
-# Registry mapping HuggingFace dataset names to their split/text-column metadata.
-# Easier datasets produce simpler, shorter text; harder ones contain dense or
-# domain-specific language.
-#
-# Easy:   roneneldan/TinyStories, ajibawa-2023/Children-Stories-Collection,
-#         Salesforce/wikitext
-# Medium: Geralt-Targaryen/openwebtext2, HuggingFaceFW/fineweb-edu, allenai/c4
-# Hard:   armanc/scientific_papers, CShorten/ML-ArXiv-Papers
-# Unstructured (single-dataset): HuggingFaceFW/fineweb
-DATASET_REGISTRY: dict[str, dict] = {
-    "roneneldan/TinyStories":                   {"split": "train", "text_col": "text"},
-    "ajibawa-2023/Children-Stories-Collection": {"split": "train", "text_col": "text"},
-    "Salesforce/wikitext":                      {"split": "train", "name": "wikitext-103-raw-v1", "text_col": "text"},
-    "Geralt-Targaryen/openwebtext2":            {"split": "train", "text_col": "text"},
-    "armanc/scientific_papers":                 {"split": "train", "text_col": "abstract"},
-    "CShorten/ML-ArXiv-Papers":                 {"split": "train", "text_col": "abstract"},
-    "HuggingFaceFW/fineweb-edu":                {"split": "train", "text_col": "text"},
-    "HuggingFaceFW/fineweb":                    {"split": "train", "name": "sample-10BT", "text_col": "text"},
-    "allenai/c4":                               {"split": "train", "name": "en", "text_col": "text"},
-    "DKYoon/SlimPajama-6B":                     {"split": "train", "text_col": "text"}
-}
+# Below this many documents, multiprocessing (Pool spawn + IPC) costs more
+# than it saves; fall back to the single-process batched path.
+_MIN_DOCS_FOR_MULTIPROC = 200
 
 def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
     """
@@ -72,18 +56,89 @@ def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
         tok.pad_token = tok.eos_token
     return tok
 
-def tokenize_and_chunk(
-    text: str,
-    tokenizer: GPT2TokenizerFast,
-    max_length: int,
-) -> List[List[int]]:
-    tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+def _chunk_tokens(tokens: List[int], max_length: int) -> List[List[int]]:
     chunks: List[List[int]] = []
     for i in range(0, len(tokens), max_length):
         chunk = tokens[i : i + max_length]
         if len(chunk) == max_length:
             chunks.append(chunk)
     return chunks
+
+def tokenize_and_chunk(
+    text: str,
+    tokenizer: GPT2TokenizerFast,
+    max_length: int,
+) -> List[List[int]]:
+    tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+    return _chunk_tokens(tokens, max_length)
+
+# Worker-local tokenizer for the multiprocessing.Pool path below. Rebuilt
+# once per worker process (via the pool initializer) instead of pickling the
+# live tokenizer object across the fork.
+_worker_tokenizer: Optional[PreTrainedTokenizerBase] = None
+
+def _init_tokenizer_worker(model_name: str) -> None:
+    # Each worker is one OS process pinned to one core; letting the fast
+    # tokenizer's own Rust thread pool also spawn threads here would
+    # oversubscribe a cgroup-limited allocation (N processes x M threads on
+    # N cores), so force it single-threaded per worker.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    global _worker_tokenizer
+    _worker_tokenizer = get_tokenizer(model_name)
+
+def _tokenize_shard(texts: List[str]) -> List[List[int]]:
+    print(f"Starting tokenizing {len(texts)}")
+    return _worker_tokenizer(texts, add_special_tokens=False)["input_ids"]
+
+def tokenize_documents(
+    texts: List[str],
+    tokenizer: PreTrainedTokenizerBase,
+    num_workers: int = 0,
+    batch_size: int = 2000,
+) -> List[List[int]]:
+    """
+    Tokenize many documents at once, returning one input_ids list per text
+    (order preserved 1:1 with `texts`).
+
+    Batches calls to the fast (Rust) tokenizer -- which parallelizes
+    internally across cores when given a list of texts -- instead of the
+    one-document-at-a-time calls that dominate tokenize_and_chunk()'s cost
+    for large corpora. For large enough inputs, further splits work across
+    `num_workers` processes.
+
+    num_workers <= 0 resolves to os.cpu_count(). Below _MIN_DOCS_FOR_MULTIPROC
+    documents (e.g. small domains, validation splits), multiprocessing
+    overhead isn't worth it, so this always uses the single-process batched
+    path regardless of num_workers.
+    """
+    if num_workers <= 0:
+        num_workers = os.cpu_count() or 1
+
+    if num_workers <= 1 or len(texts) < _MIN_DOCS_FOR_MULTIPROC:
+        results: List[List[int]] = []
+        for i in tqdm(range(0, len(texts), batch_size), desc="tokenizing", leave=False):
+            batch = texts[i : i + batch_size]
+            results.extend(tokenizer(batch, add_special_tokens=False)["input_ids"])
+        return results
+
+    num_workers = min(num_workers, len(texts))
+    shard_size = -(-len(texts) // num_workers)  # ceil div
+    shards = [texts[i : i + shard_size] for i in range(0, len(texts), shard_size)]
+
+    print(f"Total number of texts needed to be tokenized is: {len(texts)}")
+    print(f"{os.cpu_count()=}, {num_workers=}")
+    
+    with multiprocessing.Pool(
+        processes=len(shards),
+        initializer=_init_tokenizer_worker,
+        initargs=(tokenizer.name_or_path,),
+    ) as pool:
+        shard_results = list(pool.map(_tokenize_shard, shards))
+
+    results = []
+    for shard_result in shard_results:
+        results.extend(shard_result)
+    return results
 
 def load_dataset_with_embeddings(
     dataset_name: str,
@@ -149,13 +204,15 @@ def load_hf_datasets(cfg: ExperimentConfig, split = "train") -> list: # A list o
     if cfg.split_dataset:
         assert (len(cfg.dataset_list) == 1), "If you want to split a dataset, make sure it is just one"
         assert cfg.split_column, "cfg.split_column must be set when cfg.split_dataset=True"
-        name = cfg.dataset_list[0]
+        path = cfg.dataset_list[0]
 
-        text_col = DATASET_REGISTRY.get(name).get("text_col")
-        ds = load_dataset(name, split = split,  streaming = True) # Make sure you load the correct split
+        text_col = DATASET_REGISTRY.get(path).get("text_col")
+        name = DATASET_REGISTRY.get(path).get("name")
+
+        ds = load_dataset(path, name = name, split = split,  streaming = True) # Make sure you load the correct split
 
         print("\n" + "=" * 70)
-        print(f"Loading {name}, splitting by column '{cfg.split_column}'")
+        print(f"Loading {path} with name {name}, splitting by column '{cfg.split_column}'")
         print(f"(auto-discovering domains, up to {cfg.max_chunks} rows total)")
         print("=" * 70)
 
@@ -163,18 +220,24 @@ def load_hf_datasets(cfg: ExperimentConfig, split = "train") -> list: # A list o
             if cfg.max_chunks != -1 and total >= cfg.max_chunks:
                 break
             domain = row[cfg.split_column]
+            if isinstance(domain,dict):
+                domain = domain["redpajama_set_name"] # Not good it is hardcoded but for now it works 
+            else:
+                domain = str(domain)
             buckets.setdefault(domain, []).append(row[text_col])
             total += 1
 
         return [(name, texts, None) for name, texts in buckets.items()]
     else:
-        for name in cfg.dataset_list:
-            text_col = DATASET_REGISTRY.get(name).get("text_col")
-            ds = load_dataset(name, split = split,  streaming = True) # Make sure you load the correct split
+        for path in cfg.dataset_list:
+            text_col = DATASET_REGISTRY.get(path).get("text_col")
+            name = DATASET_REGISTRY.get(path).get("name")
+            
+            ds = load_dataset(path = path, name = name, split = split,  streaming = True) # Make sure you load the correct split
             for row in tqdm(ds, total=cfg.max_chunks):
                 if cfg.max_chunks != -1 and total >= cfg.max_chunks:
                     break
-                buckets.setdefault(name, []).append(row[text_col])
+                buckets.setdefault(path, []).append(row[text_col])
                 total += 1
 
     print(
@@ -189,12 +252,21 @@ def chunk_datasets(
     datasets: list,
     cfg: ExperimentConfig,
     tokenizer: GPT2TokenizerFast,
+    num_workers: int = 0,
+    batch_size: int = 2000,
 ) -> Tuple[List[Tuple[List[int], int]], Optional[List[torch.Tensor]]]:
     """Tokenize/chunk each (domain_name, texts, embeddings) triple from
     load_hf_datasets() and label every resulting chunk with its domain's
     index (0..N-1, in the order domains appear in `datasets`) -- the same
     (chunk, label) shape make_mixed_chunks() used to produce, so the result
     is ready to hand straight to MixedLMDataset(chunks, embeddings=embs).
+
+    Tokenization is batched and (for large domains) multiprocessed via
+    tokenize_documents() -- see num_workers/batch_size -- instead of calling
+    the tokenizer once per document, which otherwise dominates the cost of
+    building large caches (e.g. SlimPajama-6B). Purely a speed knob: it does
+    not change the resulting chunks, so it is deliberately kept out of
+    dataset_signature() (utils/shared_dataset.py).
 
     When cfg.split_dataset is False, each domain's chunk count is rebalanced
     to match cfg.dataset_proportions (oversampling/undersampling exactly like
@@ -217,9 +289,13 @@ def chunk_datasets(
     for name, texts, embeddings in datasets:
         chunks: List[List[int]] = []
         embs: Optional[List[torch.Tensor]] = [] if embeddings is not None else None
-        text_embs = zip(texts, embeddings) if embeddings is not None else zip(texts, [None] * len(texts))
-        for text, emb in tqdm(text_embs, total=len(texts), desc=name):
-            doc_chunks = tokenize_and_chunk(text, tokenizer, cfg.block + 1)
+        print(f"[{name}] tokenizing {len(texts)} documents...")
+        doc_token_ids = tokenize_documents(
+            texts, tokenizer, num_workers=num_workers, batch_size=batch_size
+        )
+        emb_iter = embeddings if embeddings is not None else [None] * len(texts)
+        for tokens, emb in zip(doc_token_ids, emb_iter):
+            doc_chunks = _chunk_tokens(tokens, cfg.block + 1)
             chunks.extend(doc_chunks)
             if embs is not None:
                 embs.extend([emb] * len(doc_chunks))
@@ -286,14 +362,22 @@ def chunk_datasets(
     return all_chunks, all_embs
 
 
-def make_chunks(cfg: ExperimentConfig,
-    tokenizer: GPT2TokenizerFast):
+def make_chunks(
+    cfg: ExperimentConfig,
+    tokenizer: GPT2TokenizerFast,
+    num_workers: int = 0,
+    batch_size: int = 2000,
+):
 
     train_datasets = load_hf_datasets(cfg, "train")
     validation_datasets = load_hf_datasets(cfg, "validation")
 
-    train_chunks, train_embs = chunk_datasets(train_datasets, cfg, tokenizer)
-    validation_chunks, val_embs = chunk_datasets(validation_datasets, cfg, tokenizer)
+    train_chunks, train_embs = chunk_datasets(
+        train_datasets, cfg, tokenizer, num_workers=num_workers, batch_size=batch_size
+    )
+    validation_chunks, val_embs = chunk_datasets(
+        validation_datasets, cfg, tokenizer, num_workers=num_workers, batch_size=batch_size
+    )
 
     # domain_id -> name, in the same order chunk_datasets() assigned ids --
     # used to label per-domain metrics/plots with real names instead of bare
