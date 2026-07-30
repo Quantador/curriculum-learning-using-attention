@@ -1,47 +1,35 @@
 # data.py
 """
-Dataset loading, tokenisation, and chunking for curriculum learning.
+Reading side of the dataset pipeline: turn a datatrove-tokenized cache into a
+PyTorch Dataset of (x, y, domain_id) triples.
 
-Two dataset modes:
-  - Mixed-difficulty: load an easy + a hard HuggingFace dataset, tokenise,
-    chunk into (block+1)-token sequences, label them 0 (easy) / 1 (hard).
-    Use make_mixed_chunks().
-  - Single-dataset: one source, no difficulty split (all labels 0). Supports
-    optional pre-computed external embeddings (e.g. epfml/FineWeb-HQ).
-    Use make_single_chunks().
+Nothing here tokenizes. The cache is built ahead of time by
+build_dataset_cache.py (see tokenization.py); training and sweeps only ever
+read it, and error out if it is missing (utils.shared_dataset).
 
-Difficulty label convention: 0 = easy, 1 = hard, -1 = validation (no label).
+Layout assumed on disk -- one folder per domain, so mapping a chunk back to
+its domain is just "which folder is this .ds file in":
 
-Validation always uses WikiText-2 regardless of training dataset config,
-keeping the eval set fixed across all experiments for fair comparison.
+    <entry_dir>/<split>/<domain folder>/*.ds
 
 Key exports:
-  get_tokenizer()       — tokeniser matching the student LM (GPT-2 BPE by
-                          default; pass a HF model name for other models)
-  make_mixed_chunks()   — builds labelled train/val chunks for mixed mode
-  make_single_chunks()  — builds chunks for single-dataset mode
-  MixedLMDataset        — PyTorch Dataset yielding (x, y, difficulty) triples
-  make_index_loader()   — yields shuffled pool-sized index batches
+  get_tokenizer()   — tokenizer matching the student LM (GPT-2 BPE by default)
+  TokenizedCorpus   — Dataset over the .ds files, yielding (x, y, domain_id)
+  make_index_loader — yields shuffled pool-sized index batches
 """
 from __future__ import annotations
 
-import os
 import random
-import multiprocessing
-from typing import List, Optional, Tuple
-
-import torch
-from torch.utils.data import Dataset
-from datasets import load_dataset
-from transformers import AutoTokenizer, GPT2TokenizerFast, PreTrainedTokenizerBase
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
-from config import ExperimentConfig
-from consts import DATASET_REGISTRY
 
-# Below this many documents, multiprocessing (Pool spawn + IPC) costs more
-# than it saves; fall back to the single-process batched path.
-_MIN_DOCS_FOR_MULTIPROC = 200
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
 
 def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
     """
@@ -49,371 +37,206 @@ def get_tokenizer(model_name: str = "gpt2") -> PreTrainedTokenizerBase:
 
     Defaults to GPT-2 BPE (used by TinyGPT). Pass a HuggingFace model name
     (e.g. "Qwen/Qwen3-1.7B") to get the matching tokenizer instead — required
-    whenever the token ids must line up with that model's embedding table.
+    whenever the token ids must line up with that model's embedding table, and
+    it must match the cfg.tokenizer_name the cache was built with.
     """
     tok = AutoTokenizer.from_pretrained(model_name)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok
 
-def _chunk_tokens(tokens: List[int], max_length: int) -> List[List[int]]:
-    chunks: List[List[int]] = []
-    for i in range(0, len(tokens), max_length):
-        chunk = tokens[i : i + max_length]
-        if len(chunk) == max_length:
-            chunks.append(chunk)
-    return chunks
 
-def tokenize_and_chunk(
-    text: str,
-    tokenizer: GPT2TokenizerFast,
-    max_length: int,
-) -> List[List[int]]:
-    tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
-    return _chunk_tokens(tokens, max_length)
+def discover_domain_files(
+    split_dir: Path, domains: Sequence[str], folders: dict[str, str]
+) -> List[Tuple[Path, int]]:
+    """(file, domain_id) for every .ds file under split_dir.
 
-# Worker-local tokenizer for the multiprocessing.Pool path below. Rebuilt
-# once per worker process (via the pool initializer) instead of pickling the
-# live tokenizer object across the fork.
-_worker_tokenizer: Optional[PreTrainedTokenizerBase] = None
-
-def _init_tokenizer_worker(model_name: str) -> None:
-    # Each worker is one OS process pinned to one core; letting the fast
-    # tokenizer's own Rust thread pool also spawn threads here would
-    # oversubscribe a cgroup-limited allocation (N processes x M threads on
-    # N cores), so force it single-threaded per worker.
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    global _worker_tokenizer
-    _worker_tokenizer = get_tokenizer(model_name)
-
-def _tokenize_shard(texts: List[str]) -> List[List[int]]:
-    print(f"Starting tokenizing {len(texts)}")
-    return _worker_tokenizer(texts, add_special_tokens=False)["input_ids"]
-
-def tokenize_documents(
-    texts: List[str],
-    tokenizer: PreTrainedTokenizerBase,
-    num_workers: int = 0,
-    batch_size: int = 2000,
-) -> List[List[int]]:
+    domain_id is the index of the domain in `domains`, which the manifest
+    fixes once for all splits so an id means the same thing in train and val.
+    Domains with no files (present in one split but not another) contribute
+    nothing and are simply skipped.
     """
-    Tokenize many documents at once, returning one input_ids list per text
-    (order preserved 1:1 with `texts`).
+    sources: List[Tuple[Path, int]] = []
+    for domain_id, domain in enumerate(domains):
+        folder = split_dir / folders[domain]
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.ds")):
+            if path.stat().st_size > 0:
+                sources.append((path, domain_id))
+    return sources
 
-    Batches calls to the fast (Rust) tokenizer -- which parallelizes
-    internally across cores when given a list of texts -- instead of the
-    one-document-at-a-time calls that dominate tokenize_and_chunk()'s cost
-    for large corpora. For large enough inputs, further splits work across
-    `num_workers` processes.
 
-    num_workers <= 0 resolves to os.cpu_count(). Below _MIN_DOCS_FOR_MULTIPROC
-    documents (e.g. small domains, validation splits), multiprocessing
-    overhead isn't worth it, so this always uses the single-process batched
-    path regardless of num_workers.
+class TokenizedCorpus(Dataset):
+    """Fixed-length windows over datatrove .ds files, labelled by domain.
+
+    Each .ds file is a flat little-endian stream of token ids with documents
+    separated by EOS, which is read as consecutive non-overlapping windows of
+    block+1 tokens -- x = window[:-1], y = window[1:]. Unlike the old
+    per-document chunking, windows pack across document boundaries, so no
+    tokens are dropped as a short tail.
+
+    Files are memory-mapped lazily on first access rather than loaded into
+    RAM: a full SlimPajama-6B cache is ~12 GB of token ids, and several
+    experiment workers run concurrently against the same cache, so letting
+    the OS page cache hold it once beats each process holding its own copy.
+
+    Windows are read in shuffled order (see _select()), so consecutive
+    __getitem__ calls jump to essentially random offsets across files --
+    mmap avoids re-opening a file on every access (the memmap object itself
+    is cached in self._mmaps), but each *new* page touched under that access
+    pattern is still a real page fault / disk read the first time, and random
+    order defeats OS readahead. warm_cache=True (the default) pays for this
+    upfront with one sequential read of every file at construction time --
+    much cheaper than scattered random reads -- so the random-order reads
+    later hit the page cache instead of stalling mid-epoch.
+
+    max_chunks / proportions are applied here, at read time, by choosing which
+    windows are in scope -- they are not baked into the cache, so changing
+    either does not require re-tokenizing.
     """
-    if num_workers <= 0:
-        num_workers = os.cpu_count() or 1
 
-    if num_workers <= 1 or len(texts) < _MIN_DOCS_FOR_MULTIPROC:
-        results: List[List[int]] = []
-        for i in tqdm(range(0, len(texts), batch_size), desc="tokenizing", leave=False):
-            batch = texts[i : i + batch_size]
-            results.extend(tokenizer(batch, add_special_tokens=False)["input_ids"])
-        return results
-
-    num_workers = min(num_workers, len(texts))
-    shard_size = -(-len(texts) // num_workers)  # ceil div
-    shards = [texts[i : i + shard_size] for i in range(0, len(texts), shard_size)]
-
-    print(f"Total number of texts needed to be tokenized is: {len(texts)}")
-    print(f"{os.cpu_count()=}, {num_workers=}")
-    
-    with multiprocessing.Pool(
-        processes=len(shards),
-        initializer=_init_tokenizer_worker,
-        initargs=(tokenizer.name_or_path,),
-    ) as pool:
-        shard_results = list(pool.map(_tokenize_shard, shards))
-
-    results = []
-    for shard_result in shard_results:
-        results.extend(shard_result)
-    return results
-
-def load_dataset_with_embeddings(
-    dataset_name: str,
-    n_samples: int,
-    text_col: str = "text",
-    embedding_col: str = "embeddings",
-) -> Tuple[List[str], List[torch.Tensor]]:
-    """
-    Load a HuggingFace dataset that has a pre-computed embedding column.
-
-    Some datasets (e.g. epfml/FineWeb-HQ) store one embedding vector per
-    sub-chunk of the document, yielding shape [n_sub_chunks, dim]. These
-    are mean-pooled to a single document-level vector before being attached
-    to each token chunk produced from that document.
-
-    Returns (texts, embeddings) where embeddings[i] is a 1-D float32 tensor
-    aligned with texts[i]. n_samples=-1 means no cap (stream the whole split).
-    """
-    ds = load_dataset(dataset_name, split="train", streaming=True)
-    if n_samples != -1:
-        ds = ds.take(n_samples)
-    texts = []
-    embeddings = []
-    for row in ds:
-        texts.append(row[text_col])
-        emb = torch.tensor(row[embedding_col], dtype=torch.float32)
-        # Some datasets (e.g. epfml/FineWeb-HQ) store one vector per sub-chunk,
-        # yielding shape [n_chunks, dim]. Mean-pool to a single document vector.
-        if emb.dim() == 2:
-            emb = emb.mean(dim=0)
-        embeddings.append(emb)
-    return texts, embeddings
-
-def load_hf_datasets(cfg: ExperimentConfig, split = "train") -> list: # A list of (domain_name, texts, embeddings_or_None)
-    if cfg.use_external_embeddings:
-        # Backward-compat with the old make_single_chunks() external-embeddings
-        # path: embeddings datasets like epfml/FineWeb-HQ only expose a 'train'
-        # split, so there's no real "validation" split to request from HF.
-        # Instead -- exactly like make_single_chunks() used to -- we stream the
-        # whole (capped) dataset and carve off cfg.single_dataset_val_split of
-        # it for validation. Since load_hf_datasets() has no state shared
-        # between the separate "train" and "validation" calls make_chunks()
-        # makes, the full stream is re-fetched on each call; a fixed (not
-        # shuffled) split point keeps the two calls' outputs disjoint.
-        assert len(cfg.dataset_list) <= 1, (
-            "use_external_embeddings only supports a single dataset "
-            "(cfg.external_embeddings_dataset), not cfg.dataset_list"
-        )
-        n_samples = cfg.max_chunks
-        texts, embeddings = load_dataset_with_embeddings(cfg.external_embeddings_dataset, n_samples)
-        n_val = int(len(texts) * cfg.single_dataset_val_split)
-        if split == "train":
-            texts, embeddings = texts[n_val:], embeddings[n_val:]
-        else:
-            texts, embeddings = texts[:n_val], embeddings[:n_val]
-
-        print(f"OK Loaded {len(texts)} documents ({split}) from {cfg.external_embeddings_dataset}")
-        return [(cfg.external_embeddings_dataset, texts, embeddings)]
-
-    buckets: dict[str, list[str]] = {}
-    total = 0
-
-    if cfg.split_dataset:
-        assert (len(cfg.dataset_list) == 1), "If you want to split a dataset, make sure it is just one"
-        assert cfg.split_column, "cfg.split_column must be set when cfg.split_dataset=True"
-        path = cfg.dataset_list[0]
-
-        text_col = DATASET_REGISTRY.get(path).get("text_col")
-        name = DATASET_REGISTRY.get(path).get("name")
-
-        ds = load_dataset(path, name = name, split = split,  streaming = True) # Make sure you load the correct split
-
-        print("\n" + "=" * 70)
-        print(f"Loading {path} with name {name}, splitting by column '{cfg.split_column}'")
-        print(f"(auto-discovering domains, up to {cfg.max_chunks} rows total)")
-        print("=" * 70)
-
-        for row in tqdm(ds, total=cfg.max_chunks):
-            if cfg.max_chunks != -1 and total >= cfg.max_chunks:
-                break
-            domain = row[cfg.split_column]
-            if isinstance(domain,dict):
-                domain = domain["redpajama_set_name"] # Not good it is hardcoded but for now it works 
-            else:
-                domain = str(domain)
-            buckets.setdefault(domain, []).append(row[text_col])
-            total += 1
-
-        return [(name, texts, None) for name, texts in buckets.items()]
-    else:
-        for path in cfg.dataset_list:
-            text_col = DATASET_REGISTRY.get(path).get("text_col")
-            name = DATASET_REGISTRY.get(path).get("name")
-            
-            ds = load_dataset(path = path, name = name, split = split,  streaming = True) # Make sure you load the correct split
-            for row in tqdm(ds, total=cfg.max_chunks):
-                if cfg.max_chunks != -1 and total >= cfg.max_chunks:
-                    break
-                buckets.setdefault(path, []).append(row[text_col])
-                total += 1
-
-    print(
-        f"OK Found {len(buckets)} different datasets: "
-        + ", ".join(f"{name} ({len(texts)})" for name, texts in buckets.items())
-    )
-
-    return [(name, texts, None) for name, texts in buckets.items()]
-
-
-def chunk_datasets(
-    datasets: list,
-    cfg: ExperimentConfig,
-    tokenizer: GPT2TokenizerFast,
-    num_workers: int = 0,
-    batch_size: int = 2000,
-) -> Tuple[List[Tuple[List[int], int]], Optional[List[torch.Tensor]]]:
-    """Tokenize/chunk each (domain_name, texts, embeddings) triple from
-    load_hf_datasets() and label every resulting chunk with its domain's
-    index (0..N-1, in the order domains appear in `datasets`) -- the same
-    (chunk, label) shape make_mixed_chunks() used to produce, so the result
-    is ready to hand straight to MixedLMDataset(chunks, embeddings=embs).
-
-    Tokenization is batched and (for large domains) multiprocessed via
-    tokenize_documents() -- see num_workers/batch_size -- instead of calling
-    the tokenizer once per document, which otherwise dominates the cost of
-    building large caches (e.g. SlimPajama-6B). Purely a speed knob: it does
-    not change the resulting chunks, so it is deliberately kept out of
-    dataset_signature() (utils/shared_dataset.py).
-
-    When cfg.split_dataset is False, each domain's chunk count is rebalanced
-    to match cfg.dataset_proportions (oversampling/undersampling exactly like
-    the old easy/hard rebalancing), capped at cfg.max_chunks total chunks
-    (cfg.max_chunks=-1 means no cap). When cfg.split_dataset is True, no
-    rebalancing happens -- domains already keep their natural proportions
-    from load_hf_datasets() (see its docstring), since dataset_proportions
-    doesn't apply to an auto-discovered domain list.
-
-    When a domain carries per-text embeddings (cfg.use_external_embeddings),
-    each chunk produced from a text inherits that text's embedding -- a
-    document that splits into multiple chunks replicates its embedding
-    across all of them, exactly like make_single_chunks() used to. Returns
-    (chunks, embeddings) where embeddings is None unless at least one domain
-    had embeddings attached.
-    """
-    print("\nTokenizing and chunking...")
-    per_domain_chunks: List[List[List[int]]] = []
-    per_domain_embs: List[Optional[List[torch.Tensor]]] = []
-    for name, texts, embeddings in datasets:
-        chunks: List[List[int]] = []
-        embs: Optional[List[torch.Tensor]] = [] if embeddings is not None else None
-        print(f"[{name}] tokenizing {len(texts)} documents...")
-        doc_token_ids = tokenize_documents(
-            texts, tokenizer, num_workers=num_workers, batch_size=batch_size
-        )
-        emb_iter = embeddings if embeddings is not None else [None] * len(texts)
-        for tokens, emb in zip(doc_token_ids, emb_iter):
-            doc_chunks = _chunk_tokens(tokens, cfg.block + 1)
-            chunks.extend(doc_chunks)
-            if embs is not None:
-                embs.extend([emb] * len(doc_chunks))
-        per_domain_chunks.append(chunks)
-        per_domain_embs.append(embs)
-
-    print(
-        "Raw chunks - "
-        + ", ".join(f"{name}: {len(c)}" for (name, _, _), c in zip(datasets, per_domain_chunks))
-    )
-
-    if not cfg.split_dataset and cfg.dataset_proportions:
-        if len(cfg.dataset_proportions) != len(datasets):
-            raise ValueError(
-                f"cfg.dataset_proportions has {len(cfg.dataset_proportions)} entries "
-                f"but {len(datasets)} datasets were loaded from cfg.dataset_list; "
-                "they must be the same length and in the same order."
-            )
-        total_chunks = sum(len(c) for c in per_domain_chunks)
-        target_total = total_chunks if cfg.max_chunks == -1 else min(cfg.max_chunks, total_chunks)
-
-        sampled_chunks = []
-        sampled_embs = []
-        for (name, _, _), chunks, embs, proportion in zip(
-            datasets, per_domain_chunks, per_domain_embs, cfg.dataset_proportions
-        ):
-            target_n = int(target_total * float(proportion))
-            # Sample by index (not by value) so a domain's embeddings, if any,
-            # can be subsampled in lockstep with its chunks.
-            if len(chunks) >= target_n:
-                idx = random.sample(range(len(chunks)), target_n)
-            else:
-                idx = random.choices(range(len(chunks)), k=target_n)
-            sampled_chunks.append([chunks[i] for i in idx])
-            sampled_embs.append([embs[i] for i in idx] if embs is not None else None)
-            print(f"OK Rebalanced {name} to {target_n} chunks (target {target_n})")
-    else:
-        sampled_chunks = per_domain_chunks
-        sampled_embs = per_domain_embs
-
-    has_embeddings = any(embs is not None for embs in sampled_embs)
-
-    all_chunks: List[Tuple[List[int], int]] = []
-    all_embs: Optional[List[torch.Tensor]] = [] if has_embeddings else None
-    for domain_id, chunks in enumerate(sampled_chunks):
-        embs = sampled_embs[domain_id]
-        for i, chunk in enumerate(chunks):
-            all_chunks.append((chunk, domain_id))
-            if has_embeddings:
-                # Domains without embeddings (mixed with an embedded domain)
-                # contribute None placeholders so all_chunks/all_embs stay
-                # aligned 1:1.
-                all_embs.append(embs[i] if embs is not None else None)
-
-    if has_embeddings:
-        combined = list(zip(all_chunks, all_embs))
-        random.shuffle(combined)
-        all_chunks = [c for c, _ in combined]
-        all_embs = [e for _, e in combined]
-    else:
-        random.shuffle(all_chunks)
-
-    print(f"OK Final dataset: {len(all_chunks)} chunks across {len(datasets)} domains")
-    return all_chunks, all_embs
-
-
-def make_chunks(
-    cfg: ExperimentConfig,
-    tokenizer: GPT2TokenizerFast,
-    num_workers: int = 0,
-    batch_size: int = 2000,
-):
-
-    train_datasets = load_hf_datasets(cfg, "train")
-    validation_datasets = load_hf_datasets(cfg, "validation")
-
-    train_chunks, train_embs = chunk_datasets(
-        train_datasets, cfg, tokenizer, num_workers=num_workers, batch_size=batch_size
-    )
-    validation_chunks, val_embs = chunk_datasets(
-        validation_datasets, cfg, tokenizer, num_workers=num_workers, batch_size=batch_size
-    )
-
-    # domain_id -> name, in the same order chunk_datasets() assigned ids --
-    # used to label per-domain metrics/plots with real names instead of bare
-    # ids. Tracked separately for train/val: in cfg.split_dataset mode,
-    # domains are auto-discovered per stream, so the validation split isn't
-    # guaranteed to discover the same domains in the same order as train.
-    train_domain_names = [name for name, _, _ in train_datasets]
-    val_domain_names = [name for name, _, _ in validation_datasets]
-
-    return train_chunks, validation_chunks, train_embs, val_embs, train_domain_names, val_domain_names
-
-class MixedLMDataset(Dataset):
     def __init__(
         self,
-        labeled_chunks: List[Tuple[List[int], int]],
-        embeddings: Optional[List[torch.Tensor]] = None,
+        sources: Sequence[Tuple[Path, int]],
+        block: int,
+        token_size: int,
         domain_names: Optional[List[str]] = None,
+        max_chunks: int = -1,
+        proportions: Optional[dict] = None,
+        seed: int = 0,
+        warm_cache: bool = True,
     ):
-        self.x = [
-            torch.tensor(c[:-1], dtype=torch.long) for c, _ in labeled_chunks
-        ]
-        self.y = [
-            torch.tensor(c[1:], dtype=torch.long) for c, _ in labeled_chunks
-        ]
-        self.domains = [d for _, d in labeled_chunks]
-        self.embeddings = embeddings
-        # domain_id -> name (e.g. domain_names[0] == "wikipedia"), for
-        # labeling per-domain metrics with real names. None when unknown to
-        # the caller (e.g. validation sets, or older cached datasets).
+        if not sources:
+            raise ValueError("No .ds files found -- the tokenized cache is empty.")
+        if token_size not in (2, 4):
+            raise ValueError(f"token_size must be 2 or 4, got {token_size}")
+
+        self.window = block + 1
+        self.block = block
+        # domain_id -> name, for labelling per-domain metrics and plots. Set
+        # before _select(), which resolves proportions by domain name.
         self.domain_names = domain_names
+        self._dtype = np.uint16 if token_size == 2 else np.uint32
+        self._paths = [str(p) for p, _ in sources]
+        self._domain_of_file = np.array([d for _, d in sources], dtype=np.int64)
+        self._mmaps: List[Optional[np.memmap]] = [None] * len(self._paths)
+
+        # Windows per file, and the running total so a global window id can be
+        # resolved back to (file, offset) with one searchsorted.
+        counts = [
+            Path(p).stat().st_size // token_size // self.window for p in self._paths
+        ]
+        self._cum = np.cumsum([0] + counts, dtype=np.int64)
+
+        self._sel = self._select(counts, max_chunks, proportions, seed)
+
+        if warm_cache:
+            self._warm_cache()
+
+        # Pre-computed external embeddings are not supported by the datatrove
+        # path (see tokenization.plan_jobs); training code branches on this.
+        self.embeddings = None
+
+    def _warm_cache(self) -> None:
+        total_bytes = sum(Path(p).stat().st_size for p in self._paths)
+        with tqdm(
+            total=total_bytes,
+            unit="B",
+            unit_scale=True,
+            desc="warming page cache",
+            leave=False,
+        ) as pbar:
+            for path in self._paths:
+                with open(path, "rb") as f:
+                    while chunk := f.read(1 << 20):  # 1 MiB: sequential, readahead-friendly
+                        pbar.update(len(chunk))
+
+    # -- selection ---------------------------------------------------------
+    def _windows_by_domain(self, counts: Sequence[int]) -> dict[int, np.ndarray]:
+        by_domain: dict[int, list[np.ndarray]] = {}
+        for f, n in enumerate(counts):
+            if n == 0:
+                continue
+            domain_id = int(self._domain_of_file[f])
+            ids = np.arange(self._cum[f], self._cum[f + 1], dtype=np.int64)
+            by_domain.setdefault(domain_id, []).append(ids)
+        return {d: np.concatenate(parts) for d, parts in by_domain.items()}
+
+    def _select(
+        self,
+        counts: Sequence[int],
+        max_chunks: int,
+        proportions: Optional[dict],
+        seed: int,
+    ) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        by_domain = self._windows_by_domain(counts)
+        total = int(self._cum[-1])
+
+        if proportions:
+            # Keyed by domain *name*, not position: cfg.dataset_proportions is
+            # written in cfg.dataset_list order while domain ids follow the
+            # manifest's sorted domain list, so matching by index would
+            # silently swap two domains' proportions.
+            if self.domain_names is None:
+                raise ValueError("proportions require domain_names")
+            unknown = set(proportions) - set(self.domain_names)
+            if unknown:
+                raise ValueError(
+                    f"dataset_proportions names domains not in this cache: {sorted(unknown)}; "
+                    f"cache holds {list(self.domain_names)}"
+                )
+            target_total = total if max_chunks == -1 else min(max_chunks, total)
+            parts = []
+            for domain_id, name in enumerate(self.domain_names):
+                ids = by_domain.get(domain_id)
+                if ids is None or len(ids) == 0:
+                    continue
+                target_n = int(target_total * float(proportions.get(name, 0.0)))
+                # Oversample a domain that is short of its target, exactly as
+                # the old chunk_datasets() rebalancing did.
+                replace = target_n > len(ids)
+                parts.append(rng.choice(ids, size=target_n, replace=replace))
+            selected = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+        else:
+            selected = np.arange(total, dtype=np.int64)
+            if max_chunks != -1 and total > max_chunks:
+                # Uniform subsample keeps the domains' natural proportions,
+                # which is the point of cfg.split_dataset mode.
+                selected = rng.choice(selected, size=max_chunks, replace=False)
+
+        rng.shuffle(selected)
+        return selected
+
+    # -- reading -----------------------------------------------------------
+    def _mmap(self, file_idx: int) -> np.memmap:
+        mm = self._mmaps[file_idx]
+        if mm is None:
+            mm = np.memmap(self._paths[file_idx], dtype=self._dtype, mode="r")
+            self._mmaps[file_idx] = mm
+        return mm
+
+    def __getstate__(self):
+        # Open memmaps do not survive pickling (DataLoader workers, spawn).
+        state = self.__dict__.copy()
+        state["_mmaps"] = [None] * len(self._paths)
+        return state
 
     def __len__(self) -> int:
-        return len(self.x)
+        return len(self._sel)
+
+    def domain_of(self, i: int) -> int:
+        gid = int(self._sel[i])
+        return int(self._domain_of_file[int(np.searchsorted(self._cum, gid, side="right")) - 1])
 
     def __getitem__(self, i: int):
-        return self.x[i], self.y[i], self.domains[i] # In certain cases the difficulty can match the domain
+        gid = int(self._sel[i])
+        file_idx = int(np.searchsorted(self._cum, gid, side="right")) - 1
+        offset = (gid - int(self._cum[file_idx])) * self.window
+        window = self._mmap(file_idx)[offset : offset + self.window]
+        ids = torch.from_numpy(window.astype(np.int64))
+        return ids[:-1], ids[1:], int(self._domain_of_file[file_idx])
 
 
 def make_index_loader(ds_len: int, pool_size: int):

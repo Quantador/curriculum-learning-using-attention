@@ -44,7 +44,7 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from config import ExperimentConfig
-from data import make_index_loader, MixedLMDataset
+from data import make_index_loader, TokenizedCorpus
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from utils.metrics import MetricsTracker, DiversityTracker
 from training import evaluate, evaluate_per_domain  # keep using your existing evaluate()
@@ -622,7 +622,7 @@ def compute_baseline(
 
 def build_feature_cache(
     model: TinyGPT,
-    train_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
     cfg: ExperimentConfig,
 ) -> torch.Tensor:
     """
@@ -680,8 +680,8 @@ def train_router_experiments(
     cfg: ExperimentConfig,
     model: TinyGPT,
     router: AttentionRouter,
-    train_ds: MixedLMDataset,
-    val_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
+    val_ds: TokenizedCorpus,
     tokenizer,
     metrics: MetricsTracker,
     diversity: DiversityTracker,
@@ -1143,8 +1143,8 @@ def train_aux_baseline(
     cfg: ExperimentConfig,
     model: TinyGPT,
     aux_net: nn.Module,
-    train_ds: MixedLMDataset,
-    val_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
+    val_ds: TokenizedCorpus,
     tokenizer,
     metrics: MetricsTracker,
     diversity: DiversityTracker,

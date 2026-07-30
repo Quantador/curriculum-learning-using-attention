@@ -159,6 +159,7 @@ PER_PROC_BUFFER = 1.15  # safety factor over the measured probe peak
 
 # Persists across sweeps (unlike SCRATCH_DIR, which is only reused, not
 # versioned): one subdirectory per distinct dataset signature (see
-# utils/shared_dataset.dataset_signature), so re-running the same dataset
-# config skips re-tokenizing even across separate script invocations.
+# utils/shared_dataset.dataset_signature), each holding a datatrove-tokenized
+# corpus laid out as <split>/<domain>/*.ds (see tokenization.py). Written only
+# by build_dataset_cache.py; sweeps and workers read it and never build it.
 DATASET_CACHE_DIR = Path("results/dataset_cache")

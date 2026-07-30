@@ -1,9 +1,12 @@
 # shared_dataset.py
 """
-Build the train/val dataset once and persist it to disk so that the
-orchestrator, the GPU memory probe, and every parallel experiment worker
-can each load it (via torch.load) instead of re-tokenizing the source
-HuggingFace dataset once per process.
+Resolve a config to its pre-tokenized dataset cache entry, and load it.
+
+Tokenization is *not* done here. Sweeps (parallel_experiments.py), the GPU
+memory probe, and every experiment worker call require_dataset_cache(), which
+raises with the exact build command if the cache is missing — building it is
+a separate, explicit step (build_dataset_cache.py), so a GPU-scheduling node
+never blocks on tokenizing 6B tokens.
 """
 from __future__ import annotations
 
@@ -11,120 +14,137 @@ import hashlib
 import json
 from pathlib import Path
 
-import torch
-import yaml
-
 from config import ExperimentConfig
 from consts import DATASET_CACHE_DIR
-from data import make_chunks, MixedLMDataset
+from data import TokenizedCorpus, discover_domain_files
+from tokenization import MANIFEST_NAME, read_manifest
+
+
+class DatasetCacheMissing(FileNotFoundError):
+    """Raised when a config's tokenized dataset has not been built yet."""
 
 
 def dataset_signature(cfg: ExperimentConfig) -> dict:
-    """Fields that actually change the tokenized chunks produced for cfg.
+    """Fields that change the *tokens written to disk* for cfg.
 
-    Configs sharing a signature are assumed to need the same chunks, so
-    get_or_build_dataset_cache() only tokenizes once per distinct signature
-    instead of once per config. Tokenizer choice is deliberately excluded:
-    every caller in this sweep path uses get_tokenizer() with no argument
-    (always GPT-2), regardless of cfg.hf_model_name.
+    Deliberately excluded, because they are applied at read time by
+    TokenizedCorpus and so do not require re-tokenizing:
+      - cfg.block            (window size over the token stream)
+      - cfg.max_chunks       (how many windows are in scope)
+      - cfg.dataset_proportions (per-domain rebalancing)
+
+    Included, unlike the old signature: cfg.tokenizer_name. The cache stores
+    raw token ids, so a different tokenizer is a genuinely different cache.
     """
-    sig = {
-        "block": cfg.block,
-        "max_chunks": cfg.max_chunks,
-        "use_external_embeddings": cfg.use_external_embeddings,
+    return {
+        "tokenizer_name": cfg.tokenizer_name,
+        "split_dataset": cfg.split_dataset,
+        "split_column": cfg.split_column if cfg.split_dataset else "",
+        "dataset_list": list(cfg.dataset_list),
+        "max_documents": cfg.max_documents,
     }
-    if cfg.use_external_embeddings:
-        sig.update(
-            external_embeddings_dataset=cfg.external_embeddings_dataset,
-            single_dataset_val_split=cfg.single_dataset_val_split,
-        )
-    else:
-        sig.update(
-            split_dataset=cfg.split_dataset,
-            split_column=cfg.split_column,
-            dataset_list=cfg.dataset_list,
-            dataset_proportions=cfg.dataset_proportions,
-        )
-    return sig
 
 
-def _signature_hash(sig: dict) -> str:
+def signature_hash(sig: dict) -> str:
     blob = json.dumps(sig, sort_keys=True).encode()
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
-def get_or_build_dataset_cache(
-    cfg: ExperimentConfig,
-    tokenizer,
-    cache_root: Path = DATASET_CACHE_DIR,
-    num_workers: int = 0,
+def cache_entry_dir(cfg: ExperimentConfig, cache_root: Path = DATASET_CACHE_DIR) -> Path:
+    return Path(cache_root) / signature_hash(dataset_signature(cfg))
+
+
+def require_dataset_cache(
+    cfg: ExperimentConfig, cache_root: Path = DATASET_CACHE_DIR
 ) -> Path:
-    """Return the chunks.pt path for cfg's dataset signature, building it
-    (and a signature.yaml sidecar for debugging) only on a cache miss.
+    """Return the cache entry dir for cfg, or raise telling the user to build it."""
+    entry_dir = cache_entry_dir(cfg, cache_root)
+    manifest = read_manifest(entry_dir)
+    if manifest is None:
+        sig = dataset_signature(cfg)
+        raise DatasetCacheMissing(
+            f"No tokenized dataset for this config.\n"
+            f"  expected: {entry_dir / MANIFEST_NAME}\n"
+            f"  signature: {json.dumps(sig, sort_keys=True)}\n\n"
+            f"Build it once (CPU-only job, no GPU needed):\n"
+            f"    python build_dataset_cache.py --config <your config>.yaml\n\n"
+            f"{'(the directory exists but has no manifest.json -- a previous build was interrupted; re-run the command above to resume)' if entry_dir.exists() else ''}"
+        )
+    print(f"[dataset cache] hit {entry_dir.name} ({len(manifest['domains'])} domains)")
+    return entry_dir
 
-    num_workers controls tokenization parallelism on a cache miss (see
-    data.tokenize_documents); it only affects build speed, never the
-    resulting chunks, so it is deliberately excluded from dataset_signature().
+
+def load_dataset_cache(
+    entry_dir: str | Path,
+    cfg: ExperimentConfig,
+    max_train: int | None = None,
+    max_val: int | None = None,
+    warm_cache: bool = True,
+):
+    """Load the cache entry as (train_ds, val_ds) TokenizedCorpus pairs.
+
+    cfg supplies the read-time knobs (block, max_chunks, dataset_proportions,
+    seed) that the cache deliberately does not bake in.
+
+    max_train/max_val further truncate the window count (for the GPU memory
+    probe, which only needs a handful of pool-sized batches).
+
+    warm_cache sequentially reads every underlying .ds file once up front, so
+    the training loop's shuffled per-window reads (real disk I/O only on
+    first touch, since TokenizedCorpus mmaps files) hit the OS page cache
+    instead of stalling on random access mid-epoch. Pass False when only a
+    handful of windows will actually be read (e.g. the GPU memory probe with
+    max_train/max_val set) -- there warming would read whole multi-GB domain
+    files just to serve a few dozen samples.
     """
-    sig = dataset_signature(cfg)
-    entry_dir = cache_root / _signature_hash(sig)
-    chunks_path = entry_dir / "chunks.pt"
+    entry_dir = Path(entry_dir)
+    manifest = read_manifest(entry_dir)
+    if manifest is None:
+        raise DatasetCacheMissing(f"No {MANIFEST_NAME} in {entry_dir}")
 
-    if chunks_path.exists():
-        print(f"[dataset cache] hit  {entry_dir.name} -> reusing {chunks_path}")
-        return chunks_path
+    domains, folders = manifest["domains"], manifest["folders"]
+    token_size = manifest["token_size"]
 
-    print(f"[dataset cache] miss {entry_dir.name} -> tokenizing for signature {sig}")
-    entry_dir.mkdir(parents=True, exist_ok=True)
-    with (entry_dir / "signature.yaml").open("w") as f:
-        yaml.safe_dump(sig, f)
-    build_dataset_cache(cfg, tokenizer, str(chunks_path), num_workers=num_workers)
-    return chunks_path
+    # cfg.dataset_proportions is positional in cfg.dataset_list, while domain
+    # ids follow the manifest's sorted domain list -- pair them up by name here
+    # so the two orders can never be confused downstream.
+    proportions = None
+    if cfg.dataset_proportions and not cfg.split_dataset:
+        if len(cfg.dataset_proportions) != len(cfg.dataset_list):
+            raise ValueError(
+                f"cfg.dataset_proportions has {len(cfg.dataset_proportions)} entries "
+                f"but cfg.dataset_list has {len(cfg.dataset_list)}; they must be the "
+                "same length and in the same order."
+            )
+        proportions = {
+            name: float(p) for name, p in zip(cfg.dataset_list, cfg.dataset_proportions)
+        }
 
+    def build(split: str, cap: int | None) -> TokenizedCorpus:
+        sources = discover_domain_files(entry_dir / split, domains, folders)
+        max_chunks = cfg.max_chunks
+        if cap is not None:
+            max_chunks = cap if max_chunks == -1 else min(max_chunks, cap)
+        return TokenizedCorpus(
+            sources,
+            block=cfg.block,
+            token_size=token_size,
+            domain_names=domains,
+            max_chunks=max_chunks,
+            # Proportions rebalance a hand-picked dataset_list; in
+            # split_dataset mode the domains are auto-discovered and keep
+            # their natural proportions, as before. Validation is never
+            # rebalanced -- it should reflect the real distribution.
+            proportions=proportions if split == "train" else None,
+            seed=cfg.seed,
+            warm_cache=warm_cache,
+        )
 
-def build_dataset_cache(
-    cfg: ExperimentConfig, tokenizer, cache_path: str, num_workers: int = 0
-) -> None:
-    """Tokenize the configured dataset(s) once and save chunks+embeddings to disk."""
-
-    train_chunks, val_chunks, train_embs, val_embs, train_domain_names, val_domain_names = make_chunks(
-        cfg, tokenizer, num_workers=num_workers
+    train_ds = build("train", max_train)
+    val_ds = build("validation", max_val)
+    print(
+        f"[dataset cache] train: {len(train_ds):,} windows | "
+        f"val: {len(val_ds):,} windows | block={cfg.block} | "
+        f"domains: {', '.join(domains)}"
     )
-
-    torch.save(
-        {
-            "train_chunks": train_chunks,
-            "val_chunks": val_chunks,
-            "train_embs": train_embs,
-            "val_embs": val_embs,
-            "train_domain_names": train_domain_names,
-            "val_domain_names": val_domain_names,
-        },
-        cache_path,
-    )
-
-
-def load_dataset_cache(cache_path: str, max_train: int | None = None, max_val: int | None = None):
-    """
-    Load cached chunks and wrap them as MixedLMDataset.
-
-    max_train/max_val optionally truncate the number of chunks used (for the
-    GPU memory probe, which only needs a handful of pool-sized batches).
-    """
-    blob = torch.load(cache_path, weights_only=False)
-    train_chunks, val_chunks = blob["train_chunks"], blob["val_chunks"]
-    train_embs, val_embs = blob["train_embs"], blob["val_embs"]
-    # .get(): older caches built before domain names were added won't have them.
-    train_domain_names = blob.get("train_domain_names")
-    val_domain_names = blob.get("val_domain_names")
-
-    if max_train is not None:
-        train_chunks = train_chunks[:max_train]
-        train_embs = train_embs[:max_train] if train_embs is not None else None
-    if max_val is not None:
-        val_chunks = val_chunks[:max_val]
-        val_embs = val_embs[:max_val] if val_embs is not None else None
-
-    train_ds = MixedLMDataset(train_chunks, embeddings=train_embs, domain_names=train_domain_names)
-    val_ds = MixedLMDataset(val_chunks, embeddings=val_embs, domain_names=val_domain_names)
     return train_ds, val_ds

@@ -55,8 +55,10 @@ def main() -> None:
     )
 
     train_size = max(probe_cfg.pool * 3, 64)
-    tokenizer = get_tokenizer()
-    train_ds, val_ds = load_dataset_cache(args.dataset_cache, max_train=train_size, max_val=32)
+    tokenizer = get_tokenizer(cfg.tokenizer_name)
+    train_ds, val_ds = load_dataset_cache(
+        args.dataset_cache, probe_cfg, max_train=train_size, max_val=32, warm_cache=False
+    )
 
     model = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=probe_cfg)
     router = build_router(

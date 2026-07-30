@@ -34,7 +34,7 @@ from torch import nn
 from tqdm import tqdm
 from time import perf_counter
 from config import Config
-from data import make_index_loader, MixedLMDataset
+from data import make_index_loader, TokenizedCorpus
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_features
 from utils.metrics import MetricsTracker, DiversityTracker
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
@@ -82,7 +82,7 @@ def compute_loss_per_sample(
 
 def evaluate(
     model: TinyGPT,
-    ds: MixedLMDataset,
+    ds: TokenizedCorpus,
     loss_fn: nn.Module,
     cfg: Config,
 ) -> Tuple[float, float]:
@@ -116,7 +116,7 @@ def evaluate(
 
 def evaluate_per_domain(
     model: TinyGPT,
-    ds: MixedLMDataset,
+    ds: TokenizedCorpus,
     loss_fn: nn.Module,
     cfg: Config,
 ) -> Dict[str, Tuple[float, float]]:
@@ -168,8 +168,8 @@ def evaluate_per_domain(
 def train_baseline(
     cfg: Config,
     model: TinyGPT,
-    train_ds: MixedLMDataset,
-    val_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
+    val_ds: TokenizedCorpus,
     metrics: MetricsTracker,
     diversity: DiversityTracker,
 ) -> TinyGPT:
@@ -267,8 +267,8 @@ def train_router(
     cfg: Config,
     model: TinyGPT,
     router: AttentionRouter,
-    train_ds: MixedLMDataset,
-    val_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
+    val_ds: TokenizedCorpus,
     tokenizer,
     metrics: MetricsTracker,
     diversity: DiversityTracker,

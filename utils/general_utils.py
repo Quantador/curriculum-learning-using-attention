@@ -106,9 +106,9 @@ def compute_costs(
 ) -> Dict[str, int]:
     """Returns {experiment_name: cost_bytes}, probing once per distinct memory signature.
 
-    dataset_cache_by_name maps each config's experiment_name to the chunks.pt
-    path matching that config's own dataset signature (see
-    utils/shared_dataset.get_or_build_dataset_cache).
+    dataset_cache_by_name maps each config's experiment_name to the tokenized
+    cache directory matching that config's own dataset signature (see
+    utils/shared_dataset.require_dataset_cache).
     """
     signature_of = {cfg.experiment_name: memory_signature(cfg) for cfg in configs}
     representatives: Dict[Tuple[Any, ...], ExperimentConfig] = {}

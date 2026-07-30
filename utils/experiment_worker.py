@@ -94,8 +94,8 @@ def main() -> None:
     cfg = load_config_from_yaml(args.config)
     set_seed(cfg.seed)
 
-    tokenizer = get_tokenizer()
-    train_ds, val_ds = load_dataset_cache(args.dataset_cache)
+    tokenizer = get_tokenizer(cfg.tokenizer_name)
+    train_ds, val_ds = load_dataset_cache(args.dataset_cache, cfg)
 
     base_metrics = MetricsTracker.load("results/baseline_metrics.json")
     router_metrics = MetricsTracker.load("results/router_metrics.json")

@@ -213,10 +213,27 @@ class ExperimentConfig(Config):
     #               CShorten/ML-ArXiv-Papers
     # Unstructured: HuggingFaceFW/fineweb  (use with use_single_dataset=True) 
 
-    split_dataset: bool = False # Needs to be true when used with SlimPajama. Also overrides dataset proportions. 
-    split_column: str = "" # Make sure a split column is specified to create different datasets 
+    split_dataset: bool = False # Needs to be true when used with SlimPajama. Also overrides dataset proportions.
+    split_column: str = "" # Make sure a split column is specified to create different datasets
     dataset_list: list[str] = field(default_factory=list)  # All datasets used
-    dataset_proportions: list[str] = field(default_factory=list) # The proportion for datasets in order 
+    dataset_proportions: list[str] = field(default_factory=list) # The proportion for datasets in order
+
+    # --- tokenization (build time; see tokenization.py / build_dataset_cache.py) ---
+    # These are the ONLY dataset fields baked into the on-disk cache key
+    # (utils.shared_dataset.dataset_signature), together with dataset_list /
+    # split_dataset / split_column. Changing them means re-tokenizing.
+    #
+    # Tokenizer the cache is written with. Must match the student LM's
+    # vocabulary: keep "gpt2" for tiny_gpt / GPT-2 checkpoints, set it to
+    # hf_model_name when training a model with a different vocabulary.
+    tokenizer_name: str = "gpt2"
+    # Source rows to read per split during tokenization (-1 = the whole split).
+    # This is the cap that used to be conflated with max_chunks: max_chunks now
+    # only limits how many (block+1)-token windows training uses, and is applied
+    # at read time, so it can be changed without rebuilding the cache.
+    max_documents: int = -1
+    # Rows streamed when auto-discovering domains for split_dataset mode.
+    domain_discovery_rows: int = 100_000
 
     single_dataset_val_split: float = 0.05 # Confused what this is 
 

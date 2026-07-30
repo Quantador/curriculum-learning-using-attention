@@ -20,8 +20,10 @@ A bare `python parallel_experiments.py` (no --all/--field/--combinations/
 Once a sweep of configs is generated, this script schedules them across one
 GPU instead of experiments.py's old one-at-a-time loop:
 
-  1. Tokenizes the dataset once and caches it to disk (shared_dataset.py) so
-     every worker process loads it instead of re-tokenizing.
+  1. Resolves each config to its pre-tokenized dataset cache entry
+     (shared_dataset.py) so every worker process memory-maps the same token
+     files. This script never tokenizes: if the cache for a config is
+     missing it exits with the build_dataset_cache.py command to run first.
   2. Groups the generated configs by "memory signature" (the fields that
      actually affect GPU memory: model size, batch/pool, router, training
      algorithm, feature caching, ...) and probes each distinct signature once
@@ -68,9 +70,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from config import ExperimentConfig, load_config_from_yaml
-from data import get_tokenizer
 
-from utils.shared_dataset import dataset_signature, get_or_build_dataset_cache
+from utils.shared_dataset import (
+    DatasetCacheMissing,
+    dataset_signature,
+    require_dataset_cache,
+)
 from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
 from utils.general_utils import (get_profile_fields, safe_name, 
                                  query_free_memory_bytes, compute_costs, dump_config)
@@ -345,18 +350,23 @@ def main() -> None:
     scratch_dir.mkdir(parents=True, exist_ok=False)
     print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
 
-    tokenizer = get_tokenizer()
-    print("\n=== Resolving dataset cache per config (one tokenize per distinct dataset signature) ===")
+    print("\n=== Resolving pre-tokenized dataset cache per config ===")
     signature_of_name = {cfg.experiment_name: dataset_signature(cfg) for cfg in configs}
     representative_by_signature: Dict[Any, ExperimentConfig] = {}
     for cfg in configs:
         sig_key = json.dumps(signature_of_name[cfg.experiment_name], sort_keys=True)
         representative_by_signature.setdefault(sig_key, cfg)
 
-    cache_path_by_signature = {
-        sig_key: get_or_build_dataset_cache(rep_cfg, tokenizer)
-        for sig_key, rep_cfg in representative_by_signature.items()
-    }
+    # Nothing is tokenized here: a sweep that finds no cache stops immediately
+    # rather than tying up a GPU node tokenizing (see build_dataset_cache.py).
+    try:
+        cache_path_by_signature = {
+            sig_key: require_dataset_cache(rep_cfg)
+            for sig_key, rep_cfg in representative_by_signature.items()
+        }
+    except DatasetCacheMissing as exc:
+        print(f"\n{exc}")
+        sys.exit(1)
     dataset_cache_by_name = {
         cfg.experiment_name: cache_path_by_signature[json.dumps(signature_of_name[cfg.experiment_name], sort_keys=True)]
         for cfg in configs
