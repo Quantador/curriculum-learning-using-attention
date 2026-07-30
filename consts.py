@@ -86,6 +86,7 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 
     # Feature caching
     "feature_cache_epochs": (0, [1, 2]),
+    "use_original_sequence": (False, [True])
 }
 # New experiments added for NeurIPS:
 #   1. Multi-head attention router (n_heads = 2 and 4)
@@ -117,6 +118,7 @@ FINAL_PRESENTATION_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "use_coverage_regularization": (EXPERIMENTAL_FIELDS["use_coverage_regularization"][0], [True]),
     # Top-k (baseline), sampling, sigma-greedy (epsilon_greedy)
     "selection_strategy": (EXPERIMENTAL_FIELDS["selection_strategy"][0], ["sample", "epsilon_greedy"]),
+    "use_original_sequence": (EXPERIMENTAL_FIELDS["use_original_sequence"][0], [True])
 }
 
 COMPARE_GRPO_VS_GREATS: Dict[str, tuple[Any, List[Any]]] = {

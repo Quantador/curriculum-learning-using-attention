@@ -1,9 +1,0 @@
-experiment_name: test_doge_setup
-epochs: 10
-batch: 16
-lr_lm: 0.0003
-max_chunks: 500000 # No limit on chunks
-use_wandb: true
-model_type: hf_pretrained
-hf_model_name: openai-community/gpt2
-dataset_list: ["allenai/c4"]
