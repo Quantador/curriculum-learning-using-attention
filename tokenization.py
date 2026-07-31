@@ -71,6 +71,12 @@ DOMAIN_DISCOVERY_ROWS = 100_000
 
 MANIFEST_NAME = "manifest.json"
 
+# Validation always uses WikiText-2, not the configured training dataset(s) --
+# keeps the eval signal identical across all experiment variants regardless
+# of cfg.dataset_list / cfg.split_dataset.
+VALIDATION_PATH = "Salesforce/wikitext"
+VALIDATION_DATASET_NAME = "wikitext-2-raw-v1"
+
 
 # --------------------------------------------------------------------------
 # dataset / domain plumbing
@@ -185,6 +191,17 @@ def plan_jobs(cfg: ExperimentConfig, split: str) -> list[dict]:
             "tokenization path: DocumentTokenizer writes token ids only, so a "
             "per-document embedding column has nowhere to go."
         )
+    if split == "validation":
+        return [
+            {
+                "domain": VALIDATION_PATH,
+                "path": VALIDATION_PATH,
+                "options": {"split": split, "name": VALIDATION_DATASET_NAME},
+                "text_col": "text",
+                "split_column": None,
+            }
+        ]
+
     if not cfg.dataset_list:
         raise ValueError("cfg.dataset_list is empty -- nothing to tokenize.")
 

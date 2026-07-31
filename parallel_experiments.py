@@ -96,10 +96,19 @@ def generate_experiment_configs(
     training_algorithm yields two configs: one with 'grpo', one with
     'reinforce', both with all other fields at baseline values.
 
+    Also always includes (unless include_baseline=False) an 'aux_baseline' run:
+    the supervised MSE alternative to the policy-gradient router (see
+    rl_training.train_aux_baseline()), on the same baseline_values as every
+    other reference run. It's a fixed reference point, not one of the ablated
+    fields — it doesn't get its own EXPERIMENTAL_FIELDS entry, so it always
+    rides along with every sweep instead of only appearing when someone
+    happens to select it with --field.
+
     Args:
         base_cfg:            Starting config (defaults to ExperimentConfig()).
         experimental_fields: {field: (baseline, [alternatives])} mapping.
-        include_baseline:    Whether to prepend the all-baseline config first.
+        include_baseline:    Whether to prepend the baseline + aux_baseline
+                             reference configs first.
 
     Returns a list of ExperimentConfig with descriptive experiment_name fields.
     """
@@ -114,7 +123,7 @@ def generate_experiment_configs(
     # Get baseline values
     baseline_values = {field: values[0] for field, values in experimental_fields.items()}
 
-    # Optionally add baseline experiment
+    # Optionally add baseline + aux_baseline reference experiments
     if include_baseline:
         baseline_cfg = replace(
             base_cfg,
@@ -123,6 +132,15 @@ def generate_experiment_configs(
             **baseline_values
         )
         configs.append(baseline_cfg)
+
+        aux_baseline_cfg = replace(
+            base_cfg,
+            experiment_name="aux_baseline",
+            save_dir="results/aux_baseline",
+            run_aux_baseline=True,
+            **baseline_values
+        )
+        configs.append(aux_baseline_cfg)
 
     # Generate one experiment per alternative value (one-factor-at-a-time)
     for field_name, (_, alternatives) in experimental_fields.items():
@@ -328,7 +346,7 @@ def main() -> None:
     parser.add_argument("--combinations", action="store_true", help="Run full grid search of all combinations")
     parser.add_argument("--field", type=str, action="append", help="Run experiments for specific field(s) only")
     parser.add_argument("--profile", type=str, help="Run a predefined experiment profile")
-    parser.add_argument("--no-baseline", action="store_true", help="Skip the baseline experiment")
+    parser.add_argument("--no-baseline", action="store_true", help="Skip the baseline and aux_baseline reference experiments")
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML file with ExperimentConfig field overrides, used as the base config every experiment is built from (fields under ablation are still forced to their declared values)")
     parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: --config's, or presentation_experiment)")
     parser.add_argument("--list", action="store_true", help="List experiments that would run, without running them")

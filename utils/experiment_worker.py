@@ -20,7 +20,7 @@ from data import get_tokenizer
 from metrics import MetricsTracker
 from shared_dataset import load_dataset_cache
 from models.router import build_router, get_router_feature_dim
-from rl_training import train_router_experiments, compare_runs_experiments
+from rl_training import train_router_experiments, train_aux_baseline, compare_runs_experiments
 from models.model import TinyGPT
 from metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
@@ -46,6 +46,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     print(f"  baseline_type: {cfg.baseline_type}")
     print(f"  temp_schedule: {cfg.temp_schedule}")
     print(f"  entropy_schedule: {cfg.entropy_schedule}")
+    print(f"  run_aux_baseline: {cfg.run_aux_baseline}")
 
     set_seed(cfg.seed)
 
@@ -53,26 +54,45 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
-    router = build_router(
-        d_input=get_router_feature_dim(cfg, model_router.block),
-        arch=cfg.router_architecture,
-        d_k=128,
-        n_heads=getattr(cfg, "router_n_heads", 1),
-    )
-
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
     router_div = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
 
-    model_router, router = train_router_experiments(
-        cfg=cfg,
-        model=model_router,
-        router=router,
-        train_ds=train_ds,
-        val_ds=val_ds,
-        tokenizer=tokenizer,
-        metrics=experiment_metrics,
-        diversity=router_div,
-    )
+    if cfg.run_aux_baseline:
+        # Supervised MSE alternative to the policy-gradient router (ablation
+        # baseline) — same feature pipeline and top-k selection, different
+        # training objective. See rl_training.train_aux_baseline().
+        aux_net = build_router(
+            d_input=get_router_feature_dim(cfg, model_router.block),
+            arch="auxnet",
+            d_hidden=cfg.aux_net_hidden,
+        )
+        model_router, _ = train_aux_baseline(
+            cfg=cfg,
+            model=model_router,
+            aux_net=aux_net,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            tokenizer=tokenizer,
+            metrics=experiment_metrics,
+            diversity=router_div,
+        )
+    else:
+        router = build_router(
+            d_input=get_router_feature_dim(cfg, model_router.block),
+            arch=cfg.router_architecture,
+            d_k=128,
+            n_heads=getattr(cfg, "router_n_heads", 1),
+        )
+        model_router, router = train_router_experiments(
+            cfg=cfg,
+            model=model_router,
+            router=router,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            tokenizer=tokenizer,
+            metrics=experiment_metrics,
+            diversity=router_div,
+        )
 
     experiment_metrics.save(f"{cfg.save_dir}/{cfg.experiment_name}.json")
 

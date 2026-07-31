@@ -1,8 +1,8 @@
 """
 Advanced RL-based training loops for curriculum learning experiments.
 
-This is the experiment-grade router training loop used by experiments.py
-(ablation studies) and compare.py (single runs with all variants enabled).
+This is the experiment-grade router training loop used by parallel_experiments.py
+/ utils/experiment_worker.py (ablation studies, one subprocess per config).
 
 Key features over the reference loop in training.py:
   - Three policy gradient algorithms: REINFORCE, GRPO, PPO
@@ -772,6 +772,12 @@ def train_router_experiments(
 
     total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
     global_step = 0
+    # Tokens fed to the LM so far. TokenizedCorpus yields fixed-length windows
+    # (block tokens, no padding — see data.py), so this is just
+    # X_sel.numel() accumulated each step; no tokenizer call needed.
+    # Multiplied by world_size since only rank 0 logs but every rank processes
+    # its own equally-sized shard each step under DDP.
+    total_tokens_seen = 0
 
     # Feature cache: None until first rebuild (never built during epoch 0)
     feature_cache: torch.Tensor | None = None
@@ -882,6 +888,7 @@ def train_router_experiments(
             Y_sel = Y[sel_idx]  # [B, L]
             selected_domains = [domains[i] for i in sel_idx.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx.tolist()]
+            total_tokens_seen += X_sel.numel() * cfg.world_size
 
             # --- GREATS ghost-gradient scoring (before the real LM update: a separate
             # scoring backward on X_sel/Y_sel against the fixed val batch, discarded
@@ -1065,6 +1072,7 @@ def train_router_experiments(
                     "entropy": -entropy.item(),  # entropy is -H; negate to log positive H
                     "avg_reward": reward.mean().item(),
                     "curriculum_strength": curriculum_strength,
+                    "tokens_seen": total_tokens_seen,
                     "temperature": current_temp,
                     "lambda_ent": current_lambda_ent,
                     "feat_time_ms": total_feat_time / cfg.log_every * 1000,
@@ -1138,7 +1146,6 @@ def _avg_epoch_time(metrics: MetricsTracker) -> float | None:
     relevant = times[1:] if len(times) > 1 else times
     return sum(relevant) / len(relevant)
 
-
 def train_aux_baseline(
     cfg: ExperimentConfig,
     model: TinyGPT,
@@ -1187,6 +1194,7 @@ def train_aux_baseline(
 
     total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
     global_step = 0
+    total_tokens_seen = 0
 
     for epoch in range(cfg.epochs):
         epoch_start = time.perf_counter()
@@ -1228,6 +1236,7 @@ def train_aux_baseline(
             feats_sel = feats[sel_idx_local]
             selected_diffs   = [diffs[i] for i in sel_idx_local.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
+            total_tokens_seen += X_sel.numel() * cfg.world_size
 
             # --- Compute actual improvement ---
             with torch.no_grad():
@@ -1267,6 +1276,7 @@ def train_aux_baseline(
                     loss_aux=loss_aux.item(),
                     avg_improvement=actual_improvement.mean().item(),
                     curriculum_strength=1.0 - training_progress,
+                    tokens_seen=total_tokens_seen,
                     **div_metrics,
                 )
                 print(

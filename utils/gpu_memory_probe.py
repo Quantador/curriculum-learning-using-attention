@@ -34,7 +34,7 @@ from data import get_tokenizer
 from models.model import TinyGPT
 from models.router import build_router, get_router_feature_dim
 from utils.metrics import MetricsTracker, DiversityTracker
-from rl_training import train_router_experiments
+from rl_training import train_router_experiments, train_aux_baseline
 from utils.shared_dataset import load_dataset_cache
 
 
@@ -61,27 +61,43 @@ def main() -> None:
     )
 
     model = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=probe_cfg)
-    router = build_router(
-        d_input=get_router_feature_dim(probe_cfg, model.block),
-        arch=probe_cfg.router_architecture,
-        d_k=128,
-        n_heads=getattr(probe_cfg, "router_n_heads", 1),
-    )
-
     metrics = MetricsTracker(f"probe_{probe_cfg.experiment_name}", use_wandb=False)
     diversity = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
 
     torch.cuda.reset_peak_memory_stats()
-    train_router_experiments(
-        cfg=probe_cfg,
-        model=model,
-        router=router,
-        train_ds=train_ds,
-        val_ds=val_ds,
-        tokenizer=tokenizer,
-        metrics=metrics,
-        diversity=diversity,
-    )
+    if probe_cfg.run_aux_baseline:
+        aux_net = build_router(
+            d_input=get_router_feature_dim(probe_cfg, model.block),
+            arch="auxnet",
+            d_hidden=probe_cfg.aux_net_hidden,
+        )
+        train_aux_baseline(
+            cfg=probe_cfg,
+            model=model,
+            aux_net=aux_net,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            tokenizer=tokenizer,
+            metrics=metrics,
+            diversity=diversity,
+        )
+    else:
+        router = build_router(
+            d_input=get_router_feature_dim(probe_cfg, model.block),
+            arch=probe_cfg.router_architecture,
+            d_k=128,
+            n_heads=getattr(probe_cfg, "router_n_heads", 1),
+        )
+        train_router_experiments(
+            cfg=probe_cfg,
+            model=model,
+            router=router,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            tokenizer=tokenizer,
+            metrics=metrics,
+            diversity=diversity,
+        )
     peak = torch.cuda.max_memory_allocated()
     print(f"PROBE_PEAK_BYTES={peak}")
 

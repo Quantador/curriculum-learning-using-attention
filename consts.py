@@ -86,14 +86,12 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
 
     # Feature caching
     "feature_cache_epochs": (0, [1, 2]),
-    "use_original_sequence": (False, [True])
+    "use_original_sequence": (False, [True]),
 }
 # New experiments added for NeurIPS:
 #   1. Multi-head attention router (n_heads = 2 and 4)
 #   2. Harder easy datasets (WikiText, Children-Stories)
 #   3. Harder hard datasets (scientific papers, ML-ArXiv, FineWeb-Edu)
-# Note: single-dataset mode and aux-net baseline use a different training loop
-# and must be run via compare.py with use_single_dataset / run_aux_baseline.
 ADDITIONAL_EXPERIMENTS_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "router_n_heads": (1, [2, 4]),
     "easy_dataset": (
