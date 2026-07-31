@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -60,6 +61,11 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
     router_div = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
+
+    # Wall-clock time for the whole training call, uniform across all four
+    # training loops below -- so runs can be compared on wall-clock time
+    # later, not just final ppl (see MetricsTracker.save()'s "total_time_s").
+    run_start = time.perf_counter()
 
     if cfg.run_aux_baseline:
         # Supervised MSE alternative to the policy-gradient router (ablation
@@ -112,6 +118,10 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
             metrics=experiment_metrics,
             diversity=router_div,
         )
+
+    total_time_s = time.perf_counter() - run_start
+    experiment_metrics.log(total_time_s=total_time_s)
+    print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
 
     experiment_metrics.save(f"{cfg.save_dir}/{cfg.experiment_name}.json")
 

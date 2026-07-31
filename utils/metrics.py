@@ -60,6 +60,14 @@ class MetricsTracker:
         if not vals:
             return None
         return vals[-1]
+
+    def get_total_time(self) -> Optional[float]:
+        """Total wall-clock seconds for the run (logged once, see
+        utils/experiment_worker.py's total_time_s)."""
+        vals = self.history.get("total_time_s")
+        if not vals:
+            return None
+        return vals[-1]
     
     def load(path: str | Path) -> MetricsTracker:
         """

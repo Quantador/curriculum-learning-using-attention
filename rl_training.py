@@ -1337,3 +1337,17 @@ def compare_runs_experiments(
         print("\n=== Speed (avg epoch time, excl. epoch 0) ===")
         print(f"Router     : {router_time:.1f}s / epoch")
         print(f"Experiment : {experiment_time:.1f}s / epoch  ({speedup:.2f}x speedup, {time_saved:.1f}% faster)")
+
+    base_total_time = baseline_metrics.get_total_time()
+    router_total_time = router_metrics.get_total_time()
+    experiment_total_time = experiment_metrics.get_total_time()
+
+    if base_total_time is not None or router_total_time is not None or experiment_total_time is not None:
+        print("\n=== Total run time ===")
+        for label, total_time in (
+            ("Baseline", base_total_time),
+            ("Router", router_total_time),
+            ("Experiment", experiment_total_time),
+        ):
+            if total_time is not None:
+                print(f"{label:<10} : {total_time:.1f}s ({total_time / 3600:.2f}h)")
