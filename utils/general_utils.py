@@ -47,11 +47,17 @@ def dump_config(cfg: ExperimentConfig, path: Path) -> None:
 def memory_signature(cfg: ExperimentConfig) -> Tuple[Any, ...]:
     """Fields that plausibly change GPU memory use. Configs sharing a
     signature are assumed to need the same amount of GPU memory, so we only
-    probe once per signature instead of once per config."""
+    probe once per signature instead of once per config.
+
+    Uses the *effective* LM batch size, not the raw cfg.batch: run_random_pool_baseline
+    widens the selected batch to cfg.pool at runtime (see utils/experiment_worker.py),
+    so probing it under cfg.batch would understate its real peak memory and risk an
+    OOM once the scheduler packs it alongside other jobs."""
+    effective_batch = cfg.pool if cfg.run_random_pool_baseline else cfg.batch
     return (
         cfg.model_type, cfg.hf_model_name,
         cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.n_chunks,
-        cfg.batch, cfg.block, cfg.pool_mult,
+        effective_batch, cfg.block, cfg.pool_mult,
         cfg.training_algorithm, cfg.ppo_epochs, cfg.grpo_group_size,
         cfg.router_architecture, cfg.router_n_heads,
         cfg.enable_text_hierarchical, cfg.hierarchical_representation, cfg.hierarchical_layer_index,

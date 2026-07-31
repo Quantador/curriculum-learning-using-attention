@@ -96,19 +96,23 @@ def generate_experiment_configs(
     training_algorithm yields two configs: one with 'grpo', one with
     'reinforce', both with all other fields at baseline values.
 
-    Also always includes (unless include_baseline=False) an 'aux_baseline' run:
-    the supervised MSE alternative to the policy-gradient router (see
-    rl_training.train_aux_baseline()), on the same baseline_values as every
-    other reference run. It's a fixed reference point, not one of the ablated
-    fields — it doesn't get its own EXPERIMENTAL_FIELDS entry, so it always
-    rides along with every sweep instead of only appearing when someone
-    happens to select it with --field.
+    Also always includes (unless include_baseline=False) three fixed reference
+    runs, non-router controls that every sweep should be judged against:
+      - 'baseline':             plain baseline_values, RL router as usual.
+      - 'aux_baseline':         supervised MSE alternative to the router
+                                (rl_training.train_aux_baseline()).
+      - 'random_batch_baseline': uniform random cfg.batch-sized selection,
+                                no router/aux_net (training.train_baseline()).
+      - 'random_pool_baseline':  same, but selecting cfg.pool samples (the
+                                router's whole candidate pool, unfiltered).
+    None of these are ablated EXPERIMENTAL_FIELDS entries — they're fixed
+    reference points that ride along with every sweep instead of only
+    appearing when someone happens to select them with --field.
 
     Args:
         base_cfg:            Starting config (defaults to ExperimentConfig()).
         experimental_fields: {field: (baseline, [alternatives])} mapping.
-        include_baseline:    Whether to prepend the baseline + aux_baseline
-                             reference configs first.
+        include_baseline:    Whether to prepend the reference configs first.
 
     Returns a list of ExperimentConfig with descriptive experiment_name fields.
     """
@@ -123,24 +127,24 @@ def generate_experiment_configs(
     # Get baseline values
     baseline_values = {field: values[0] for field, values in experimental_fields.items()}
 
-    # Optionally add baseline + aux_baseline reference experiments
+    # Optionally add the fixed reference experiments (router baseline +
+    # non-router controls), each identical to baseline_values except for the
+    # one flag that switches training loop.
     if include_baseline:
-        baseline_cfg = replace(
-            base_cfg,
-            experiment_name="baseline",
-            save_dir="results/baseline",
-            **baseline_values
-        )
-        configs.append(baseline_cfg)
-
-        aux_baseline_cfg = replace(
-            base_cfg,
-            experiment_name="aux_baseline",
-            save_dir="results/aux_baseline",
-            run_aux_baseline=True,
-            **baseline_values
-        )
-        configs.append(aux_baseline_cfg)
+        reference_overrides = {
+            "baseline": {},
+            "aux_baseline": {"run_aux_baseline": True},
+            "random_batch_baseline": {"run_random_batch_baseline": True},
+            "random_pool_baseline": {"run_random_pool_baseline": True},
+        }
+        for name, overrides in reference_overrides.items():
+            configs.append(replace(
+                base_cfg,
+                experiment_name=name,
+                save_dir=f"results/{name}",
+                **baseline_values,
+                **overrides,
+            ))
 
     # Generate one experiment per alternative value (one-factor-at-a-time)
     for field_name, (_, alternatives) in experimental_fields.items():

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import argparse
 import sys
-import os 
+import os
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,6 +22,7 @@ from metrics import MetricsTracker
 from shared_dataset import load_dataset_cache
 from models.router import build_router, get_router_feature_dim
 from rl_training import train_router_experiments, train_aux_baseline, compare_runs_experiments
+from training import train_baseline
 from models.model import TinyGPT
 from metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
@@ -47,6 +49,8 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     print(f"  temp_schedule: {cfg.temp_schedule}")
     print(f"  entropy_schedule: {cfg.entropy_schedule}")
     print(f"  run_aux_baseline: {cfg.run_aux_baseline}")
+    print(f"  run_random_batch_baseline: {cfg.run_random_batch_baseline}")
+    print(f"  run_random_pool_baseline: {cfg.run_random_pool_baseline}")
 
     set_seed(cfg.seed)
 
@@ -73,6 +77,21 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
             train_ds=train_ds,
             val_ds=val_ds,
             tokenizer=tokenizer,
+            metrics=experiment_metrics,
+            diversity=router_div,
+        )
+    elif cfg.run_random_batch_baseline or cfg.run_random_pool_baseline:
+        # Non-learned controls: uniform random selection, no router/aux_net.
+        # training.train_baseline() already draws cfg.batch random samples
+        # from a cfg.pool-sized window each step, so the "random batch the
+        # size of the pool" variant is just that same function with
+        # batch widened to pool via replace() -- no new training loop needed.
+        random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, batch=cfg.pool)
+        model_router = train_baseline(
+            cfg=random_cfg,
+            model=model_router,
+            train_ds=train_ds,
+            val_ds=val_ds,
             metrics=experiment_metrics,
             diversity=router_div,
         )

@@ -35,6 +35,7 @@ from models.model import TinyGPT
 from models.router import build_router, get_router_feature_dim
 from utils.metrics import MetricsTracker, DiversityTracker
 from rl_training import train_router_experiments, train_aux_baseline
+from training import train_baseline
 from utils.shared_dataset import load_dataset_cache
 
 
@@ -78,6 +79,16 @@ def main() -> None:
             train_ds=train_ds,
             val_ds=val_ds,
             tokenizer=tokenizer,
+            metrics=metrics,
+            diversity=diversity,
+        )
+    elif probe_cfg.run_random_batch_baseline or probe_cfg.run_random_pool_baseline:
+        random_cfg = probe_cfg if probe_cfg.run_random_batch_baseline else replace(probe_cfg, batch=probe_cfg.pool)
+        train_baseline(
+            cfg=random_cfg,
+            model=model,
+            train_ds=train_ds,
+            val_ds=val_ds,
             metrics=metrics,
             diversity=diversity,
         )

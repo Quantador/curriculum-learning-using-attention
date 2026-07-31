@@ -349,6 +349,14 @@ class ExperimentConfig(Config):
     run_aux_baseline: bool = False
     aux_net_hidden: int = 256
 
+    # Non-learned control baselines (training.train_baseline: uniform random
+    # selection, no router/aux_net at all). run_random_batch_baseline draws
+    # cfg.batch random samples per step (same shape as the router's selected
+    # batch); run_random_pool_baseline draws cfg.pool (the router's full
+    # candidate pool, unfiltered) -- see utils/experiment_worker.py.
+    run_random_batch_baseline: bool = False
+    run_random_pool_baseline: bool = False
+
 
 def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> ExperimentConfig:
     """
