@@ -81,7 +81,7 @@ def get_scheduled_value(
     schedule: str,
     initial: float,
     minimum: float,
-    progress: float,  # 0.0 to 1.0
+    progress: float,  # 0.0 to 1.0 , usually calculated from how many steps have passed.
     step: int = 0,
     cycle_length: int = 1000,
 ) -> float:
@@ -805,7 +805,9 @@ def train_router_experiments(
         # Each iteration implements the core curriculum learning cycle:
         #   1. Sample M = cfg.pool candidate indices (pre-shuffled each epoch).
         #   2. Extract router features for all M samples.
-        #   3. Router scores pool → softmax(/ temp) → select k = cfg.batch samples.
+        #   3. Router scores pool → softmax(/ temp) → select k samples (k =
+        #      cfg.batch, or an annealed fraction of the pool when
+        #      cfg.use_curriculum_ratio_schedule is on).
         #   4. LM forward + backward on selected batch.
         #   5. Compute reward signal (loss improvement, gradient norm, etc.).
         #   6. Router RL update (REINFORCE / GRPO / PPO + entropy regularisation).
@@ -831,6 +833,19 @@ def train_router_experiments(
                     cfg.entropy_schedule, cfg.lambda_ent, cfg.lambda_ent_min, progress,
                     step=global_step, cycle_length=cfg.entropy_cycle_length,
                 )
+
+            # Curriculum-ratio schedule: shrink the selected batch from a
+            # weakly-selective fraction of the pool down to a strongly-selective
+            # one over training, instead of a fixed cfg.batch. See config.py's
+            # use_curriculum_ratio_schedule docstring.
+            if cfg.use_curriculum_ratio_schedule:
+                current_ratio = get_scheduled_value(
+                    cfg.curriculum_ratio_schedule, cfg.curriculum_ratio_initial, cfg.curriculum_ratio_min,
+                    progress, step=global_step, cycle_length=cfg.entropy_cycle_length,
+                )
+                select_k = max(1, min(len(pool_indices), round(current_ratio * len(pool_indices))))
+            else:
+                select_k = cfg.batch
 
             batch = [train_ds[i] for i in pool_indices]
             xs, ys, domains = zip(*batch)
@@ -875,7 +890,7 @@ def train_router_experiments(
             # --- Sample selection based on strategy ---
             sel_idx = select_samples(
                 probs=probs,
-                k=cfg.batch,
+                k=select_k,
                 strategy=cfg.selection_strategy,
                 epsilon=cfg.epsilon_greedy,
             )
@@ -1075,6 +1090,7 @@ def train_router_experiments(
                     "tokens_seen": total_tokens_seen,
                     "temperature": current_temp,
                     "lambda_ent": current_lambda_ent,
+                    "select_k": select_k,
                     "feat_time_ms": total_feat_time / cfg.log_every * 1000,
                     **diversity.get_metrics(),
                 }

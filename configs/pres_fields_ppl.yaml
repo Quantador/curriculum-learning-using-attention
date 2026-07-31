@@ -1,4 +1,4 @@
-experiment_name: ppl_comparison_presentation
+experiment_name: ppl_comparison_presentation_2
 epochs: 10
 batch: 16
 pool_mult: 10

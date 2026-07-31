@@ -114,6 +114,15 @@ class Config:
                     f"{self.n_layers})."
                 )
 
+        if self.use_curriculum_ratio_schedule:
+            if not (0.0 < self.curriculum_ratio_min <= self.curriculum_ratio_initial <= 1.0):
+                raise ValueError(
+                    "use_curriculum_ratio_schedule requires "
+                    "0 < curriculum_ratio_min <= curriculum_ratio_initial <= 1 "
+                    f"(got min={self.curriculum_ratio_min}, "
+                    f"initial={self.curriculum_ratio_initial})."
+                )
+
     @property
     def pool(self) -> int:
         return self.pool_mult * self.batch
@@ -290,6 +299,19 @@ class ExperimentConfig(Config):
     # Selection strategy
     selection_strategy: str = "topk"  # options: topk, sample, epsilon_greedy
     epsilon_greedy: float = 0.1  # epsilon for epsilon_greedy selection
+
+    # Curriculum-ratio schedule: instead of a fixed cfg.batch, the number of
+    # samples selected into the training batch each step is
+    # round(ratio * pool_size), with `ratio` annealed from
+    # curriculum_ratio_initial down to curriculum_ratio_min over training
+    # progress. Starts weakly selective (rate/accept most of the pool) and
+    # tightens into a strongly selective curriculum (only the router's
+    # top few percent) by the end of training. cfg.batch is unused while
+    # this is on -- see train_router_experiments() in rl_training.py.
+    use_curriculum_ratio_schedule: bool = False
+    curriculum_ratio_schedule: str = "linear_decay"  # same vocabulary as temp_schedule
+    curriculum_ratio_initial: float = 0.9  # fraction of pool selected at progress=0
+    curriculum_ratio_min: float = 0.1  # fraction of pool selected at progress=1
 
     # Baseline for variance reduction (REINFORCE)
     baseline_type: str = "batch_mean"  # options: batch_mean, moving_avg, none
