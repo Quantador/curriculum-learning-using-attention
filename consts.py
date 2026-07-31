@@ -154,6 +154,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "loss_improvement_logging": LOSS_IMPROVEMENT_LOGGING,
     "compare_use_original_sequence": COMPARE_USE_ORIGINAL_SEQUENCE,
     "compare-use-original-sequence": COMPARE_USE_ORIGINAL_SEQUENCE,  # alias
+    "transformer-layer-ablation": COMPARE_TRANSFORMER_LAYER,
+    "transformer_layer_ablation": COMPARE_TRANSFORMER_LAYER
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")
