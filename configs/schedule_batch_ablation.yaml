@@ -1,0 +1,12 @@
+experiment_name: schedule_batch_ablation
+epochs: 10
+batch: 16
+pool_mult: 8 # Use 8 for 128 batch size 
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 200000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+use_curriculum_ratio_schedule: true
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7 , 0.3]

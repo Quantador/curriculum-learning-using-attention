@@ -143,6 +143,10 @@ COMPARE_USE_ORIGINAL_SEQUENCE: Dict[str, tuple[Any, List[Any]]] = {
 COMPARE_TRANSFORMER_LAYER: Dict[str, tuple[Any, List[Any]]] = {
     "hierarchical_layer_index": (0, [2, 4, 6, 8, 10, 12])
 }
+
+SCHEDULE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
+    "curriculum_ratio_schedule": ("linear_decay", ["cosine_decay", "exponential_decay", "cyclic"])
+}
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -155,7 +159,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "compare_use_original_sequence": COMPARE_USE_ORIGINAL_SEQUENCE,
     "compare-use-original-sequence": COMPARE_USE_ORIGINAL_SEQUENCE,  # alias
     "transformer-layer-ablation": COMPARE_TRANSFORMER_LAYER,
-    "transformer_layer_ablation": COMPARE_TRANSFORMER_LAYER
+    "transformer_layer_ablation": COMPARE_TRANSFORMER_LAYER,
+    "schedule_ablation": SCHEDULE_ABLATION
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")
