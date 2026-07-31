@@ -123,6 +123,12 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     experiment_metrics.log(total_time_s=total_time_s)
     print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
 
+    # The training loops above intentionally leave their wandb run open so
+    # total_time_s lands in it too; this closes it once everything's logged.
+    if cfg.use_wandb and cfg.rank == 0:
+        import wandb
+        wandb.finish()
+
     experiment_metrics.save(f"{cfg.save_dir}/{cfg.experiment_name}.json")
 
     print("\n=== Comparing runs ===")

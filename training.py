@@ -257,8 +257,9 @@ def train_baseline(
         if cfg.world_size > 1:
             dist.barrier()
 
-    if cfg.use_wandb and cfg.rank == 0:
-        wandb.finish()
+    # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
+    # which logs a couple more summary metrics (e.g. total_time_s) into this
+    # same run before closing it.
 
     return model
 

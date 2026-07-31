@@ -42,11 +42,14 @@ class MetricsTracker:
         """Log scalar metrics to history and optionally to W&B.
 
         Non-numeric values are silently skipped (e.g. epoch strings).
+        Skips the W&B call once wandb.run is None -- e.g. after the training
+        loop's own wandb.finish() has already run but a caller still logs a
+        post-hoc summary metric (total_time_s) into this same tracker.
         """
         for k, v in kwargs.items():
             if isinstance(v, (int, float)):
                 self.history[k].append(float(v))
-        if self.use_wandb:
+        if self.use_wandb and wandb.run is not None:
             wandb.log(kwargs)
 
     def save(self, path: str | Path) -> None:

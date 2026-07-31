@@ -1131,9 +1131,9 @@ def train_router_experiments(
             + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
         )
 
-    if cfg.use_wandb and cfg.rank == 0:
-        import wandb
-        wandb.finish()
+    # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
+    # which logs a couple more summary metrics (e.g. total_time_s) into this
+    # same run before closing it.
 
     return model, router
 
@@ -1299,9 +1299,9 @@ def train_aux_baseline(
             f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
         )
 
-    if cfg.use_wandb:
-        import wandb
-        wandb.finish()
+    # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
+    # which logs a couple more summary metrics (e.g. total_time_s) into this
+    # same run before closing it.
 
     return model, aux_net
 
