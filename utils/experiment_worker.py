@@ -92,7 +92,12 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         # from a cfg.pool-sized window each step, so the "random batch the
         # size of the pool" variant is just that same function with
         # batch widened to pool via replace() -- no new training loop needed.
-        random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, batch=cfg.pool)
+        # pool_mult=1 too: cfg.pool is a property (pool_mult * batch), so
+        # widening batch alone would silently re-inflate pool by another
+        # factor of pool_mult, shrinking the window to 1/pool_mult of the
+        # dataset and making train_baseline's random.sample(window, batch)
+        # discard most of each window instead of training on all of it.
+        random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, batch=cfg.pool, pool_mult=1)
         model_router = train_baseline(
             cfg=random_cfg,
             model=model_router,
