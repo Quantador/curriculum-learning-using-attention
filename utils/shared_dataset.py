@@ -16,7 +16,7 @@ from pathlib import Path
 
 from config import ExperimentConfig
 from consts import DATASET_CACHE_DIR
-from data import TokenizedCorpus, discover_domain_files
+from data import TokenizedCorpus, discover_domain_files, get_tokenizer
 from tokenization import MANIFEST_NAME, read_manifest
 
 
@@ -147,4 +147,11 @@ def load_dataset_cache(
         f"val: {len(val_ds):,} windows | block={cfg.block} | "
         f"domains: {', '.join(domains)}"
     )
+
+    if cfg.sentence_embedder_model:
+        from utils.sentence_embedder import build_sentence_embeddings
+
+        tokenizer = get_tokenizer(cfg.tokenizer_name)
+        train_ds.embeddings = build_sentence_embeddings(train_ds, cfg, tokenizer)
+
     return train_ds, val_ds

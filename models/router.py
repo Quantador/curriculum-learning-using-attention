@@ -94,10 +94,13 @@ def extract_router_features(
     cfg: ExperimentConfig,
     pad_token_id: int,
     vocab_size: int,
-    external_emb: Optional[torch.Tensor] = None,
+    external_embedding: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Build the feature vector that the router scores each candidate sample with.
+    Build the final feature vector that the router scores each candidate sample
+    with. Everything the router sees is concatenated in here -- callers pass
+    in raw ingredients (X, external_embedding) and get back the finished [B, F]
+    tensor; no further concatenation should happen on the outside.
 
     Concatenates up to three optional feature groups in this order:
       1. Hierarchical hidden states  [B, n_chunks * d_model]
@@ -106,8 +109,11 @@ def extract_router_features(
       2. Text statistics  [B, 4]
          Enabled by cfg.enable_text_stat. Cheap surface features: fill ratio,
          lexical diversity, normalised mean/std token id.
-      3. Pre-computed external embeddings  [B, external_embedding_dim]
-         Used when cfg.use_external_embeddings=True and external_emb is provided.
+      3. External embedding  [B, D]
+         Passed in by the caller as `external_embedding` -- e.g. the current
+         pool's rows of TokenizedCorpus.embeddings, populated via
+         cfg.use_external_embeddings or cfg.sentence_embedder_model. Required
+         (must be non-None) whenever either of those flags is set.
 
     If no group is enabled, returns random features as a fallback
     (router learns nothing — intended only for sanity-check baselines).
@@ -130,13 +136,17 @@ def extract_router_features(
         )
         features.append(stats)
 
-    use_external_embbedings = getattr(cfg, "use_external_embeddings", False)
-    if use_external_embbedings and external_emb is None:
-        raise ValueError("Make sure there are external embeddings to be used "
-        "                   if use_external_embeddings is set to True")
-    
-    if getattr(cfg, "use_external_embeddings", False) and external_emb is not None:
-        features.append(external_emb)  # [B, external_embedding_dim]
+    needs_external = getattr(cfg, "use_external_embeddings", False) or bool(
+        getattr(cfg, "sentence_embedder_model", "")
+    )
+    if needs_external and external_embedding is None:
+        raise ValueError(
+            "cfg.use_external_embeddings or cfg.sentence_embedder_model is set, "
+            "so extract_router_features() requires external_embedding (e.g. the "
+            "current pool's TokenizedCorpus.embeddings rows)."
+        )
+    if external_embedding is not None:
+        features.append(external_embedding)  # [B, D]
 
     if not features:
         print("Warning: No features enabled for router; returning random features.")
@@ -160,10 +170,13 @@ def get_router_feature_dim(cfg: ExperimentConfig, sequence_size: int) -> int:
     extract_router_features().
     """
     if cfg.use_original_sequence:
-        return sequence_size 
-    full_dim = cfg.n_chunks * cfg.d_model + 4
-    if not cfg.enable_text_hierarchical and not cfg.enable_text_stat:
-        return full_dim
+        return sequence_size
+    has_precomputed_emb = getattr(cfg, "use_external_embeddings", False) or bool(
+        getattr(cfg, "sentence_embedder_model", "")
+    )
+    if not cfg.enable_text_hierarchical and not cfg.enable_text_stat and not has_precomputed_emb:
+        # Matches the random-feature fallback in extract_router_features().
+        return cfg.n_chunks * cfg.d_model + 4
     dim = 0
     if cfg.enable_text_hierarchical:
         dim += cfg.n_chunks * cfg.d_model
@@ -171,6 +184,8 @@ def get_router_feature_dim(cfg: ExperimentConfig, sequence_size: int) -> int:
         dim += 4
     if getattr(cfg, "use_external_embeddings", False):
         dim += getattr(cfg, "external_embedding_dim", 768)
+    if getattr(cfg, "sentence_embedder_model", ""):
+        dim += getattr(cfg, "sentence_embedder_dim", 768)
     return dim
 
 

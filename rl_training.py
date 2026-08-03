@@ -855,8 +855,15 @@ def train_router_experiments(
 
             # --- Router features over the full pool ---
             feat_start = time.perf_counter()
+            external_embedding = None
+            if train_ds.embeddings is not None:
+                external_embedding = torch.stack(
+                    [train_ds.embeddings[i] for i in pool_indices]
+                ).to(cfg.device)
+
             if feature_cache is not None:
                 hidden_feats = feature_cache[pool_indices].to(cfg.device).float()
+                parts = [hidden_feats]
                 if cfg.enable_text_stat:
                     stats = compute_text_statistics(
                         X,
@@ -864,9 +871,10 @@ def train_router_experiments(
                         vocab_size=tokenizer.vocab_size,
                         block=cfg.block,
                     )
-                    feats = torch.cat([hidden_feats, stats], dim=1)
-                else:
-                    feats = hidden_feats
+                    parts.append(stats)
+                if external_embedding is not None:
+                    parts.append(external_embedding)
+                feats = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
             else:
                 feats = extract_router_features(
                     model=model,
@@ -874,15 +882,9 @@ def train_router_experiments(
                     cfg=cfg,
                     pad_token_id=tokenizer.pad_token_id,
                     vocab_size=tokenizer.vocab_size,
+                    external_embedding=external_embedding,
                 )  # [M, F]
             total_feat_time += time.perf_counter() - feat_start
-
-            # Append pre-computed external embeddings when available.
-            if train_ds.embeddings is not None:
-                pool_embs = torch.stack(
-                    [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
-                feats = torch.cat([feats, pool_embs], dim=1)
 
             scores = router(feats)  # [M]
             probs = torch.softmax(scores / current_temp, dim=0)  # [M]
@@ -1227,19 +1229,20 @@ def train_aux_baseline(
             Y = torch.stack(ys).to(cfg.device)  # [M, L]
 
             # --- Feature extraction ---
+            external_embedding = None
+            if train_ds.embeddings is not None:
+                external_embedding = torch.stack(
+                    [train_ds.embeddings[i] for i in pool_indices]
+                ).to(cfg.device)
+
             feats = extract_router_features(
                 model=model,
                 X=X,
                 cfg=cfg,
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=tokenizer.vocab_size,
+                external_embedding=external_embedding,
             )  # [M, F]
-            
-            if train_ds.embeddings is not None:
-                pool_embs = torch.stack(
-                    [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
-                feats = torch.cat([feats, pool_embs], dim=1)
 
             # --- Selection: top-k by predicted improvement ---
             with torch.no_grad():

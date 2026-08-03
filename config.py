@@ -252,7 +252,24 @@ class ExperimentConfig(Config):
     use_external_embeddings: bool = False
     external_embeddings_dataset: str = "epfml/FineWeb-HQ"
     external_embedding_dim: int = 768
-    
+
+    # Sentence-embedder router features: a frozen sentence-transformers model
+    # encodes each training window's decoded text once, up front (see
+    # utils.sentence_embedder.build_sentence_embeddings), and the result is
+    # concatenated onto the router's other features every step via
+    # TokenizedCorpus.embeddings -- same plug point train_router_experiments /
+    # train_aux_baseline (rl_training.py) already use for use_external_embeddings
+    # above, which this option is independent of.
+    # Empty model name = disabled.
+    sentence_embedder_model: str = ""
+    sentence_embedder_dim: int = 768
+    sentence_embedder_batch_size: int = 64
+    # Optional .pt path to persist/reload the embedding cache. Safe to reuse
+    # across runs and even rebuild indefinitely: the encoder is frozen, so a
+    # window's embedding never changes, unlike the periodically-rebuilt
+    # hierarchical feature cache (rl_training.build_feature_cache).
+    sentence_embedder_cache_path: str = ""
+
     # Router architecture
     router_architecture: str = "attention"  # options: attention, linear, mlp
     router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter

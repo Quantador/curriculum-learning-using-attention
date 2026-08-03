@@ -134,8 +134,13 @@ class TokenizedCorpus(Dataset):
         if warm_cache:
             self._warm_cache()
 
-        # Pre-computed external embeddings are not supported by the datatrove
-        # path (see tokenization.plan_jobs); training code branches on this.
+        # Pre-computed per-window embeddings, concatenated onto router
+        # features by the training loops when set (they all branch on
+        # `train_ds.embeddings is not None`). None by default -- the
+        # use_external_embeddings dataset-column path is not supported by the
+        # datatrove path (see tokenization.plan_jobs). Populated after
+        # construction by utils.shared_dataset.load_dataset_cache() when
+        # cfg.sentence_embedder_model is set (see utils.sentence_embedder).
         self.embeddings = None
 
     def _warm_cache(self) -> None:

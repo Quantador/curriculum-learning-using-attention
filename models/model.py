@@ -23,8 +23,6 @@ Feature extraction utilities:
   compute_text_statistics()     — 4 cheap surface-level features: sequence fill
                                   ratio, lexical diversity, mean/std token id
   extract_hierarchical_hidden() — transformer hidden states, chunked & pooled
-  extract_hierarchical_features() — combines the above two (legacy helper used
-                                    by training.py's reference router loop)
 """
 
 from __future__ import annotations
@@ -373,26 +371,6 @@ def extract_hierarchical_hidden(
     h_reshaped = h.view(B, cfg.n_chunks, chunk_len, D)
     pooled = h_reshaped.mean(dim=2)          # [B, n_chunks, D]
     return pooled.reshape(B, cfg.n_chunks * D)
-
-
-def extract_hierarchical_features(
-    model: TinyGPT,
-    X: torch.Tensor,
-    cfg: Config,
-    pad_token_id: int,
-    vocab_size: int,
-) -> torch.Tensor:
-    # Original "full" features: hierarchical hidden + stats
-    pooled = extract_hierarchical_hidden(model, X, cfg)  # [B, n_chunks*D]
-    stats = compute_text_statistics(
-        X,
-        pad_token_id=pad_token_id,
-        vocab_size=vocab_size,
-        block=cfg.block,
-    )
-    print(f"{pooled.shape=}")
-    print(f"{stats.shape=}")
-    return torch.cat([pooled, stats], dim=1)
 
 
 
