@@ -201,6 +201,7 @@ def train_baseline(
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
 
     global_step = 0
+    total_tokens_seen = 0
     for epoch in range(cfg.epochs):
         idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
@@ -214,6 +215,7 @@ def train_baseline(
 
             X = torch.stack(xs).to(cfg.device)
             Y = torch.stack(ys).to(cfg.device)
+            total_tokens_seen += X.numel() * cfg.world_size
 
             opt.zero_grad()
             logits = model(X)
@@ -234,6 +236,7 @@ def train_baseline(
                     step=global_step,
                     loss_lm=loss.item(),
                     entropy=math.log(cfg.batch),
+                    tokens_seen=total_tokens_seen,
                     **div_metrics,
                 )
 
