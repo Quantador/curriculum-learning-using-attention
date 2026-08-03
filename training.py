@@ -260,6 +260,18 @@ def train_baseline(
         if cfg.world_size > 1:
             dist.barrier()
 
+    # --- Final per-domain perplexity, fully trained model ---
+    if cfg.rank == 0:
+        per_domain_ppl = evaluate_per_domain(model, val_ds, loss_fn, cfg)
+        metrics.log(
+            step=global_step,
+            **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+        )
+        print(
+            "[Final per-domain val perplexity] "
+            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+        )
+
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this
     # same run before closing it.
