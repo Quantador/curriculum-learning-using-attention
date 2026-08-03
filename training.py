@@ -225,27 +225,3 @@ def train_baseline(
     # same run before closing it.
 
     return model
-
-
-def compare_runs(
-    baseline_metrics: MetricsTracker,
-    router_metrics: MetricsTracker,
-    aux_metrics: Optional[MetricsTracker] = None,
-):
-    base_ppl   = baseline_metrics.get_final_ppl()
-    router_ppl = router_metrics.get_final_ppl()
-
-    if base_ppl is None or router_ppl is None:
-        print("Missing val_ppl in metrics; cannot compare.")
-        return
-
-    print("\n=== Comparison ===")
-    print(f"Baseline       val_ppl: {base_ppl:.1f}")
-    print(f"Router         val_ppl: {router_ppl:.1f}  "
-          f"({(base_ppl - router_ppl) / base_ppl * 100:.2f}% vs baseline)")
-
-    if aux_metrics is not None:
-        aux_ppl = aux_metrics.get_final_ppl()
-        if aux_ppl is not None:
-            print(f"Aux-net        val_ppl: {aux_ppl:.1f}  "
-                  f"({(base_ppl - aux_ppl) / base_ppl * 100:.2f}% vs baseline)")
