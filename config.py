@@ -162,7 +162,7 @@ class ExperimentConfig(Config):
     def __post_init__(self):
         super().__post_init__()
         if self.wandb_project is None:
-            self.wandb_project = f"curriculum-learning-{self.experiment_name}"
+            self.wandb_project = f"{self.experiment_name}"
         if self.save_dir is None:
             self.save_dir = f"results/{self.experiment_name}"
 
@@ -277,7 +277,7 @@ class ExperimentConfig(Config):
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
-    use_original_sequence: bool = True # This uses the original tokens sequence, not passed through the model. 
+    use_original_sequence: bool = False # This uses the original tokens sequence, not passed through the model. 
     
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo

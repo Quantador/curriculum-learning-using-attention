@@ -1,0 +1,17 @@
+experiment_name: sentence_embedder_ablation
+epochs: 10
+batch: 16
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 200000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+# Required: extract_router_features() returns the raw token sequence early
+# when this is true (its class default), bypassing every other feature group
+# -- including sentence_embedder_model -- so the ablation would otherwise be
+# a no-op.
+use_original_sequence: false
+sentence_embedder_dim: 768
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7 , 0.3]

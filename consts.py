@@ -147,6 +147,21 @@ COMPARE_TRANSFORMER_LAYER: Dict[str, tuple[Any, List[Any]]] = {
 SCHEDULE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
     "curriculum_ratio_schedule": ("linear_decay", ["cosine_decay", "exponential_decay", "cyclic"])
 }
+
+# "" = no sentence-embedder feature (router falls back to the base
+# hierarchical/stat features only). Every alternative below is a 768-dim
+# model, matching ExperimentConfig.sentence_embedder_dim's default -- so this
+# one-factor-at-a-time ablation never needs a second field to track the
+# embedding dimension per model (see utils/sentence_embedder.py).
+SENTENCE_EMBEDDER_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
+    "sentence_embedder_model": ("", [
+        "sentence-transformers/all-mpnet-base-v2",
+        "BAAI/bge-base-en-v1.5",
+        "thenlper/gte-base",
+        "intfloat/e5-base-v2",
+    ]),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -160,7 +175,9 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "compare-use-original-sequence": COMPARE_USE_ORIGINAL_SEQUENCE,  # alias
     "transformer-layer-ablation": COMPARE_TRANSFORMER_LAYER,
     "transformer_layer_ablation": COMPARE_TRANSFORMER_LAYER,
-    "schedule_ablation": SCHEDULE_ABLATION
+    "schedule_ablation": SCHEDULE_ABLATION,
+    "sentence_embedder_ablation": SENTENCE_EMBEDDER_ABLATION,
+    "sentence-embedder-ablation": SENTENCE_EMBEDDER_ABLATION,  # alias
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")
