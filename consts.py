@@ -162,6 +162,34 @@ SENTENCE_EMBEDDER_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
     ]),
 }
 
+# One-factor-at-a-time comparison of every distinct way extract_router_features()
+# (models/router.py) can build the router's input vector:
+#   - enable_text_hierarchical=False  -> drop the hierarchical hidden-state group,
+#                                         router sees only text stats
+#   - enable_text_stat=False          -> drop the cheap text-statistics group,
+#                                         router sees only the hierarchical group
+#   - hierarchical_representation:
+#       full      (baseline) -> final transformer hidden state
+#       embedder              -> token+positional embeddings only, no transformer layers
+#       layer                 -> hidden state after hierarchical_layer_index layers
+#                                 (base config below pins hierarchical_layer_index=6
+#                                 so this alternative is valid without touching that field)
+#   - use_original_sequence=True      -> bypass every feature group; router scores
+#                                         the raw token ids directly
+#   - sentence_embedder_model set     -> concatenate a frozen precomputed sentence
+#                                         embedding (only one representative model
+#                                         here; see SENTENCE_EMBEDDER_ABLATION above
+#                                         to compare models against each other)
+# use_external_embeddings (config.py) is intentionally excluded: it's rejected by
+# tokenization.py's datatrove path (NotImplementedError) and can't currently run.
+ROUTER_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
+    "enable_text_hierarchical": (True, [False]),
+    "enable_text_stat": (True, [False]),
+    "hierarchical_representation": ("full", ["embedder", "layer"]),
+    "use_original_sequence": (False, [True]),
+    "sentence_embedder_model": ("", ["intfloat/e5-base-v2"]),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -178,6 +206,7 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "schedule_ablation": SCHEDULE_ABLATION,
     "sentence_embedder_ablation": SENTENCE_EMBEDDER_ABLATION,
     "sentence-embedder-ablation": SENTENCE_EMBEDDER_ABLATION,  # alias
+    "router_feature_ablation": ROUTER_FEATURE_ABLATION,
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

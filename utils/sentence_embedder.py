@@ -78,10 +78,9 @@ def build_sentence_embeddings(
     batch_size = cfg.sentence_embedder_batch_size
     for start in tqdm(range(0, n_windows, batch_size), desc="Building sentence-embedder cache"):
         end = min(start + batch_size, n_windows)
-        texts = [
-            tokenizer.decode(train_ds[i][0], skip_special_tokens=True)
-            for i in range(start, end)
-        ]
+        texts = tokenizer.batch_decode(
+            [train_ds[i][0] for i in range(start, end)], skip_special_tokens=True
+        )
         embs = encoder.encode(
             texts, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False
         )

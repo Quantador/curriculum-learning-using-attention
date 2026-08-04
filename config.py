@@ -263,7 +263,10 @@ class ExperimentConfig(Config):
     # Empty model name = disabled.
     sentence_embedder_model: str = ""
     sentence_embedder_dim: int = 768
-    sentence_embedder_batch_size: int = 64
+    # These are small (100-400M param) encoders relative to a modern GPU, so
+    # this can go much higher than a training batch size would; 512 is a safe
+    # default and can be raised further on GPUs with more headroom.
+    sentence_embedder_batch_size: int = 512
     # Optional .pt path to persist/reload the embedding cache. Safe to reuse
     # across runs and even rebuild indefinitely: the encoder is frozen, so a
     # window's embedding never changes, unlike the periodically-rebuilt
@@ -419,16 +422,22 @@ def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> Exp
     with open(path) as f:
         overrides = yaml.safe_load(f) or {}
 
+    # experiment_name defaults to the YAML file's own name (without
+    # extension) so a run's name/save_dir/wandb_project track the config
+    # file used to launch it. An explicit experiment_name: key in the YAML
+    # still takes precedence over this default.
+    if "experiment_name" not in overrides:
+        overrides["experiment_name"] = os.path.splitext(os.path.basename(path))[0]
+
     # save_dir/wandb_project are lazily derived from experiment_name in
     # __post_init__, but only when still None; by this point cfg already has
     # them resolved to concrete strings (from the ExperimentConfig() default
-    # above, or from the caller-supplied cfg). If the YAML overrides
-    # experiment_name without also overriding these, force them back to None
-    # so __post_init__ re-derives from the new name instead of keeping the
-    # stale resolved value from the old one.
-    if "experiment_name" in overrides:
-        overrides.setdefault("save_dir", None)
-        overrides.setdefault("wandb_project", None)
+    # above, or from the caller-supplied cfg). Since experiment_name is now
+    # always being set (explicitly or via the filename default above), force
+    # both back to None so __post_init__ re-derives from the new name instead
+    # of keeping the stale resolved value from the old one.
+    overrides.setdefault("save_dir", None)
+    overrides.setdefault("wandb_project", None)
 
     valid_fields = {f.name for f in fields(cfg)}
     unknown = set(overrides) - valid_fields

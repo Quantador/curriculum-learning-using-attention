@@ -1,0 +1,13 @@
+epochs: 10
+batch: 16
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 200000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+use_original_sequence: false
+sentence_embedder_dim: 768
+sentence_embedder_model: "intfloat/e5-base-v2"
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7 , 0.3]

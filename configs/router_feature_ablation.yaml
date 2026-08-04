@@ -1,0 +1,21 @@
+epochs: 10
+batch: 16
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 200000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+# Baseline stays "full"; pinning the layer index here (valid for gpt2's 12
+# layers) lets the hierarchical_representation="layer" alternative in the
+# router_feature_ablation profile run without touching this field.
+hierarchical_representation: full
+hierarchical_layer_index: 6
+# Required: extract_router_features() returns the raw token sequence early
+# when this is true (its class default), bypassing every other feature group
+# -- so the ablation's use_original_sequence=True variant is meaningful only
+# because the baseline here is explicitly false.
+use_original_sequence: false
+sentence_embedder_dim: 768
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7, 0.3]
