@@ -134,8 +134,6 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         import wandb
         wandb.finish()
 
-    experiment_metrics.save(f"{cfg.save_dir}/{cfg.experiment_name}.json")
-
     print("\n=== Comparing runs ===")
     compare_runs_experiments(
         base_metrics,
