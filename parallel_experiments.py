@@ -53,6 +53,21 @@ Scheduling knobs (sweep modes only):
     --poll-interval S    Seconds between checks on running workers (default 5).
     --gpu INDEX          Physical GPU index to target (default 0).
 See EXPERIMENTS.md for the full CLI reference and field descriptions.
+
+DDP mode -- speed up ONE experiment across multiple GPUs instead of packing
+several experiments onto one, e.g. when a single config (large model) is the
+bottleneck rather than sweep breadth. Launch under torchrun instead of plain
+python; detected automatically from torchrun's WORLD_SIZE env var, no new
+flag needed:
+
+    torchrun --standalone --nproc-per-node=gpu parallel_experiments.py --profile final_presentation
+
+Every config in the sweep still runs, just sequentially instead of packed --
+each one trains across all GPUs in the process group via
+DistributedDataParallel (see run_ddp_sweep()), one persistent NCCL process
+group for the whole sweep. --max-parallel/--safety-margin/--gpu are ignored
+in this mode (no GPU-memory probing, no CUDA_VISIBLE_DEVICES targeting --
+GPU selection comes from torchrun's LOCAL_RANK).
 """
 from __future__ import annotations
 
@@ -69,15 +84,22 @@ from itertools import product
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import torch
+import torch.distributed as dist
+
 from config import ExperimentConfig, load_config_from_yaml
+from data import get_tokenizer
 
 from utils.shared_dataset import (
     DatasetCacheMissing,
     dataset_signature,
+    load_dataset_cache,
     require_dataset_cache,
 )
+from utils.distributed_utils import cleanup_distributed, setup_distributed
+from utils.metrics import MetricsTracker
 from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
-from utils.general_utils import (get_profile_fields, safe_name, 
+from utils.general_utils import (get_profile_fields, safe_name,
                                  query_free_memory_bytes, compute_costs, dump_config)
 
 def generate_experiment_configs(
@@ -132,10 +154,10 @@ def generate_experiment_configs(
     # one flag that switches training loop.
     if include_baseline:
         reference_overrides = {
+            "random_pool_baseline": {"run_random_pool_baseline": True},
             "baseline": {},
             "aux_baseline": {"run_aux_baseline": True},
             "random_batch_baseline": {"run_random_batch_baseline": True},
-            "random_pool_baseline": {"run_random_pool_baseline": True},
         }
         for name, overrides in reference_overrides.items():
             configs.append(replace(
@@ -289,6 +311,90 @@ def run_scheduler(
     return results
 
 
+def run_ddp_sweep(
+    configs: List[ExperimentConfig],
+    dataset_cache_by_name: Dict[str, Path],
+    signature_of_name: Dict[str, Any],
+    rank: int,
+    local_rank: int,
+    world_size: int,
+) -> None:
+    """
+    DDP-mode sweep runner: entered instead of run_scheduler() when launched
+    under torchrun (world_size > 1, see main()). No GPU-memory probing, no
+    packing multiple experiments onto one GPU -- each config in `configs`
+    trains one at a time, using every GPU in this process group via
+    DistributedDataParallel (see the DDP-wrapping inside train_baseline /
+    train_router_experiments / train_aux_baseline), run entirely in-process
+    (not subprocessed) so the NCCL process group setup_distributed() already
+    initialized persists across the whole sweep instead of being torn down
+    and rebuilt per config.
+
+    utils.shared_dataset.load_dataset_cache() reads a pre-tokenized,
+    mmap-backed on-disk cache, so it is safe (and gives an identical result)
+    to call on every rank independently -- no rank-0-loads-then-broadcasts
+    step needed. It's also loaded once per distinct dataset signature and
+    reused across every config that shares it (typically all of them, since
+    a sweep's ablated fields rarely touch dataset_signature()'s fields),
+    rather than reloaded -- and re-mmap'd/re-shuffled -- per config.
+    """
+    # Imported here, not at module level: run_single_experiment lives in the
+    # same package as this file's other GPU-probing/subprocess-launching
+    # machinery, which plain `python parallel_experiments.py` (no torchrun)
+    # should never need to import torch.distributed-adjacent DDP code for.
+    from utils.experiment_worker import run_single_experiment
+
+    if not configs:
+        return
+
+    tokenizer = get_tokenizer(configs[0].tokenizer_name)
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+
+    # Two permanently-empty trackers: compare_runs_experiments() (called at
+    # the end of every run_single_experiment()) only ever prints "cannot
+    # compare" against these today -- nothing in the active codebase writes
+    # results/baseline_metrics.json / router_metrics.json anymore (dead
+    # since the old compare.py script was removed), so there's no file to
+    # load here either. Matches what MetricsTracker.load() on a missing path
+    # already returns.
+    base_metrics = MetricsTracker("baseline", use_wandb=False)
+    router_metrics = MetricsTracker("router", use_wandb=False)
+
+    loaded_by_signature: Dict[str, Tuple[Any, Any]] = {}
+
+    for i, cfg in enumerate(configs, 1):
+        if rank == 0:
+            print(f"\n=== [{i}/{len(configs)}] DDP experiment: {cfg.experiment_name} "
+                  f"(world_size={world_size}) ===")
+
+        cfg = replace(cfg, rank=rank, world_size=world_size, local_rank=local_rank, device=device)
+
+        sig_key = json.dumps(signature_of_name[cfg.experiment_name], sort_keys=True)
+        if sig_key not in loaded_by_signature:
+            loaded_by_signature[sig_key] = load_dataset_cache(dataset_cache_by_name[cfg.experiment_name], cfg)
+        train_ds, val_ds = loaded_by_signature[sig_key]
+
+        try:
+            run_single_experiment(
+                cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
+                base_metrics=base_metrics, router_metrics=router_metrics,
+            )
+        except Exception:
+            if rank == 0:
+                print(f"[FAILED] {cfg.experiment_name}")
+            import traceback
+            traceback.print_exc()
+            # Every rank must keep moving through the same config sequence in
+            # lockstep (they share one process group) -- letting one rank
+            # raise while others continue would desync the next config's
+            # collective calls, or hang if others are still mid-.backward().
+            # Continuing the loop on every rank keeps them aligned; a bad
+            # config just fails identically everywhere instead of hanging.
+
+        if world_size > 1:
+            dist.barrier()  # hold every rank at the same config boundary before moving on
+
+
 def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
     if args.profile and args.field:
         print("Error: --profile and --field cannot be used together.")
@@ -354,22 +460,25 @@ def main() -> None:
     parser.add_argument("--max-parallel", type=int, default=None, help="Skip GPU probing; always run exactly N workers")
     parser.add_argument("--safety-margin", type=float, default=0.6, help="Fraction of free GPU memory usable (default 0.6)")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="Seconds between polls of running workers")
-    parser.add_argument("--gpu", type=int, default=0, help="Physical GPU index to target (default 0)")
+    parser.add_argument("--gpu", type=int, default=0, help="Physical GPU index to target (default 0). No-op under DDP (torchrun) -- GPU selection there comes from LOCAL_RANK, not this")
     args = parser.parse_args()
+
+    # (0, 0, 1) untouched if not launched via torchrun (WORLD_SIZE unset) --
+    # see utils/distributed_utils.py.
+    rank, local_rank, world_size = setup_distributed()
 
     configs = build_config_list(args)
 
     if args.list:
-        print(f"\n=== {len(configs)} experiments would be run ===\n")
-        for i, cfg in enumerate(configs, 1):
-            print(f"  {i}. {cfg.experiment_name}")
+        if rank == 0:
+            print(f"\n=== {len(configs)} experiments would be run ===\n")
+            for i, cfg in enumerate(configs, 1):
+                print(f"  {i}. {cfg.experiment_name}")
+        cleanup_distributed()
         return
 
-    scratch_dir = SCRATCH_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
-    scratch_dir.mkdir(parents=True, exist_ok=False)
-    print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
-
-    print("\n=== Resolving pre-tokenized dataset cache per config ===")
+    if rank == 0:
+        print("\n=== Resolving pre-tokenized dataset cache per config ===")
     signature_of_name = {cfg.experiment_name: dataset_signature(cfg) for cfg in configs}
     representative_by_signature: Dict[Any, ExperimentConfig] = {}
     for cfg in configs:
@@ -378,22 +487,45 @@ def main() -> None:
 
     # Nothing is tokenized here: a sweep that finds no cache stops immediately
     # rather than tying up a GPU node tokenizing (see build_dataset_cache.py).
+    # Safe to resolve identically on every rank under DDP too -- this only
+    # reads each cache entry's manifest.json, no dataset loading yet.
     try:
         cache_path_by_signature = {
             sig_key: require_dataset_cache(rep_cfg)
             for sig_key, rep_cfg in representative_by_signature.items()
         }
     except DatasetCacheMissing as exc:
-        print(f"\n{exc}")
+        if rank == 0:
+            print(f"\n{exc}")
+        cleanup_distributed()
         sys.exit(1)
     dataset_cache_by_name = {
         cfg.experiment_name: cache_path_by_signature[json.dumps(signature_of_name[cfg.experiment_name], sort_keys=True)]
         for cfg in configs
     }
-    print(
-        f"{len(configs)} config(s) map to {len(representative_by_signature)} "
-        f"distinct dataset signature(s)"
-    )
+    if rank == 0:
+        print(
+            f"{len(configs)} config(s) map to {len(representative_by_signature)} "
+            f"distinct dataset signature(s)"
+        )
+
+    if world_size > 1:
+        # DDP mode (launched via torchrun): one experiment at a time, using
+        # every GPU in this process group via DistributedDataParallel --
+        # no packing multiple experiments onto one GPU, so GPU-memory
+        # probing and --max-parallel/--safety-margin/--gpu are all no-ops.
+        if rank == 0:
+            print(
+                f"\n=== DDP mode: {world_size} ranks, running {len(configs)} experiments "
+                f"sequentially (--max-parallel/--safety-margin/--gpu ignored) ===\n"
+            )
+        run_ddp_sweep(configs, dataset_cache_by_name, signature_of_name, rank, local_rank, world_size)
+        cleanup_distributed()
+        return
+
+    scratch_dir = SCRATCH_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+    scratch_dir.mkdir(parents=True, exist_ok=False)
+    print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
 
     if args.max_parallel is not None:
         cost_by_name = {cfg.experiment_name: 1 for cfg in configs}

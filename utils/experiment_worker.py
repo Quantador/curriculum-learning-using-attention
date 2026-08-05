@@ -19,15 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import load_config_from_yaml
 from data import get_tokenizer
-from metrics import MetricsTracker
-from shared_dataset import load_dataset_cache
+from utils.shared_dataset import load_dataset_cache
 from models.router import build_router, get_router_feature_dim
 from rl_training import train_router_experiments, train_aux_baseline, compare_runs_experiments
 from training import train_baseline
-from models.model import TinyGPT
-from metrics import MetricsTracker, DiversityTracker
+from models.model import build_model
+from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
-from general_utils import set_seed
+from utils.general_utils import set_seed
 
 def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics):
     """Run a single experiment with the given configuration.
@@ -36,26 +35,33 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     utils/experiment_worker.py, which calls this once per config inside its
     own subprocess when running a sweep via run_scheduler().
     """
-    print(f"\n{'='*60}")
-    print(f"=== Running experiment: {cfg.experiment_name} ===")
-    print(f"{'='*60}")
-    print(f"  router_architecture: {cfg.router_architecture}")
-    print(f"  enable_text_stat: {cfg.enable_text_stat}")
-    print(f"  enable_text_hierarchical: {cfg.enable_text_hierarchical}")
-    print(f"  hierarchical_representation: {cfg.hierarchical_representation}")
-    print(f"  training_algorithm: {cfg.training_algorithm}")
-    print(f"  reward_signal: {cfg.reward_signal}")
-    print(f"  selection_strategy: {cfg.selection_strategy}")
-    print(f"  baseline_type: {cfg.baseline_type}")
-    print(f"  temp_schedule: {cfg.temp_schedule}")
-    print(f"  entropy_schedule: {cfg.entropy_schedule}")
-    print(f"  run_aux_baseline: {cfg.run_aux_baseline}")
-    print(f"  run_random_batch_baseline: {cfg.run_random_batch_baseline}")
-    print(f"  run_random_pool_baseline: {cfg.run_random_pool_baseline}")
+    # Every rank runs this function identically under DDP (cfg.world_size >
+    # 1); gate the purely informational prints to rank 0 so a multi-GPU job
+    # log doesn't repeat each line once per rank.
+    if cfg.rank == 0:
+        print(f"\n{'='*60}")
+        print(f"=== Running experiment: {cfg.experiment_name} ===")
+        print(f"{'='*60}")
+        print(f"  router_architecture: {cfg.router_architecture}")
+        print(f"  enable_text_stat: {cfg.enable_text_stat}")
+        print(f"  enable_text_hierarchical: {cfg.enable_text_hierarchical}")
+        print(f"  hierarchical_representation: {cfg.hierarchical_representation}")
+        print(f"  training_algorithm: {cfg.training_algorithm}")
+        print(f"  reward_signal: {cfg.reward_signal}")
+        print(f"  selection_strategy: {cfg.selection_strategy}")
+        print(f"  baseline_type: {cfg.baseline_type}")
+        print(f"  temp_schedule: {cfg.temp_schedule}")
+        print(f"  entropy_schedule: {cfg.entropy_schedule}")
+        print(f"  run_aux_baseline: {cfg.run_aux_baseline}")
+        print(f"  run_random_batch_baseline: {cfg.run_random_batch_baseline}")
+        print(f"  run_random_pool_baseline: {cfg.run_random_pool_baseline}")
 
-    set_seed(cfg.seed)
+    # + cfg.rank: harmless (always +0) outside DDP; under DDP, diverges each
+    # rank's data-selection/dropout randomness while model init still matches
+    # across ranks regardless (DDP's constructor broadcasts rank 0's weights).
+    set_seed(cfg.seed + cfg.rank)
 
-    model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
+    model_router = build_model(tokenizer.vocab_size, cfg)
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
     router_div = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
 
@@ -122,8 +128,9 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         )
 
     total_time_s = time.perf_counter() - run_start
-    experiment_metrics.log(total_time_s=total_time_s)
-    print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
+    if cfg.rank == 0:
+        experiment_metrics.log(total_time_s=total_time_s)
+        print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
 
     # The training loops above intentionally leave their wandb run open so
     # total_time_s lands in it too; this closes it once everything's logged.
@@ -131,12 +138,13 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         import wandb
         wandb.finish()
 
-    print("\n=== Comparing runs ===")
-    compare_runs_experiments(
-        base_metrics,
-        router_metrics,
-        experiment_metrics,
-    )
+    if cfg.rank == 0:
+        print("\n=== Comparing runs ===")
+        compare_runs_experiments(
+            base_metrics,
+            router_metrics,
+            experiment_metrics,
+        )
 
     return experiment_metrics
 

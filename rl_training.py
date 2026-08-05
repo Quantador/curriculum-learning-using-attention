@@ -41,6 +41,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 from config import ExperimentConfig
@@ -706,6 +707,13 @@ def train_router_experiments(
 
     model.to(cfg.device).train()
     router.to(cfg.device).train()
+    if cfg.world_size > 1:
+        # device_ids must be None for CPU modules (only single/multi-GPU
+        # modules accept it) -- only relevant for the gloo/CPU smoke-test
+        # path, since real DDP training always runs on CUDA.
+        ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
+        model = DDP(model, device_ids=ddp_device_ids)
+        router = DDP(router, device_ids=ddp_device_ids)
 
     opt_lm = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
     opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
@@ -737,7 +745,14 @@ def train_router_experiments(
                 decoupled_fn=False,
                 separate_val=False,
             ),
-            model=model,
+            # Unwrapped: GhostSuite's per-sample-gradient hooks match
+            # nn.Linear/nn.Embedding/nn.LayerNorm/HF Conv1D by exact type (see
+            # the model_type check above) and walk named_modules() directly --
+            # a DDP wrapper would shadow every submodule path under "module."
+            # and could interfere with per-sample gradient capture, so hand it
+            # the real model regardless of whether DDP is wrapping it for the
+            # actual LM forward/backward elsewhere in this function.
+            model=model.module if isinstance(model, DDP) else model,
             optimizer=opt_lm,
             ddp_info={"master_process": cfg.rank == 0},
             val_data=(X_val, Y_val),
@@ -785,9 +800,18 @@ def train_router_experiments(
     pool_loader = make_pool_loader(
         train_ds, cfg.pool,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+        rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
 
     for epoch in range(cfg.epochs):
+        # DistributedSampler reshuffles from `seed + epoch`; without this call
+        # every rank would see the identical pool order every epoch. No-op
+        # (AttributeError-free via hasattr) in the single-process case, where
+        # the default RandomSampler already reshuffles on every fresh
+        # `for ... in loader`.
+        if hasattr(pool_loader.sampler, "set_epoch"):
+            pool_loader.sampler.set_epoch(epoch)
+
         # The feature cache is never built at epoch 0: the model's weights are
         # randomly initialised, so the hidden states are noise. Caching garbage
         # features would waste memory and mislead the router. Rebuilding every
@@ -1190,7 +1214,7 @@ def train_aux_baseline(
     same features, same top-k selection, same feature pipeline — only the
     training objective differs (MSE regression vs. REINFORCE).
     """
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.init(
             project=cfg.wandb_project,
@@ -1205,6 +1229,10 @@ def train_aux_baseline(
     aux_net.to(cfg.device)
     model.train()
     aux_net.train()
+    if cfg.world_size > 1:
+        ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
+        model = DDP(model, device_ids=ddp_device_ids)
+        aux_net = DDP(aux_net, device_ids=ddp_device_ids)
 
     print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
@@ -1219,12 +1247,16 @@ def train_aux_baseline(
     pool_loader = make_pool_loader(
         train_ds, cfg.pool,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+        rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
 
     for epoch in range(cfg.epochs):
+        if hasattr(pool_loader.sampler, "set_epoch"):
+            pool_loader.sampler.set_epoch(epoch)
+
         epoch_start = time.perf_counter()
 
-        for pool_idx, X, Y, diffs in tqdm(pool_loader):
+        for pool_idx, X, Y, diffs in tqdm(pool_loader, disable=(cfg.rank != 0)):
             pool_indices = pool_idx.tolist()
             diffs = diffs.tolist()
             X = X.to(cfg.device, non_blocking=True)  # [M, L]
@@ -1287,7 +1319,7 @@ def train_aux_baseline(
             diversity.update(selected_indices, selected_diffs)
 
             global_step += 1
-            if global_step % cfg.log_every == 0:
+            if global_step % cfg.log_every == 0 and cfg.rank == 0:
                 training_progress = global_step / total_steps
                 div_metrics = diversity.get_metrics()
                 metrics.log(
@@ -1306,19 +1338,25 @@ def train_aux_baseline(
                     f"loss_aux={loss_aux.item():.6f}"
                 )
 
-        val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
-        epoch_time = time.perf_counter() - epoch_start
-        metrics.log(
-            epoch=epoch,
-            step=global_step,
-            val_loss=val_loss,
-            val_ppl=val_ppl,
-            epoch_time_s=epoch_time,
-        )
-        print(
-            f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
-            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
-        )
+        # Only rank 0 evaluates (val_ds is small and identical on every rank);
+        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
+        # .backward() calls before rank 0 has finished its forward-only pass.
+        if cfg.rank == 0:
+            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+            epoch_time = time.perf_counter() - epoch_start
+            metrics.log(
+                epoch=epoch,
+                step=global_step,
+                val_loss=val_loss,
+                val_ppl=val_ppl,
+                epoch_time_s=epoch_time,
+            )
+            print(
+                f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
+                f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
+            )
+        if cfg.world_size > 1:
+            dist.barrier()
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this

@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from tqdm import tqdm
@@ -173,6 +174,12 @@ def train_baseline(
 
     model.to(cfg.device)
     model.train()
+    if cfg.world_size > 1:
+        # device_ids must be None for CPU modules (only single/multi-GPU
+        # modules accept it) -- only relevant for the gloo/CPU smoke-test
+        # path, since real DDP training always runs on CUDA.
+        ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
+        model = DDP(model, device_ids=ddp_device_ids)
 
     loss_fn = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
@@ -182,8 +189,14 @@ def train_baseline(
     baseline_loader = make_baseline_loader(
         train_ds, cfg.pool, cfg.batch,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+        rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
     for epoch in range(cfg.epochs):
+        # See PooledBatchSampler.set_epoch(): required under DDP so pools
+        # reshuffle across epochs (its RNG is local, not the global `random`
+        # module, so it has no other source of cross-epoch variation).
+        baseline_loader.batch_sampler.set_epoch(epoch)
+
         for selected_idx, X, Y, diffs in tqdm(baseline_loader, disable=(cfg.rank != 0)):
             selected_indices = selected_idx.tolist()
             diffs = diffs.tolist()

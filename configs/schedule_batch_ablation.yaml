@@ -1,4 +1,4 @@
-experiment_name: schedule_batch_ablation
+experiment_name: schedule_batch_ablation_2
 epochs: 10
 batch: 16
 pool_mult: 8 # Use 8 for 128 batch size 
@@ -10,3 +10,6 @@ hf_model_name: openai-community/gpt2
 use_curriculum_ratio_schedule: true
 dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
 dataset_proportions: [0.7 , 0.3]
+use_original_sequence: false
+sentence_embedder_dim: 768
+sentence_embedder_model: "intfloat/e5-base-v2"

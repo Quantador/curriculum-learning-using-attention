@@ -32,6 +32,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
@@ -274,6 +275,9 @@ def make_pool_loader(
     pool_size: int,
     num_workers: int = 0,
     pin_memory: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    seed: int = 0,
 ) -> DataLoader:
     """
     DataLoader yielding shuffled, non-overlapping (idx, x, y, domain) pools of
@@ -289,17 +293,41 @@ def make_pool_loader(
 
     Reusable across epochs: build it once and iterate repeatedly
     (`for epoch in ...: for pool in loader: ...`) rather than rebuilding it
-    every epoch -- shuffle=True means every fresh `for ... in loader` call
-    reshuffles, and persistent_workers keeps worker processes alive between
-    epochs instead of paying fork/mmap-reopen cost on every one.
+    every epoch -- persistent_workers keeps worker processes alive between
+    epochs instead of paying fork/mmap-reopen cost on every one. When
+    world_size > 1, call `loader.sampler.set_epoch(epoch)` before each epoch's
+    iteration (DistributedSampler reshuffles deterministically from `seed +
+    epoch`, otherwise every rank -- and every epoch -- would see the same
+    order); the single-process RandomSampler used when world_size == 1
+    reshuffles on every fresh `for ... in loader` automatically and has no
+    such method.
 
     drop_last=True: a trailing partial pool (< pool_size) is skipped. At the
     max_chunks scale these configs run at (hundreds of thousands of windows
     vs. a pool_size in the low hundreds), that drops a negligible fraction of
-    an epoch.
+    an epoch. Under DDP, DistributedSampler's own drop_last=True first
+    truncates the dataset to a multiple of world_size, so every rank gets
+    exactly len(ds) // world_size candidates and therefore the same number of
+    pools per epoch -- required so every rank issues the same number of
+    DDP-synchronizing .backward() calls (a mismatch would hang NCCL).
     """
+    dataset = _IndexedDataset(ds)
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True, seed=seed,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=pool_size,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0,
+        )
     return DataLoader(
-        _IndexedDataset(ds),
+        dataset,
         batch_size=pool_size,
         shuffle=True,
         drop_last=True,
@@ -325,21 +353,71 @@ class PooledBatchSampler(Sampler):
     only batch_size out of every pool_size candidates) -- pool_size, not
     batch_size, is what should set "how much of the dataset counts as an
     epoch" for a fair comparison.
+
+    DDP sharding (world_size > 1): every rank must partition the pools
+    identically and then take a disjoint slice, or ranks would train on
+    overlapping data and/or issue different numbers of DDP-synchronizing
+    .backward() calls per epoch (hanging NCCL). So the shuffle uses a local
+    random.Random(seed + epoch) instead of the shared global `random` module
+    -- every rank computes the exact same shuffled pool partition from that
+    seed, then rank-only strides over whole pools (pools[rank::world_size],
+    first truncated to a multiple of world_size so every rank gets the same
+    count) -- the same strided-sharding principle as a DistributedSampler,
+    just at pool granularity so make_pool_loader() and this class agree on
+    "how much of the dataset one epoch means." The final per-pool subsample
+    uses a separate, rank-dependent RNG since that step doesn't need
+    cross-rank agreement. With world_size=1 (the default) this reduces
+    exactly to the old single-process behaviour, just with a local RNG
+    instead of the global one.
+
+    Call set_epoch(epoch) before each epoch's iteration, mirroring
+    DistributedSampler's API, so pools reshuffle across epochs instead of
+    repeating -- required (not just nice-to-have) under DDP, since a local
+    RNG has no other source of cross-epoch variation the way the old
+    global-`random`-module version implicitly had.
     """
 
-    def __init__(self, ds_len: int, pool_size: int, batch_size: int):
+    def __init__(
+        self,
+        ds_len: int,
+        pool_size: int,
+        batch_size: int,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+    ):
         self.ds_len = ds_len
         self.pool_size = pool_size
         self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
     def __iter__(self):
+        shared_rng = random.Random(self.seed + self.epoch)
         order = list(range(self.ds_len))
-        random.shuffle(order)
-        for start in range(0, self.ds_len - self.pool_size + 1, self.pool_size):
-            yield random.sample(order[start : start + self.pool_size], self.batch_size)
+        shared_rng.shuffle(order)
+        pools = [
+            order[start : start + self.pool_size]
+            for start in range(0, self.ds_len - self.pool_size + 1, self.pool_size)
+        ]
+        n_usable = (len(pools) // self.world_size) * self.world_size
+        local_pools = pools[self.rank : n_usable : self.world_size]
+
+        # Distinct from shared_rng's seed (which every rank must agree on) --
+        # offsets chosen simply to avoid collisions between epoch/rank pairs,
+        # not for any cryptographic property.
+        local_rng = random.Random(self.seed + self.epoch * 1_000_003 + self.rank)
+        for pool in local_pools:
+            yield local_rng.sample(pool, self.batch_size)
 
     def __len__(self) -> int:
-        return self.ds_len // self.pool_size
+        n_pools = self.ds_len // self.pool_size
+        return n_pools // self.world_size
 
 
 def make_baseline_loader(
@@ -348,13 +426,19 @@ def make_baseline_loader(
     batch_size: int,
     num_workers: int = 0,
     pin_memory: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    seed: int = 0,
 ) -> DataLoader:
     """DataLoader for training.train_baseline(); see PooledBatchSampler.
-    Reusable across epochs the same way as make_pool_loader() (fresh shuffle
-    per `for ... in loader`, persistent_workers between epochs)."""
+    Reusable across epochs the same way as make_pool_loader() (persistent
+    workers between epochs); call
+    `loader.batch_sampler.set_epoch(epoch)` before each epoch's iteration."""
     return DataLoader(
         _IndexedDataset(ds),
-        batch_sampler=PooledBatchSampler(len(ds), pool_size, batch_size),
+        batch_sampler=PooledBatchSampler(
+            len(ds), pool_size, batch_size, rank=rank, world_size=world_size, seed=seed,
+        ),
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,

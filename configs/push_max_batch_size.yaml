@@ -1,5 +1,5 @@
 epochs: 10
-batch: 256
+batch: 128
 pool_mult: 2
 sentence_embedder_batch_size: 2048
 lr_lm: 0.0003
