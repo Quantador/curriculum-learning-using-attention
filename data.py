@@ -13,9 +13,13 @@ its domain is just "which folder is this .ds file in":
     <entry_dir>/<split>/<domain folder>/*.ds
 
 Key exports:
-  get_tokenizer()   — tokenizer matching the student LM (GPT-2 BPE by default)
-  TokenizedCorpus   — Dataset over the .ds files, yielding (x, y, domain_id)
-  make_index_loader — yields shuffled pool-sized index batches
+  get_tokenizer()      — tokenizer matching the student LM (GPT-2 BPE by default)
+  TokenizedCorpus      — Dataset over the .ds files, yielding (x, y, domain_id)
+  make_pool_loader()   — DataLoader of shuffled (idx, x, y, domain) pools, for
+                         the curriculum loops that need every pool candidate's
+                         data (rl_training.train_router_experiments/train_aux_baseline)
+  make_baseline_loader() — DataLoader of (idx, x, y, domain) batches drawn by
+                         PooledBatchSampler, for training.train_baseline()
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ from tqdm import tqdm
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
@@ -244,8 +248,114 @@ class TokenizedCorpus(Dataset):
         return ids[:-1], ids[1:], int(self._domain_of_file[file_idx])
 
 
-def make_index_loader(ds_len: int, pool_size: int):
-    order = list(range(ds_len))
-    random.shuffle(order)
-    for i in range(0, ds_len, pool_size):
-        yield order[i : i + pool_size]
+class _IndexedDataset(Dataset):
+    """Wraps a Dataset so each item also carries its own index.
+
+    The curriculum training loops track selected/covered samples by index
+    into the underlying dataset (CoverageTracker, DiversityTracker, the
+    feature cache in rl_training.build_feature_cache, ...), which a plain
+    DataLoader batch has no way to report back -- shuffling happens inside
+    the Sampler, invisible to __getitem__.
+    """
+
+    def __init__(self, base: Dataset):
+        self.base = base
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, i: int):
+        x, y, domain = self.base[i]
+        return i, x, y, domain
+
+
+def make_pool_loader(
+    ds: Dataset,
+    pool_size: int,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+) -> DataLoader:
+    """
+    DataLoader yielding shuffled, non-overlapping (idx, x, y, domain) pools of
+    pool_size candidates -- one per curriculum-learning step in
+    rl_training.train_router_experiments/train_aux_baseline, which need every
+    pool candidate's data (router feature extraction runs over the whole
+    pool, not just the eventually-selected batch).
+
+    With num_workers > 0, the next pool is gathered on a worker process while
+    the GPU is still busy with the current one's feature extraction + LM
+    forward/backward -- previously this CPU-side gather (mmap reads +
+    torch.stack) was fully serialized with GPU compute every step.
+
+    Reusable across epochs: build it once and iterate repeatedly
+    (`for epoch in ...: for pool in loader: ...`) rather than rebuilding it
+    every epoch -- shuffle=True means every fresh `for ... in loader` call
+    reshuffles, and persistent_workers keeps worker processes alive between
+    epochs instead of paying fork/mmap-reopen cost on every one.
+
+    drop_last=True: a trailing partial pool (< pool_size) is skipped. At the
+    max_chunks scale these configs run at (hundreds of thousands of windows
+    vs. a pool_size in the low hundreds), that drops a negligible fraction of
+    an epoch.
+    """
+    return DataLoader(
+        _IndexedDataset(ds),
+        batch_size=pool_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+
+
+class PooledBatchSampler(Sampler):
+    """
+    Batch sampler backing training.train_baseline()'s "pool" semantics:
+    partition a shuffled permutation of range(ds_len) into non-overlapping
+    pools of pool_size, then yield a uniformly random batch_size-sized
+    subsample of each pool -- same distribution as the old
+    make_index_loader() + inline random.sample(pool_indices, cfg.batch), but
+    as a batch_sampler so DataLoader only ever fetches the batch_size samples
+    actually used, not all pool_size candidates (unlike make_pool_loader()
+    above, the random baseline never looks at the rest of the pool).
+
+    Exists so the random baseline sees the same per-epoch step count and
+    token budget as the router-based training loops (which also update on
+    only batch_size out of every pool_size candidates) -- pool_size, not
+    batch_size, is what should set "how much of the dataset counts as an
+    epoch" for a fair comparison.
+    """
+
+    def __init__(self, ds_len: int, pool_size: int, batch_size: int):
+        self.ds_len = ds_len
+        self.pool_size = pool_size
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        order = list(range(self.ds_len))
+        random.shuffle(order)
+        for start in range(0, self.ds_len - self.pool_size + 1, self.pool_size):
+            yield random.sample(order[start : start + self.pool_size], self.batch_size)
+
+    def __len__(self) -> int:
+        return self.ds_len // self.pool_size
+
+
+def make_baseline_loader(
+    ds: Dataset,
+    pool_size: int,
+    batch_size: int,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+) -> DataLoader:
+    """DataLoader for training.train_baseline(); see PooledBatchSampler.
+    Reusable across epochs the same way as make_pool_loader() (fresh shuffle
+    per `for ... in loader`, persistent_workers between epochs)."""
+    return DataLoader(
+        _IndexedDataset(ds),
+        batch_sampler=PooledBatchSampler(len(ds), pool_size, batch_size),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )

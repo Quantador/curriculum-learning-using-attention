@@ -65,6 +65,14 @@ class Config:
     # System
     seed: int = 0
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+    # Background worker processes for the training/eval DataLoaders (data.py's
+    # make_pool_loader/make_baseline_loader, and evaluate()/evaluate_per_domain()
+    # in training.py). 0 = load in the main process (safe default -- sweeps in
+    # parallel_experiments.py run several experiment subprocesses concurrently
+    # on one GPU without budgeting CPU workers, so raising this multiplies
+    # across however many are running at once). Raise it for standalone runs
+    # to overlap next-batch loading with GPU compute.
+    dataloader_num_workers: int = 0
 
     # Distributed (DDP). Defaults are the single-process case; train_ddp.py
     # overrides these after torch.distributed.init_process_group().

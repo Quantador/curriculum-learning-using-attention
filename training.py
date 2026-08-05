@@ -13,17 +13,18 @@ evaluate() is shared by train_baseline() and rl_training.py.
 from __future__ import annotations
 
 import math
-import random
 from collections import defaultdict
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 from config import Config
-from data import make_index_loader, TokenizedCorpus
+from data import make_baseline_loader, TokenizedCorpus
 from models.model import TinyGPT
 from utils.metrics import MetricsTracker, DiversityTracker
 
@@ -33,28 +34,42 @@ def evaluate(
     ds: TokenizedCorpus,
     loss_fn: nn.Module,
     cfg: Config,
+    batch_size: int = 64,
 ) -> Tuple[float, float]:
     """
     Compute mean cross-entropy loss and perplexity over the full dataset.
 
-    Iterates sample-by-sample (not batched) to avoid padding artefacts.
+    Uses a plain sequential DataLoader (no shuffling needed for a full-pass
+    eval) -- TokenizedCorpus windows are all exactly cfg.block tokens (no
+    padding, see data.py), so batching never introduces padding artefacts.
+    batch_size is independent of cfg.batch: no gradients are held here, so it
+    can be much larger. pin_memory speeds up the host->GPU copy;
+    cfg.dataloader_num_workers lets the next batch's CPU-side gather overlap
+    with the current batch's forward pass (matters less here than in the
+    per-step training loops, since eval only runs once per epoch).
     Sets model to eval() before the loop and restores train() after.
 
     Returns (avg_loss, perplexity) where perplexity = exp(avg_loss).
     """
     model.eval()
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=cfg.dataloader_num_workers,
+        pin_memory=(cfg.device != "cpu"),
+    )
     total_loss, total_tok = 0.0, 0
     with torch.no_grad():
-        for i in range(len(ds)):
-            x, y, _ = ds[i]
-            x = x.unsqueeze(0).to(cfg.device)
-            y = y.unsqueeze(0).to(cfg.device)
-            logits = model(x)
+        for X, Y, _ in loader:
+            X = X.to(cfg.device, non_blocking=True)
+            Y = Y.to(cfg.device, non_blocking=True)
+            logits = model(X)
             loss = loss_fn(
                 logits.view(-1, logits.size(-1)),
-                y.view(-1),
+                Y.view(-1),
             )
-            n_tok = y.numel()
+            n_tok = Y.numel()
             total_loss += loss.item() * n_tok
             total_tok += n_tok
     model.train()
@@ -67,6 +82,7 @@ def evaluate_per_domain(
     ds: TokenizedCorpus,
     loss_fn: nn.Module,
     cfg: Config,
+    batch_size: int = 64,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Like evaluate(), but broken out per domain: one (avg_loss, perplexity)
@@ -77,6 +93,12 @@ def evaluate_per_domain(
     call evaluate() for the cheap aggregate val_loss/val_ppl tracked every
     epoch instead.
 
+    Batched like evaluate() via the same kind of sequential DataLoader (same
+    no-padding argument), but needs a per-sample loss to split by domain, so
+    it always computes cross-entropy with reduction='none' internally
+    regardless of loss_fn's own reduction (loss_fn is only used by
+    evaluate() for the aggregate case).
+
     Keyed by domain name (ds.domain_names[domain_id]) when ds carries one,
     falling back to str(domain_id) otherwise -- matches DiversityTracker's
     domain_ratio/{name} convention so the two line up in W&B.
@@ -84,19 +106,26 @@ def evaluate_per_domain(
     model.eval()
     domain_loss: Dict[int, float] = defaultdict(float)
     domain_tok: Dict[int, int] = defaultdict(int)
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=cfg.dataloader_num_workers,
+        pin_memory=(cfg.device != "cpu"),
+    )
     with torch.no_grad():
-        for i in range(len(ds)):
-            x, y, domain = ds[i]
-            x = x.unsqueeze(0).to(cfg.device)
-            y = y.unsqueeze(0).to(cfg.device)
-            logits = model(x)
-            loss = loss_fn(
-                logits.view(-1, logits.size(-1)),
-                y.view(-1),
-            )
-            n_tok = y.numel()
-            domain_loss[domain] += loss.item() * n_tok
-            domain_tok[domain] += n_tok
+        for X, Y, domains in loader:
+            X = X.to(cfg.device, non_blocking=True)
+            Y = Y.to(cfg.device, non_blocking=True)
+            logits = model(X)
+            B, L, V = logits.shape
+            token_loss = F.cross_entropy(
+                logits.view(B * L, V), Y.view(B * L), reduction="none"
+            ).view(B, L)
+            per_sample_loss = token_loss.sum(dim=1)  # [B], matches n_tok weighting below
+            for b, domain in enumerate(domains.tolist()):
+                domain_loss[domain] += per_sample_loss[b].item()
+                domain_tok[domain] += L
     model.train()
 
     domain_names = getattr(ds, "domain_names", None)
@@ -150,19 +179,16 @@ def train_baseline(
 
     global_step = 0
     total_tokens_seen = 0
+    baseline_loader = make_baseline_loader(
+        train_ds, cfg.pool, cfg.batch,
+        num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+    )
     for epoch in range(cfg.epochs):
-        idx_loader = make_index_loader(len(train_ds), cfg.pool)
-
-        for pool_indices in tqdm(idx_loader, disable=(cfg.rank != 0)):
-            if len(pool_indices) < cfg.batch:
-                continue
-
-            selected_indices = random.sample(pool_indices, cfg.batch)
-            batch = [train_ds[i] for i in selected_indices]
-            xs, ys, diffs = zip(*batch)
-
-            X = torch.stack(xs).to(cfg.device)
-            Y = torch.stack(ys).to(cfg.device)
+        for selected_idx, X, Y, diffs in tqdm(baseline_loader, disable=(cfg.rank != 0)):
+            selected_indices = selected_idx.tolist()
+            diffs = diffs.tolist()
+            X = X.to(cfg.device, non_blocking=True)
+            Y = Y.to(cfg.device, non_blocking=True)
             total_tokens_seen += X.numel() * cfg.world_size
 
             opt.zero_grad()

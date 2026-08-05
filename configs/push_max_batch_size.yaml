@@ -1,6 +1,6 @@
 epochs: 10
-batch: 512
-pool_mult: 10
+batch: 256
+pool_mult: 2
 lr_lm: 0.0003
 use_wandb: true
 max_chunks: 200000

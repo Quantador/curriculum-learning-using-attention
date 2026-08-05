@@ -44,7 +44,7 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from config import ExperimentConfig
-from data import make_index_loader, TokenizedCorpus
+from data import make_pool_loader, TokenizedCorpus
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from utils.metrics import MetricsTracker, DiversityTracker
 from training import evaluate, evaluate_per_domain  # keep using your existing evaluate()
@@ -782,6 +782,11 @@ def train_router_experiments(
     # Feature cache: None until first rebuild (never built during epoch 0)
     feature_cache: torch.Tensor | None = None
 
+    pool_loader = make_pool_loader(
+        train_ds, cfg.pool,
+        num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+    )
+
     for epoch in range(cfg.epochs):
         # The feature cache is never built at epoch 0: the model's weights are
         # randomly initialised, so the hidden states are noise. Caching garbage
@@ -797,13 +802,14 @@ def train_router_experiments(
         ):
             feature_cache = build_feature_cache(model, train_ds, cfg)
 
-        idx_loader = make_index_loader(len(train_ds), cfg.pool)
         epoch_start = time.perf_counter()
         total_feat_time = 0.0
 
         # ── Per-step curriculum loop ──────────────────────────────────────────
         # Each iteration implements the core curriculum learning cycle:
-        #   1. Sample M = cfg.pool candidate indices (pre-shuffled each epoch).
+        #   1. Sample M = cfg.pool candidate indices (pre-shuffled each epoch,
+        #      prefetched by pool_loader's workers while the previous step's
+        #      GPU work is still running -- see cfg.dataloader_num_workers).
         #   2. Extract router features for all M samples.
         #   3. Router scores pool → softmax(/ temp) → select k samples (k =
         #      cfg.batch, or an annealed fraction of the pool when
@@ -812,9 +818,11 @@ def train_router_experiments(
         #   5. Compute reward signal (loss improvement, gradient norm, etc.).
         #   6. Router RL update (REINFORCE / GRPO / PPO + entropy regularisation).
         # ─────────────────────────────────────────────────────────────────────
-        for pool_indices in tqdm(idx_loader, disable=(cfg.rank != 0)):
-            if len(pool_indices) < cfg.batch:
-                continue
+        for pool_idx, X, Y, domains in tqdm(pool_loader, disable=(cfg.rank != 0)):
+            pool_indices = pool_idx.tolist()
+            domains = domains.tolist()
+            X = X.to(cfg.device, non_blocking=True)  # [M, L]
+            Y = Y.to(cfg.device, non_blocking=True)  # [M, L]
 
             # Compute training progress for schedules
             progress = global_step / total_steps
@@ -846,12 +854,6 @@ def train_router_experiments(
                 select_k = max(1, min(len(pool_indices), round(current_ratio * len(pool_indices))))
             else:
                 select_k = cfg.batch
-
-            batch = [train_ds[i] for i in pool_indices]
-            xs, ys, domains = zip(*batch)
-
-            X = torch.stack(xs).to(cfg.device)  # [M, L]
-            Y = torch.stack(ys).to(cfg.device)  # [M, L]
 
             # --- Router features over the full pool ---
             feat_start = time.perf_counter()
@@ -1214,19 +1216,19 @@ def train_aux_baseline(
     global_step = 0
     total_tokens_seen = 0
 
+    pool_loader = make_pool_loader(
+        train_ds, cfg.pool,
+        num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+    )
+
     for epoch in range(cfg.epochs):
         epoch_start = time.perf_counter()
-        idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
-        for pool_indices in tqdm(idx_loader):
-            if len(pool_indices) < cfg.batch:
-                continue
-
-            batch = [train_ds[i] for i in pool_indices]
-            xs, ys, diffs = zip(*batch)
-
-            X = torch.stack(xs).to(cfg.device)  # [M, L]
-            Y = torch.stack(ys).to(cfg.device)  # [M, L]
+        for pool_idx, X, Y, diffs in tqdm(pool_loader):
+            pool_indices = pool_idx.tolist()
+            diffs = diffs.tolist()
+            X = X.to(cfg.device, non_blocking=True)  # [M, L]
+            Y = Y.to(cfg.device, non_blocking=True)  # [M, L]
 
             # --- Feature extraction ---
             external_embedding = None
