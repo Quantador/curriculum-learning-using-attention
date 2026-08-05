@@ -34,8 +34,8 @@ GPU instead of experiments.py's old one-at-a-time loop:
      finish, until the queue is exhausted. A failed worker is logged and the
      rest of the sweep continues (its slot is freed immediately).
 
-Every config keeps the experiment_name/save_dir that
-generate_experiment_configs()/generate_combination_configs() already assign,
+Every config keeps the experiment_name that
+generate_experiment_configs()/generate_combination_configs() already assigns,
 and wandb_project is left untouched — so every run in the sweep lands in the
 same wandb project and shows up on the same graph.
 
@@ -141,7 +141,6 @@ def generate_experiment_configs(
             configs.append(replace(
                 base_cfg,
                 experiment_name=name,
-                save_dir=f"results/{name}",
                 **baseline_values,
                 **overrides,
             ))
@@ -159,7 +158,6 @@ def generate_experiment_configs(
             new_cfg = replace(
                 base_cfg,
                 experiment_name=experiment_name,
-                save_dir=f"results/{experiment_name}",
                 **overrides
             )
             configs.append(new_cfg)
@@ -206,7 +204,6 @@ def generate_combination_configs(
         new_cfg = replace(
             base_cfg,
             experiment_name=experiment_name,
-            save_dir=f"results/{experiment_name}",
             **overrides
         )
         configs.append(new_cfg)
@@ -308,12 +305,12 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
     # Without --name it falls back to --config's (or ExperimentConfig()'s
     # "presentation_experiment") experiment_name.
     if args.name:
-        # save_dir/wandb_project only re-derive from experiment_name in
-        # __post_init__ while still None; base_cfg (if any) already has them
-        # resolved to concrete strings, so force both back to None or
-        # replace() would silently keep the stale values tied to the old name.
+        # wandb_project only re-derives from experiment_name in __post_init__
+        # while still None; base_cfg (if any) already has it resolved to a
+        # concrete string, so force it back to None or replace() would
+        # silently keep the stale value tied to the old name.
         base_cfg = (
-            replace(base_cfg, experiment_name=args.name, save_dir=None, wandb_project=None)
+            replace(base_cfg, experiment_name=args.name, wandb_project=None)
             if base_cfg else ExperimentConfig(experiment_name=args.name)
         )
 

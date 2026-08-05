@@ -55,9 +55,6 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
 
     set_seed(cfg.seed)
 
-    # Ensure save directory exists
-    os.makedirs(cfg.save_dir, exist_ok=True)
-
     model_router = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
     experiment_metrics = MetricsTracker(cfg.experiment_name, use_wandb=cfg.use_wandb)
     router_div = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)

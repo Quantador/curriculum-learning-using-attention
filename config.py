@@ -84,7 +84,6 @@ class Config:
     use_wandb: bool = True
     wandb_project: str = "curriculum-learning-final"
     wandb_entity: str | None = None
-    save_dir: str = "results"
     log_every: int = 100
 
     # Set automatically by load_config_from_yaml() to the source YAML path;
@@ -160,19 +159,16 @@ class ExperimentConfig(Config):
     """
     experiment_name: str = "presentation_experiment"
 
-    # None = derive from experiment_name in __post_init__ below. Fields are
-    # computed once at class-definition time from the *default* experiment_name,
-    # so a plain string default here would silently ignore any override of
+    # None = derive from experiment_name in __post_init__ below. Computed
+    # once at class-definition time from the *default* experiment_name, so a
+    # plain string default here would silently ignore any override of
     # experiment_name (constructor kwarg, dataclasses.replace(), or YAML).
     wandb_project: str | None = None
-    save_dir: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
         if self.wandb_project is None:
             self.wandb_project = f"{self.experiment_name}"
-        if self.save_dir is None:
-            self.save_dir = f"results/{self.experiment_name}"
 
         if self.reward_signal in ("difficulty_weighted", "combined") and len(self.dataset_list) != 2:
             raise ValueError("In order to use difficulty scoring, you need to use 2 datasets, the first one "
@@ -431,20 +427,19 @@ def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> Exp
         overrides = yaml.safe_load(f) or {}
 
     # experiment_name defaults to the YAML file's own name (without
-    # extension) so a run's name/save_dir/wandb_project track the config
-    # file used to launch it. An explicit experiment_name: key in the YAML
-    # still takes precedence over this default.
+    # extension) so a run's name/wandb_project track the config file used to
+    # launch it. An explicit experiment_name: key in the YAML still takes
+    # precedence over this default.
     if "experiment_name" not in overrides:
         overrides["experiment_name"] = os.path.splitext(os.path.basename(path))[0]
 
-    # save_dir/wandb_project are lazily derived from experiment_name in
-    # __post_init__, but only when still None; by this point cfg already has
-    # them resolved to concrete strings (from the ExperimentConfig() default
-    # above, or from the caller-supplied cfg). Since experiment_name is now
-    # always being set (explicitly or via the filename default above), force
-    # both back to None so __post_init__ re-derives from the new name instead
-    # of keeping the stale resolved value from the old one.
-    overrides.setdefault("save_dir", None)
+    # wandb_project is lazily derived from experiment_name in __post_init__,
+    # but only when still None; by this point cfg already has it resolved to
+    # a concrete string (from the ExperimentConfig() default above, or from
+    # the caller-supplied cfg). Since experiment_name is now always being set
+    # (explicitly or via the filename default above), force it back to None
+    # so __post_init__ re-derives it from the new name instead of keeping the
+    # stale resolved value from the old one.
     overrides.setdefault("wandb_project", None)
 
     valid_fields = {f.name for f in fields(cfg)}

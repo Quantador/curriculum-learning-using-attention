@@ -727,7 +727,7 @@ def train_router_experiments(
         ghost_engine = GhostEngineManager(
             config=SimpleNamespace(
                 method="GradDotProd",
-                result_dir=os.path.join(cfg.save_dir, "ghost"),
+                result_dir=os.path.join("results", cfg.experiment_name, "ghost"),
                 val_batch_size=cfg.greats_val_batch_size,
                 log_grad_norms=cfg.greats_log_grad_norms,
                 score_exclude_params=cfg.greats_score_exclude_params,

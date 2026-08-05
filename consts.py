@@ -71,19 +71,6 @@ EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {
     "use_coverage_regularization": (False, [True]),
     "coverage_type": ("count", ["recency", "uncertainty"]),
 
-    # Dataset combinations (easy_dataset, hard_dataset)
-    # Easy options: TinyStories, Children-Stories, SimpleWikipedia, WikiText
-    # Hard options: OpenWebText2, ArXiv, Code, FineWeb-Edu
-    "easy_dataset": ("roneneldan/TinyStories", [
-        "ajibawa-2023/Children-Stories-Collection",
-        "Salesforce/wikitext",
-    ]),
-    "hard_dataset": ("Geralt-Targaryen/openwebtext2", [
-        "armanc/scientific_papers",
-        "CShorten/ML-ArXiv-Papers",
-        "HuggingFaceFW/fineweb-edu",
-    ]),
-
     # Feature caching
     "feature_cache_epochs": (0, [1, 2]),
     "use_original_sequence": (False, [True]),
