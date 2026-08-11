@@ -224,18 +224,36 @@ def train_baseline(
             diversity.update(selected_indices, diffs)
 
             global_step += 1
-            if global_step % cfg.log_every == 0 and cfg.rank == 0:
-                div_metrics = diversity.get_metrics()
-                metrics.log(
-                    epoch=epoch,
-                    step=global_step,
-                    loss_lm=loss.item(),
-                    entropy=math.log(cfg.batch),
-                    tokens_seen=total_tokens_seen,
-                    **div_metrics,
-                )
+            if global_step % cfg.log_every == 0:
+                # loss is this rank's own local-shard batch loss; average
+                # across ranks before logging so world_size>1 runs plot the
+                # whole step's loss, not just rank 0's 1/world_size slice.
+                # Every rank hits this collective in lockstep since the
+                # DDP-sharded loader gives every rank the same step count
+                # per epoch (see PooledBatchSampler) -- only rank 0 then
+                # actually writes to wandb/prints below.
+                log_loss = loss.detach()
+                if cfg.world_size > 1:
+                    log_loss = log_loss.clone()
+                    dist.all_reduce(log_loss, op=dist.ReduceOp.SUM)
+                    log_loss /= cfg.world_size
 
-                print(f"[Baseline] Step {global_step} - loss_lm={loss.item():.4f}")
+                # get_metrics() itself issues collectives (all_reduce/
+                # all_gather_object) when world_size > 1, so every rank must
+                # call it here, not just rank 0.
+                div_metrics = diversity.get_metrics(world_size=cfg.world_size)
+
+                if cfg.rank == 0:
+                    metrics.log(
+                        epoch=epoch,
+                        step=global_step,
+                        loss_lm=log_loss.item(),
+                        entropy=math.log(cfg.batch),
+                        tokens_seen=total_tokens_seen,
+                        **div_metrics,
+                    )
+
+                    print(f"[Baseline] Step {global_step} - loss_lm={log_loss.item():.4f}")
 
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
         # other ranks wait so nobody starts the next epoch's DDP-synchronizing

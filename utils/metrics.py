@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
 try:
     import wandb
@@ -125,7 +126,7 @@ class DiversityTracker:
                 self.domain_counts[d] = 0
             self.domain_counts[d] += 1
 
-    def get_metrics(self) -> Dict[str, float]:
+    def get_metrics(self, world_size: int = 1) -> Dict[str, float]:
         """
         Return a dict of diversity metrics accumulated since instantiation.
 
@@ -138,8 +139,43 @@ class DiversityTracker:
                               far. Sharing the "domain_ratio/" prefix across
                               domains groups them into one section/panel in
                               the W&B UI automatically.
+
+        world_size > 1: each rank only ever calls update() with its own
+        DistributedSampler-sharded slice of the dataset (see data.py), so
+        self.selection_counts/domain_counts/step_selections are each only
+        that rank's own partial view. Pass cfg.world_size here to merge
+        every rank's view before computing the stats above -- selection_counts
+        via all_reduce (dataset-index tensor, cheap to sum elementwise),
+        domain_counts/step_selections via all_gather_object (small Python
+        objects, not tensors). Every rank must call this the same number of
+        times with the same world_size (it's a collective) -- true here
+        since it's only ever invoked from a cfg.log_every-gated block that
+        every rank reaches in lockstep. Uses local copies throughout, so
+        self.* state is never mutated by this call and repeated calls don't
+        double-count already-merged contributions.
         """
         counts = self.selection_counts
+        domain_counts = self.domain_counts
+        step_selections = self.step_selections
+
+        if world_size > 1:
+            counts = counts.clone()
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+            gathered_domain_counts: List[Optional[dict]] = [None] * world_size
+            dist.all_gather_object(gathered_domain_counts, self.domain_counts)
+            merged_domain_counts: Dict[int, int] = defaultdict(int)
+            for dc in gathered_domain_counts:
+                for domain_id, count in dc.items():
+                    merged_domain_counts[domain_id] += count
+            domain_counts = merged_domain_counts
+
+            gathered_step_selections: List[Optional[List[List[int]]]] = [None] * world_size
+            dist.all_gather_object(gathered_step_selections, self.step_selections)
+            step_selections = [
+                step for rank_steps in gathered_step_selections for step in rank_steps
+            ]
+
         selected_mask = counts > 0
         num_selected = selected_mask.sum().item()
 
@@ -150,15 +186,15 @@ class DiversityTracker:
         else:
             balance_std = 0.0
 
-        recent = [i for step in self.step_selections for i in step]
+        recent = [i for step in step_selections for i in step]
         total_recent = len(recent)
         unique_recent = len(set(recent)) if total_recent > 0 else 0
         unique_ratio = unique_recent / max(1, total_recent)
 
-        total_sel = sum(self.domain_counts.values())
+        total_sel = sum(domain_counts.values())
         domain_ratios = {
             f"domain_ratio/{self._domain_label(domain_id)}": (count / total_sel if total_sel > 0 else 0.0)
-            for domain_id, count in sorted(self.domain_counts.items())
+            for domain_id, count in sorted(domain_counts.items())
         }
 
         return {

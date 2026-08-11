@@ -313,14 +313,33 @@ class CoverageTracker:
 
         return bonus
 
-    def get_coverage_stats(self) -> dict:
-        """Get coverage statistics for logging."""
-        selected_mask = self.counts > 0
+    def get_coverage_stats(self, world_size: int = 1) -> dict:
+        """
+        Get coverage statistics for logging.
+
+        world_size > 1: self.counts only reflects this rank's own
+        DistributedSampler-sharded slice of the dataset (see data.py's
+        make_pool_loader and CoverageTracker's class docstring on why that's
+        the *correct* rank-local state for get_coverage_bonus()'s training
+        signal). For logging, though, pass cfg.world_size to merge every
+        rank's counts via all_reduce first so the reported coverage
+        describes the whole world, not just this rank's shard. Uses a local
+        copy -- self.counts (and therefore get_coverage_bonus()) is never
+        mutated by this call. Every rank must call this the same number of
+        times with the same world_size (it's a collective) -- true here
+        since it's only ever invoked from a cfg.log_every-gated block that
+        every rank reaches in lockstep.
+        """
+        counts = self.counts
+        if world_size > 1:
+            counts = counts.clone()
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        selected_mask = counts > 0
         return {
             "coverage_ratio": selected_mask.float().mean().item(),
-            "avg_selection_count": self.counts[selected_mask].mean().item() if selected_mask.any() else 0,
-            "max_selection_count": self.counts.max().item(),
-            "min_selection_count": self.counts[selected_mask].min().item() if selected_mask.any() else 0,
+            "avg_selection_count": counts[selected_mask].mean().item() if selected_mask.any() else 0,
+            "max_selection_count": counts.max().item(),
+            "min_selection_count": counts[selected_mask].min().item() if selected_mask.any() else 0,
         }
 
 
@@ -1141,39 +1160,67 @@ def train_router_experiments(
 
             # --- Logging ---
             global_step += 1
-            if global_step % cfg.log_every == 0 and cfg.rank == 0:
-                curriculum_strength = 1.0 - progress
+            if global_step % cfg.log_every == 0:
+                # loss_lm/loss_router/policy_loss/entropy/avg_reward are all
+                # this rank's own local-shard values; average across ranks
+                # before logging so world_size>1 runs plot the whole step,
+                # not just rank 0's 1/world_size sliver. Every rank hits this
+                # collective in lockstep (equal per-rank step counts, see
+                # make_pool_loader's DistributedSampler) -- only rank 0
+                # then actually writes to wandb/prints below.
+                log_scalars = torch.stack([
+                    loss_lm.detach(), loss_router.detach(), policy_loss.detach(),
+                    entropy.detach(), reward.mean().detach(),
+                ])
+                if cfg.world_size > 1:
+                    log_scalars = log_scalars.clone()
+                    dist.all_reduce(log_scalars, op=dist.ReduceOp.SUM)
+                    log_scalars /= cfg.world_size
+                agg_loss_lm, agg_loss_router, agg_policy_loss, agg_entropy, agg_avg_reward = log_scalars.tolist()
 
-                log_data = {
-                    "epoch": epoch,
-                    "step": global_step,
-                    "loss_lm": loss_lm.item(),
-                    "loss_router": loss_router.item(),
-                    "policy_loss": policy_loss.item(),
-                    "entropy": -entropy.item(),  # entropy is -H; negate to log positive H
-                    "avg_reward": reward.mean().item(),
-                    "curriculum_strength": curriculum_strength,
-                    "tokens_seen": total_tokens_seen,
-                    "temperature": current_temp,
-                    "lambda_ent": current_lambda_ent,
-                    "select_k": select_k,
-                    "feat_time_ms": total_feat_time / cfg.log_every * 1000,
-                    **diversity.get_metrics(),
-                }
-                total_feat_time = 0.0
-
-                # Add coverage stats if enabled
-                if coverage_tracker is not None:
-                    log_data.update(coverage_tracker.get_coverage_stats())
-
-                metrics.log(**log_data)
-
-                print(
-                    f"[{cfg.training_algorithm.upper()}] Step {global_step} | "
-                    f"loss_lm={loss_lm.item():.4f} | "
-                    f"loss_router={loss_router.item():.4f} | "
-                    f"temp={current_temp:.3f} | "
+                # get_metrics()/get_coverage_stats() themselves issue
+                # collectives (all_reduce/all_gather_object) when
+                # world_size > 1, so every rank must call them here, not
+                # just rank 0.
+                div_metrics = diversity.get_metrics(world_size=cfg.world_size)
+                coverage_stats = (
+                    coverage_tracker.get_coverage_stats(world_size=cfg.world_size)
+                    if coverage_tracker is not None else None
                 )
+
+                if cfg.rank == 0:
+                    curriculum_strength = 1.0 - progress
+
+                    log_data = {
+                        "epoch": epoch,
+                        "step": global_step,
+                        "loss_lm": agg_loss_lm,
+                        "loss_router": agg_loss_router,
+                        "policy_loss": agg_policy_loss,
+                        "entropy": -agg_entropy,  # entropy is -H; negate to log positive H
+                        "avg_reward": agg_avg_reward,
+                        "curriculum_strength": curriculum_strength,
+                        "tokens_seen": total_tokens_seen,
+                        "temperature": current_temp,
+                        "lambda_ent": current_lambda_ent,
+                        "select_k": select_k,
+                        "feat_time_ms": total_feat_time / cfg.log_every * 1000,
+                        **div_metrics,
+                    }
+                    total_feat_time = 0.0
+
+                    # Add coverage stats if enabled
+                    if coverage_stats is not None:
+                        log_data.update(coverage_stats)
+
+                    metrics.log(**log_data)
+
+                    print(
+                        f"[{cfg.training_algorithm.upper()}] Step {global_step} | "
+                        f"loss_lm={agg_loss_lm:.4f} | "
+                        f"loss_router={agg_loss_router:.4f} | "
+                        f"temp={current_temp:.3f} | "
+                    )
 
         # --- Validation ---
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
@@ -1369,24 +1416,45 @@ def train_aux_baseline(
             diversity.update(selected_indices, selected_diffs)
 
             global_step += 1
-            if global_step % cfg.log_every == 0 and cfg.rank == 0:
-                training_progress = global_step / total_steps
-                div_metrics = diversity.get_metrics()
-                metrics.log(
-                    epoch=epoch,
-                    step=global_step,
-                    loss_lm=loss_lm.item(),
-                    loss_aux=loss_aux.item(),
-                    avg_improvement=actual_improvement.mean().item(),
-                    curriculum_strength=1.0 - training_progress,
-                    tokens_seen=total_tokens_seen,
-                    **div_metrics,
-                )
-                print(
-                    f"[AuxNet] Step {global_step} | "
-                    f"loss_lm={loss_lm.item():.4f} | "
-                    f"loss_aux={loss_aux.item():.6f}"
-                )
+            if global_step % cfg.log_every == 0:
+                # loss_lm/loss_aux/avg_improvement are all this rank's own
+                # local-shard values; average across ranks before logging so
+                # world_size>1 runs plot the whole step, not just rank 0's
+                # 1/world_size sliver. Every rank hits this collective in
+                # lockstep (equal per-rank step counts, see make_pool_loader's
+                # DistributedSampler) -- only rank 0 then actually writes to
+                # wandb/prints below.
+                log_scalars = torch.stack([
+                    loss_lm.detach(), loss_aux.detach(), actual_improvement.mean().detach(),
+                ])
+                if cfg.world_size > 1:
+                    log_scalars = log_scalars.clone()
+                    dist.all_reduce(log_scalars, op=dist.ReduceOp.SUM)
+                    log_scalars /= cfg.world_size
+                agg_loss_lm, agg_loss_aux, agg_avg_improvement = log_scalars.tolist()
+
+                # get_metrics() itself issues collectives (all_reduce/
+                # all_gather_object) when world_size > 1, so every rank must
+                # call it here, not just rank 0.
+                div_metrics = diversity.get_metrics(world_size=cfg.world_size)
+
+                if cfg.rank == 0:
+                    training_progress = global_step / total_steps
+                    metrics.log(
+                        epoch=epoch,
+                        step=global_step,
+                        loss_lm=agg_loss_lm,
+                        loss_aux=agg_loss_aux,
+                        avg_improvement=agg_avg_improvement,
+                        curriculum_strength=1.0 - training_progress,
+                        tokens_seen=total_tokens_seen,
+                        **div_metrics,
+                    )
+                    print(
+                        f"[AuxNet] Step {global_step} | "
+                        f"loss_lm={agg_loss_lm:.4f} | "
+                        f"loss_aux={agg_loss_aux:.6f}"
+                    )
 
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
         # other ranks wait so nobody starts the next epoch's DDP-synchronizing
