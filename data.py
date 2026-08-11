@@ -312,24 +312,20 @@ def make_pool_loader(
     DDP-synchronizing .backward() calls (a mismatch would hang NCCL).
     """
     dataset = _IndexedDataset(ds)
+    sampler = None 
+    shuffle = True 
     if world_size > 1:
         sampler = DistributedSampler(
             dataset, num_replicas=world_size, rank=rank,
             shuffle=True, drop_last=True, seed=seed,
         )
-        return DataLoader(
-            dataset,
-            batch_size=pool_size,
-            sampler=sampler,
-            drop_last=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=num_workers > 0,
-        )
+        shuffle = None 
+    
     return DataLoader(
         dataset,
         batch_size=pool_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler = sampler, 
         drop_last=True,
         num_workers=num_workers,
         pin_memory=pin_memory,

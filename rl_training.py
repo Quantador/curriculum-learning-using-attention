@@ -714,6 +714,14 @@ def train_router_experiments(
         ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
         model = DDP(model, device_ids=ddp_device_ids)
         router = DDP(router, device_ids=ddp_device_ids)
+    # Unwrapped handle for rank-0-only eval: only rank 0 calls evaluate()/
+    # evaluate_per_domain() (see below), but DDP's forward() broadcasts
+    # module buffers whenever the last grad-enabled forward left
+    # require_forward_param_sync set (true for HF models with registered
+    # buffers, e.g. GPT-2's attn.bias) -- a collective every other rank
+    # isn't there to join, hanging NCCL. Evaluating the unwrapped module
+    # sidesteps DDP's forward entirely.
+    eval_model = model.module if isinstance(model, DDP) else model
 
     opt_lm = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
     opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
@@ -1143,7 +1151,7 @@ def train_router_experiments(
         # .backward() calls before rank 0 has finished its forward-only pass.
         if cfg.rank == 0:
             loss_fn = nn.CrossEntropyLoss()
-            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
 
             epoch_time = time.perf_counter() - epoch_start
             metrics.log(
@@ -1165,7 +1173,7 @@ def train_router_experiments(
     # --- Final per-domain perplexity, fully trained model ---
     if cfg.rank == 0:
         loss_fn = nn.CrossEntropyLoss()
-        per_domain_ppl = evaluate_per_domain(model, val_ds, loss_fn, cfg)
+        per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
         metrics.log(
             step=global_step,
             **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
@@ -1233,6 +1241,13 @@ def train_aux_baseline(
         ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
         model = DDP(model, device_ids=ddp_device_ids)
         aux_net = DDP(aux_net, device_ids=ddp_device_ids)
+    # Unwrapped handle for rank-0-only eval: only rank 0 calls evaluate()
+    # (see below), but DDP's forward() broadcasts module buffers whenever
+    # the last grad-enabled forward left require_forward_param_sync set
+    # (true for HF models with registered buffers, e.g. GPT-2's attn.bias)
+    # -- a collective every other rank isn't there to join, hanging NCCL.
+    # Evaluating the unwrapped module sidesteps DDP's forward entirely.
+    eval_model = model.module if isinstance(model, DDP) else model
 
     print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
@@ -1342,7 +1357,7 @@ def train_aux_baseline(
         # other ranks wait so nobody starts the next epoch's DDP-synchronizing
         # .backward() calls before rank 0 has finished its forward-only pass.
         if cfg.rank == 0:
-            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
             epoch_time = time.perf_counter() - epoch_start
             metrics.log(
                 epoch=epoch,
