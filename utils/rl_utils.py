@@ -126,6 +126,7 @@ def ppo_update(
     sel_idx: torch.Tensor,
     cfg: ExperimentConfig,
     lambda_ent: float,
+    temperature: float,
     entropy_type: str = "shannon",
     entropy_alpha: float = 2.0,
     entropy_q: float = 2.0,
@@ -138,6 +139,13 @@ def ppo_update(
         L = min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)
     where ratio = new_log_prob / old_log_prob and ε = cfg.ppo_clip.
     Clipping prevents destructively large policy updates in a single step.
+
+    `temperature` must be the same value the caller used to produce
+    old_log_probs (i.e. the schedule-annealed current_temp, not the static
+    cfg.temp) -- otherwise ratio = exp(new_log_probs - old_log_probs) mixes
+    two different temperatures' softmax outputs, corrupting the ratio with a
+    spurious offset unrelated to any actual policy drift, even on the very
+    first inner epoch before router weights have moved at all.
 
     Advantages are normalised across the selected batch before clipping.
     Coverage loss is applied only on the first inner epoch to avoid
@@ -156,9 +164,12 @@ def ppo_update(
     total_entropy = torch.tensor(0.0, device=cfg.device)
 
     for _ in range(cfg.ppo_epochs):
-        # Recompute probabilities with current router
+        # Recompute probabilities with current router, at the same
+        # temperature old_log_probs was computed at (see docstring) --
+        # NOT cfg.temp, which is the static/initial value and ignores
+        # cfg.temp_schedule's annealing.
         scores = router(feats)
-        probs = torch.softmax(scores / cfg.temp, dim=0)
+        probs = torch.softmax(scores / temperature, dim=0)
         new_log_probs = probs[sel_idx].clamp_min(1e-12).log()
 
         # PPO clipped objective

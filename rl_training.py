@@ -1150,6 +1150,7 @@ def train_router_experiments(
                     sel_idx=sel_idx,
                     cfg=cfg,
                     lambda_ent=current_lambda_ent,
+                    temperature=current_temp,
                     **ent_kwargs,
                 )
 
