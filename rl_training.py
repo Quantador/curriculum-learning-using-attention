@@ -30,6 +30,7 @@ Entry points:
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import random
@@ -793,7 +794,12 @@ def train_router_experiments(
             device=cfg.device,
         )
 
-    total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
+    # // world_size before // pool: under DDP each rank only sees its shard
+    # (make_pool_loader's DistributedSampler truncates to len(ds)//world_size
+    # candidates per rank, drop_last=True -- see data.py), so this must match
+    # steps actually taken per rank per epoch, not the single-process count,
+    # or progress (used below to drive every schedule) would never reach 1.0.
+    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.pool) * cfg.epochs)
     global_step = 0
     # Tokens fed to the LM so far. TokenizedCorpus yields fixed-length windows
     # (block tokens, no padding — see data.py), so this is just
@@ -982,7 +988,19 @@ def train_router_experiments(
                 reduction="mean",
             )
 
-            loss_lm.backward()
+            # DDP's Reducer all-reduces (averages) gradients across ranks as
+            # part of backward() itself -- by the time backward() returns,
+            # .grad is already the world-averaged gradient, not this rank's
+            # own. That's exactly right for opt_lm.step() (one shared model),
+            # but it means compute_gradient_reward() below would read a value
+            # that's identical on every rank and barely moved by this rank's
+            # own selection -- useless as a per-rank RL reward. no_sync()
+            # skips that automatic reduction so backward() leaves .grad
+            # purely local to this rank's own X_sel/Y_sel.
+            local_grad_reward = cfg.world_size > 1 and isinstance(model, DDP) and cfg.reward_signal in ("gradient_norm", "gradient_alignment")
+            backward_ctx = model.no_sync() if local_grad_reward else contextlib.nullcontext()
+            with backward_ctx:
+                loss_lm.backward()
 
             gradient_reward = None
             if cfg.reward_signal in ("gradient_norm", "gradient_alignment"):
@@ -997,6 +1015,18 @@ def train_router_experiments(
                     param_count=grad_param_count,
                     clip=cfg.gradient_reward_clip,
                 )
+
+            if local_grad_reward:
+                # no_sync() above skipped DDP's automatic averaging, so
+                # manually replicate it now (sum then divide by world_size)
+                # before opt_lm.step() -- otherwise every rank's LM replica
+                # would drift out of sync, applying only its own local
+                # gradient instead of the shared, averaged update.
+                for p in grad_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(cfg.world_size)
+
             opt_lm.step()
 
             # loss and entropy AFTER update
@@ -1255,7 +1285,12 @@ def train_aux_baseline(
     opt_lm  = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
     opt_aux = torch.optim.Adam(aux_net.parameters(), lr=cfg.lr_router)
 
-    total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
+    # // world_size before // pool: under DDP each rank only sees its shard
+    # (make_pool_loader's DistributedSampler truncates to len(ds)//world_size
+    # candidates per rank, drop_last=True -- see data.py), so this must match
+    # steps actually taken per rank per epoch, not the single-process count,
+    # or training_progress (used below) would never reach 1.0.
+    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.pool) * cfg.epochs)
     global_step = 0
     total_tokens_seen = 0
 
