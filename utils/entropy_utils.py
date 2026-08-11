@@ -121,7 +121,7 @@ def compute_entropy(
 
     elif entropy_type == "kl_uniform":
         # Return negative KL so that minimizing increases uniformity
-        return -compute_kl_from_uniform(probs)
+        return compute_kl_from_uniform(probs)
 
     else:
         return compute_shannon_entropy(probs)

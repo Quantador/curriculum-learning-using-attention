@@ -1048,11 +1048,30 @@ def train_router_experiments(
 
             opt_lm.step()
 
-            # loss and entropy AFTER update
+            # loss and entropy AFTER update: skip this extra full forward
+            # pass when reward_signal='greats_score', since compute_reward()'s
+            # greats_score branch below ignores loss_before/loss_after
+            # entirely (its reward comes from the ghost gradient-dot-product
+            # score instead) and entropy_after is already unused in that mode
+            # (only computed for 'uncertainty_reduction'/'combined', which
+            # greats_score can't simultaneously be). The one other consumer,
+            # coverage_tracker.update()'s uncertainty-based bonus, still
+            # needs a real per-sample loss, so keep computing it then.
+            needs_real_loss_after = cfg.reward_signal != "greats_score" or (
+                coverage_tracker is not None and cfg.coverage_type == "uncertainty"
+            )
             with torch.no_grad():
-                logits_after = model(X_sel)
-                loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
-                entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
+                if needs_real_loss_after:
+                    logits_after = model(X_sel)
+                    loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
+                    entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
+                else:
+                    # Discarded stand-in: never read by compute_reward()'s
+                    # greats_score branch, and coverage_tracker.update()'s
+                    # `losses` arg is only read when coverage_type ==
+                    # 'uncertainty', ruled out above.
+                    loss_after = loss_before
+                    entropy_after = None
     
             # Get difficulty scores for selected samples
             # Conditions for selected_domains to act as difficulty markers 
