@@ -194,7 +194,7 @@ def train_baseline(
     eval_model = model.module if isinstance(model, DDP) else model
 
     loss_fn = nn.CrossEntropyLoss()
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
 
     global_step = 0
     total_tokens_seen = 0

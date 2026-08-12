@@ -744,8 +744,8 @@ def train_router_experiments(
     # sidesteps DDP's forward entirely.
     eval_model = model.module if isinstance(model, DDP) else model
 
-    opt_lm = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
-    opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
+    opt_lm = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
     grad_params = [p for p in model.parameters() if p.requires_grad]
     grad_param_count = sum(p.numel() for p in grad_params)
@@ -1357,8 +1357,8 @@ def train_aux_baseline(
     print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
     mse_fn  = nn.MSELoss()
-    opt_lm  = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
-    opt_aux = torch.optim.Adam(aux_net.parameters(), lr=cfg.lr_router)
+    opt_lm  = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt_aux = torch.optim.AdamW(aux_net.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
     # // world_size before // pool: under DDP each rank only sees its shard
     # (make_pool_loader's DistributedSampler truncates to len(ds)//world_size
