@@ -125,8 +125,8 @@ def generate_experiment_configs(
                                 the sweep's own control condition.
       - 'aux_baseline':         supervised MSE alternative to the router
                                 (rl_training.train_aux_baseline()).
-      - 'random_batch_baseline': uniform random cfg.batch-sized selection,
-                                no router/aux_net (training.train_baseline()).
+      - 'random_batch_baseline': uniform random cfg.global_batch_size-sized
+                                selection, no router/aux_net (training.train_baseline()).
       - 'random_pool_baseline':  same, but selecting cfg.pool samples (the
                                 router's whole candidate pool, unfiltered).
     None of these are ablated EXPERIMENTAL_FIELDS entries — they're fixed

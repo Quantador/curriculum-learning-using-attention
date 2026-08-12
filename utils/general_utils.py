@@ -82,11 +82,14 @@ def memory_signature(cfg: ExperimentConfig) -> Tuple[Any, ...]:
     signature are assumed to need the same amount of GPU memory, so we only
     probe once per signature instead of once per config.
 
-    Uses the *effective* LM batch size, not the raw cfg.batch: run_random_pool_baseline
-    widens the selected batch to cfg.pool at runtime (see utils/experiment_worker.py),
-    so probing it under cfg.batch would understate its real peak memory and risk an
-    OOM once the scheduler packs it alongside other jobs."""
-    effective_batch = cfg.pool if cfg.run_random_pool_baseline else cfg.batch
+    Uses the *effective* LM batch size, not the raw cfg.per_rank_batch_size:
+    run_random_pool_baseline widens the selected batch to cfg.pool at runtime
+    (see utils/experiment_worker.py), so probing it under
+    cfg.per_rank_batch_size would understate its real peak memory and risk an
+    OOM once the scheduler packs it alongside other jobs. GPU-memory probing
+    only ever runs single-process (world_size=1 -- see run_ddp_sweep()'s
+    docstring), so per_rank_batch_size == global_batch_size here regardless."""
+    effective_batch = cfg.pool if cfg.run_random_pool_baseline else cfg.per_rank_batch_size
     return (
         cfg.model_type, cfg.hf_model_name,
         cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.n_chunks,

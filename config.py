@@ -3,7 +3,7 @@
 Central configuration for all curriculum learning experiments.
 
 Two dataclasses:
-  - Config: base training hyperparameters (model size, batch, lr, etc.)
+  - Config: base training hyperparameters (model size, global_batch_size, lr, etc.)
   - ExperimentConfig: extends Config with all experiment-specific knobs —
     router architecture, training algorithm (REINFORCE/GRPO/PPO), reward
     signal, entropy formulation, dataset choices, coverage regularization,
@@ -53,7 +53,7 @@ class Config:
     hf_model_name: str = "Qwen/Qwen3-1.7B"
 
     # Training
-    batch: int = 16
+    global_batch_size: int = 16
     pool_mult: int = 5
     epochs: int = 10
     lr_lm: float = 3e-4
@@ -132,7 +132,23 @@ class Config:
 
     @property
     def pool(self) -> int:
-        return self.pool_mult * self.batch
+        return self.pool_mult * self.global_batch_size
+
+    @property
+    def per_rank_batch_size(self) -> int:
+        """global_batch_size split evenly across ranks -- the number of
+        samples each GPU actually draws/selects per step under DDP.
+        world_size=1 (the default) leaves this equal to global_batch_size.
+        Any remainder (global_batch_size not a multiple of world_size) is
+        dropped, same truncate-to-fit approach PooledBatchSampler already
+        uses for pool sharding."""
+        per_rank = self.global_batch_size // self.world_size
+        if per_rank < 1:
+            raise ValueError(
+                f"global_batch_size={self.global_batch_size} is smaller than "
+                f"world_size={self.world_size}: each rank would get 0 samples per step."
+            )
+        return per_rank
     
     
     
@@ -324,14 +340,14 @@ class ExperimentConfig(Config):
     selection_strategy: str = "topk"  # options: topk, sample, epsilon_greedy
     epsilon_greedy: float = 0.1  # epsilon for epsilon_greedy selection
 
-    # Curriculum-ratio schedule: instead of a fixed cfg.batch, the number of
-    # samples selected into the training batch each step is
+    # Curriculum-ratio schedule: instead of a fixed cfg.per_rank_batch_size,
+    # the number of samples selected into the training batch each step is
     # round(ratio * pool_size), with `ratio` annealed from
     # curriculum_ratio_initial down to curriculum_ratio_min over training
     # progress. Starts weakly selective (rate/accept most of the pool) and
     # tightens into a strongly selective curriculum (only the router's
-    # top few percent) by the end of training. cfg.batch is unused while
-    # this is on -- see train_router_experiments() in rl_training.py.
+    # top few percent) by the end of training. cfg.global_batch_size is
+    # unused while this is on -- see train_router_experiments() in rl_training.py.
     use_curriculum_ratio_schedule: bool = False
     curriculum_ratio_schedule: str = "linear_decay"  # same vocabulary as temp_schedule
     curriculum_ratio_initial: float = 0.9  # fraction of pool selected at progress=0
@@ -397,9 +413,10 @@ class ExperimentConfig(Config):
 
     # Non-learned control baselines (training.train_baseline: uniform random
     # selection, no router/aux_net at all). run_random_batch_baseline draws
-    # cfg.batch random samples per step (same shape as the router's selected
-    # batch); run_random_pool_baseline draws cfg.pool (the router's full
-    # candidate pool, unfiltered) -- see utils/experiment_worker.py.
+    # cfg.global_batch_size random samples per step (same shape as the
+    # router's selected batch, split across ranks like any other run);
+    # run_random_pool_baseline draws cfg.pool (the router's full candidate
+    # pool, unfiltered, also split across ranks) -- see utils/experiment_worker.py.
     run_random_batch_baseline: bool = False
     run_random_pool_baseline: bool = False
 

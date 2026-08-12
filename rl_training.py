@@ -869,7 +869,7 @@ def train_router_experiments(
         #      GPU work is still running -- see cfg.dataloader_num_workers).
         #   2. Extract router features for all M samples.
         #   3. Router scores pool → softmax(/ temp) → select k samples (k =
-        #      cfg.batch, or an annealed fraction of the pool when
+        #      cfg.per_rank_batch_size, or an annealed fraction of the pool when
         #      cfg.use_curriculum_ratio_schedule is on).
         #   4. LM forward + backward on selected batch.
         #   5. Compute reward signal (loss improvement, gradient norm, etc.).
@@ -901,8 +901,8 @@ def train_router_experiments(
 
             # Curriculum-ratio schedule: shrink the selected batch from a
             # weakly-selective fraction of the pool down to a strongly-selective
-            # one over training, instead of a fixed cfg.batch. See config.py's
-            # use_curriculum_ratio_schedule docstring.
+            # one over training, instead of a fixed cfg.per_rank_batch_size. See
+            # config.py's use_curriculum_ratio_schedule docstring.
             if cfg.use_curriculum_ratio_schedule:
                 current_ratio = get_scheduled_value(
                     cfg.curriculum_ratio_schedule, cfg.curriculum_ratio_initial, cfg.curriculum_ratio_min,
@@ -910,7 +910,7 @@ def train_router_experiments(
                 )
                 select_k = max(1, min(len(pool_indices), round(current_ratio * len(pool_indices))))
             else:
-                select_k = cfg.batch
+                select_k = cfg.per_rank_batch_size
 
             # --- Router features over the full pool ---
             feat_start = time.perf_counter()
@@ -1398,7 +1398,7 @@ def train_aux_baseline(
             # --- Selection: top-k by predicted improvement ---
             with torch.no_grad():
                 predicted_improvement = aux_net(feats.detach())  # [M]
-            topk = torch.topk(predicted_improvement, k=cfg.batch)
+            topk = torch.topk(predicted_improvement, k=cfg.per_rank_batch_size)
             sel_idx_local = topk.indices
 
             X_sel = X[sel_idx_local]

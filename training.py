@@ -43,7 +43,7 @@ def evaluate(
     Uses a plain sequential DataLoader (no shuffling needed for a full-pass
     eval) -- TokenizedCorpus windows are all exactly cfg.block tokens (no
     padding, see data.py), so batching never introduces padding artefacts.
-    batch_size is independent of cfg.batch: no gradients are held here, so it
+    batch_size is independent of cfg.global_batch_size: no gradients are held here, so it
     can be much larger. pin_memory speeds up the host->GPU copy;
     cfg.dataloader_num_workers lets the next batch's CPU-side gather overlap
     with the current batch's forward pass (matters less here than in the
@@ -154,9 +154,12 @@ def train_baseline(
     """
     Train TinyGPT with uniform random batch selection (no curriculum).
 
-    At each step, draws cfg.batch samples uniformly at random from a pool
-    of cfg.pool candidates (pool_mult × batch). This is the control condition —
-    it sets the performance floor that the router should beat.
+    At each step, draws cfg.per_rank_batch_size samples uniformly at random
+    from a pool of cfg.pool candidates (pool_mult × global_batch_size).
+    global_batch_size is split evenly across ranks, so under DDP each rank
+    only ever draws its own cfg.per_rank_batch_size-sized slice. This is the
+    control condition — it sets the performance floor that the router should
+    beat.
     """
 
     if cfg.use_wandb and cfg.rank == 0:
@@ -195,7 +198,7 @@ def train_baseline(
     global_step = 0
     total_tokens_seen = 0
     baseline_loader = make_baseline_loader(
-        train_ds, cfg.pool, cfg.batch,
+        train_ds, cfg.pool, cfg.per_rank_batch_size,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
@@ -248,7 +251,7 @@ def train_baseline(
                         epoch=epoch,
                         step=global_step,
                         loss_lm=log_loss.item(),
-                        entropy=math.log(cfg.batch),
+                        entropy=math.log(cfg.per_rank_batch_size),
                         tokens_seen=total_tokens_seen,
                         **div_metrics,
                     )

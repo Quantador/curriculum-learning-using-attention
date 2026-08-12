@@ -1,6 +1,6 @@
 experiment_name: test_exp_speed
 epochs: 10
-batch: 16
+global_batch_size: 16
 pool_mult: 10
 lr_lm: 0.0003
 use_wandb: true

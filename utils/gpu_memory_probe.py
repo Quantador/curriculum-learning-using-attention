@@ -84,12 +84,13 @@ def main() -> None:
         )
     elif probe_cfg.run_random_batch_baseline or probe_cfg.run_random_pool_baseline:
         # pool_mult=1 too -- see utils/experiment_worker.py's identical replace()
-        # call for why (cfg.pool is a pool_mult*batch property, so widening
-        # batch alone re-inflates pool by another factor of pool_mult).
+        # call for why (cfg.pool is a pool_mult*global_batch_size property, so
+        # widening global_batch_size alone re-inflates pool by another factor
+        # of pool_mult).
         random_cfg = (
             probe_cfg
             if probe_cfg.run_random_batch_baseline
-            else replace(probe_cfg, batch=probe_cfg.pool, pool_mult=1)
+            else replace(probe_cfg, global_batch_size=probe_cfg.pool, pool_mult=1)
         )
         train_baseline(
             cfg=random_cfg,

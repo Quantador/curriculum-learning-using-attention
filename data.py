@@ -339,7 +339,7 @@ class PooledBatchSampler(Sampler):
     partition a shuffled permutation of range(ds_len) into non-overlapping
     pools of pool_size, then yield a uniformly random batch_size-sized
     subsample of each pool -- same distribution as the old
-    make_index_loader() + inline random.sample(pool_indices, cfg.batch), but
+    make_index_loader() + inline random.sample(pool_indices, cfg.per_rank_batch_size), but
     as a batch_sampler so DataLoader only ever fetches the batch_size samples
     actually used, not all pool_size candidates (unlike make_pool_loader()
     above, the random baseline never looks at the rest of the pool).

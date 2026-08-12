@@ -91,16 +91,18 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         )
     elif cfg.run_random_batch_baseline or cfg.run_random_pool_baseline:
         # Non-learned controls: uniform random selection, no router/aux_net.
-        # training.train_baseline() already draws cfg.batch random samples
-        # from a cfg.pool-sized window each step, so the "random batch the
-        # size of the pool" variant is just that same function with
-        # batch widened to pool via replace() -- no new training loop needed.
-        # pool_mult=1 too: cfg.pool is a property (pool_mult * batch), so
-        # widening batch alone would silently re-inflate pool by another
-        # factor of pool_mult, shrinking the window to 1/pool_mult of the
-        # dataset and making train_baseline's random.sample(window, batch)
+        # training.train_baseline() already draws cfg.global_batch_size random
+        # samples (split across ranks) from a cfg.pool-sized window each step,
+        # so the "random batch the size of the pool" variant is just that same
+        # function with global_batch_size widened to pool via replace() -- no
+        # new training loop needed, and the widened pool-sized batch still
+        # gets split across ranks like any other global_batch_size.
+        # pool_mult=1 too: cfg.pool is a property (pool_mult * global_batch_size),
+        # so widening global_batch_size alone would silently re-inflate pool by
+        # another factor of pool_mult, shrinking the window to 1/pool_mult of
+        # the dataset and making train_baseline's random.sample(window, batch)
         # discard most of each window instead of training on all of it.
-        random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, batch=cfg.pool, pool_mult=1)
+        random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, global_batch_size=cfg.pool, pool_mult=1)
         model_router = train_baseline(
             cfg=random_cfg,
             model=model_router,
