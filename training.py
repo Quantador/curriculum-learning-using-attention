@@ -27,6 +27,7 @@ from tqdm import tqdm
 from config import Config
 from data import make_baseline_loader, TokenizedCorpus
 from models.model import TinyGPT
+from utils.general_utils import autocast_ctx
 from utils.metrics import MetricsTracker, DiversityTracker
 
 
@@ -61,7 +62,7 @@ def evaluate(
         pin_memory=(cfg.device != "cpu"),
     )
     total_loss, total_tok = 0.0, 0
-    with torch.no_grad():
+    with torch.no_grad(), autocast_ctx(cfg.device):
         for X, Y, _ in loader:
             X = X.to(cfg.device, non_blocking=True)
             Y = Y.to(cfg.device, non_blocking=True)
@@ -114,7 +115,7 @@ def evaluate_per_domain(
         num_workers=cfg.dataloader_num_workers,
         pin_memory=(cfg.device != "cpu"),
     )
-    with torch.no_grad():
+    with torch.no_grad(), autocast_ctx(cfg.device):
         for X, Y, domains in loader:
             X = X.to(cfg.device, non_blocking=True)
             Y = Y.to(cfg.device, non_blocking=True)
@@ -216,11 +217,12 @@ def train_baseline(
             total_tokens_seen += X.numel() * cfg.world_size
 
             opt.zero_grad()
-            logits = model(X)
-            loss = loss_fn(
-                logits.view(-1, logits.size(-1)),
-                Y.view(-1),
-            )
+            with autocast_ctx(cfg.device):
+                logits = model(X)
+                loss = loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    Y.view(-1),
+                )
             loss.backward()
             opt.step()
 

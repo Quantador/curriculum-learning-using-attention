@@ -4,7 +4,7 @@ import os
 import sys
 import subprocess
 import yaml
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from consts import EXPERIMENT_PROFILES, PER_PROC_BUFFER, CONTEXT_OVERHEAD_BYTES, EXPERIMENTAL_FIELDS
@@ -38,6 +38,16 @@ def get_profile_fields(profile: str | None) -> Dict[str, tuple[Any, List[Any]]] 
 
 def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def autocast_ctx(device: str):
+    """bf16 autocast for the LM's forward passes on CUDA -- halves activation
+    memory relative to the fp32 compute this codebase otherwise defaults to,
+    with no GradScaler needed (bf16 keeps fp32's exponent range, unlike fp16).
+    No-op on CPU, where autocast isn't needed for this codebase's models."""
+    if device.startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def dump_config(cfg: ExperimentConfig, path: Path) -> None:

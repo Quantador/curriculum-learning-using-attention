@@ -70,75 +70,85 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     # later, not just final ppl (see MetricsTracker.save()'s "total_time_s").
     run_start = time.perf_counter()
 
-    if cfg.run_aux_baseline:
-        # Supervised MSE alternative to the policy-gradient router (ablation
-        # baseline) — same feature pipeline and top-k selection, different
-        # training objective. See rl_training.train_aux_baseline().
-        aux_net = build_router(
-            d_input=get_router_feature_dim(cfg, model_router.block),
-            arch="auxnet",
-            d_hidden=cfg.aux_net_hidden,
-        )
-        model_router, _ = train_aux_baseline(
-            cfg=cfg,
-            model=model_router,
-            aux_net=aux_net,
-            train_ds=train_ds,
-            val_ds=val_ds,
-            tokenizer=tokenizer,
-            metrics=experiment_metrics,
-            diversity=router_div,
-        )
-    elif cfg.run_random_batch_baseline or cfg.run_random_pool_baseline:
-        # Non-learned controls: uniform random selection, no router/aux_net.
-        # training.train_baseline() already draws cfg.global_batch_size random
-        # samples (split across ranks) from a cfg.pool-sized window each step,
-        # so the "random batch the size of the pool" variant is just that same
-        # function with global_batch_size widened to pool via replace() -- no
-        # new training loop needed, and the widened pool-sized batch still
-        # gets split across ranks like any other global_batch_size.
-        # pool_mult=1 too: cfg.pool is a property (pool_mult * global_batch_size),
-        # so widening global_batch_size alone would silently re-inflate pool by
-        # another factor of pool_mult, shrinking the window to 1/pool_mult of
-        # the dataset and making train_baseline's random.sample(window, batch)
-        # discard most of each window instead of training on all of it.
-        random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, global_batch_size=cfg.pool, pool_mult=1)
-        model_router = train_baseline(
-            cfg=random_cfg,
-            model=model_router,
-            train_ds=train_ds,
-            val_ds=val_ds,
-            metrics=experiment_metrics,
-            diversity=router_div,
-        )
-    else:
-        router = build_router(
-            d_input=get_router_feature_dim(cfg, model_router.block),
-            arch=cfg.router_architecture,
-            d_k=128,
-            n_heads=getattr(cfg, "router_n_heads", 1),
-        )
-        model_router, router = train_router_experiments(
-            cfg=cfg,
-            model=model_router,
-            router=router,
-            train_ds=train_ds,
-            val_ds=val_ds,
-            tokenizer=tokenizer,
-            metrics=experiment_metrics,
-            diversity=router_div,
-        )
+    # try/finally so wandb.finish() always runs, even if training raises --
+    # otherwise a failed run (e.g. an OOM) leaves its wandb run open, and
+    # under run_ddp_sweep() (which runs every config sequentially in the same
+    # process, unlike run_scheduler()'s one-subprocess-per-config isolation)
+    # the NEXT config's wandb.init() call just reattaches to that still-open
+    # run instead of starting its own -- so its metrics silently land under
+    # the failed run's name instead of its own.
+    try:
+        if cfg.run_aux_baseline:
+            # Supervised MSE alternative to the policy-gradient router (ablation
+            # baseline) — same feature pipeline and top-k selection, different
+            # training objective. See rl_training.train_aux_baseline().
+            aux_net = build_router(
+                d_input=get_router_feature_dim(cfg, model_router.block),
+                arch="auxnet",
+                d_hidden=cfg.aux_net_hidden,
+            )
+            model_router, _ = train_aux_baseline(
+                cfg=cfg,
+                model=model_router,
+                aux_net=aux_net,
+                train_ds=train_ds,
+                val_ds=val_ds,
+                tokenizer=tokenizer,
+                metrics=experiment_metrics,
+                diversity=router_div,
+            )
+        elif cfg.run_random_batch_baseline or cfg.run_random_pool_baseline:
+            # Non-learned controls: uniform random selection, no router/aux_net.
+            # training.train_baseline() already draws cfg.global_batch_size random
+            # samples (split across ranks) from a cfg.pool-sized window each step,
+            # so the "random batch the size of the pool" variant is just that same
+            # function with global_batch_size widened to pool via replace() -- no
+            # new training loop needed, and the widened pool-sized batch still
+            # gets split across ranks like any other global_batch_size.
+            # pool_mult=1 too: cfg.pool is a property (pool_mult * global_batch_size),
+            # so widening global_batch_size alone would silently re-inflate pool by
+            # another factor of pool_mult, shrinking the window to 1/pool_mult of
+            # the dataset and making train_baseline's random.sample(window, batch)
+            # discard most of each window instead of training on all of it.
+            random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, global_batch_size=cfg.pool, pool_mult=1)
+            model_router = train_baseline(
+                cfg=random_cfg,
+                model=model_router,
+                train_ds=train_ds,
+                val_ds=val_ds,
+                metrics=experiment_metrics,
+                diversity=router_div,
+            )
+        else:
+            router = build_router(
+                d_input=get_router_feature_dim(cfg, model_router.block),
+                arch=cfg.router_architecture,
+                d_k=128,
+                n_heads=getattr(cfg, "router_n_heads", 1),
+            )
+            model_router, router = train_router_experiments(
+                cfg=cfg,
+                model=model_router,
+                router=router,
+                train_ds=train_ds,
+                val_ds=val_ds,
+                tokenizer=tokenizer,
+                metrics=experiment_metrics,
+                diversity=router_div,
+            )
 
-    total_time_s = time.perf_counter() - run_start
-    if cfg.rank == 0:
-        experiment_metrics.log(total_time_s=total_time_s)
-        print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
-
-    # The training loops above intentionally leave their wandb run open so
-    # total_time_s lands in it too; this closes it once everything's logged.
-    if cfg.use_wandb and cfg.rank == 0:
-        import wandb
-        wandb.finish()
+        total_time_s = time.perf_counter() - run_start
+        if cfg.rank == 0:
+            experiment_metrics.log(total_time_s=total_time_s)
+            print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
+    finally:
+        # The training loops above intentionally leave their wandb run open so
+        # total_time_s lands in it too; this closes it once everything's logged
+        # -- or, on a raised exception, closes whatever partial run is still
+        # open so it doesn't bleed into the next config's wandb.init().
+        if cfg.use_wandb and cfg.rank == 0:
+            import wandb
+            wandb.finish()
 
     if cfg.rank == 0:
         print("\n=== Comparing runs ===")

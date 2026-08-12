@@ -53,6 +53,7 @@ from training import evaluate, evaluate_per_domain  # keep using your existing e
 from models.router import extract_router_features
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 from utils.rl_utils import grpo_update, ppo_update, reinforce_update
+from utils.general_utils import autocast_ctx
 
 @torch.no_grad()
 def compute_loss_per_sample_vectorized(
@@ -992,7 +993,14 @@ def train_router_experiments(
             # zeroing for this real step.
             opt_lm.zero_grad()
 
-            logits = model(X_sel)  # [B, L, V]
+            with autocast_ctx(cfg.device):
+                logits = model(X_sel)  # [B, L, V]
+            # Cast back to fp32 so every downstream consumer (entropy/reward
+            # functions, GhostSuite's per-sample gradient hooks, DDP grad
+            # sync) sees the same dtype as before -- autocast's memory win
+            # comes from the transformer's internal activations having run
+            # in bf16, not from the dtype of this final tensor.
+            logits = logits.float()
 
             # per-sample loss and entropy BEFORE update
             with torch.no_grad():
@@ -1060,9 +1068,9 @@ def train_router_experiments(
             needs_real_loss_after = cfg.reward_signal != "greats_score" or (
                 coverage_tracker is not None and cfg.coverage_type == "uncertainty"
             )
-            with torch.no_grad():
+            with torch.no_grad(), autocast_ctx(cfg.device):
                 if needs_real_loss_after:
-                    logits_after = model(X_sel)
+                    logits_after = model(X_sel).float()
                     loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
                     entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
                 else:
@@ -1409,11 +1417,13 @@ def train_aux_baseline(
             total_tokens_seen += X_sel.numel() * cfg.world_size
 
             # --- Compute actual improvement ---
-            with torch.no_grad():
-                loss_before = compute_loss_per_sample_vectorized(model(X_sel), Y_sel)
+            with torch.no_grad(), autocast_ctx(cfg.device):
+                loss_before = compute_loss_per_sample_vectorized(model(X_sel).float(), Y_sel)
 
             opt_lm.zero_grad()
-            logits_sel = model(X_sel)
+            with autocast_ctx(cfg.device):
+                logits_sel = model(X_sel)
+            logits_sel = logits_sel.float()
             loss_lm = loss_fn(
                 logits_sel.view(-1, logits_sel.size(-1)),
                 Y_sel.view(-1),
@@ -1421,8 +1431,8 @@ def train_aux_baseline(
             loss_lm.backward()
             opt_lm.step()
 
-            with torch.no_grad():
-                loss_after = compute_loss_per_sample_vectorized(model(X_sel), Y_sel)
+            with torch.no_grad(), autocast_ctx(cfg.device):
+                loss_after = compute_loss_per_sample_vectorized(model(X_sel).float(), Y_sel)
 
             actual_improvement = (loss_before - loss_after).clamp(min=0.0).detach()
 

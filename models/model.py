@@ -33,6 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from config import Config
+from utils.general_utils import autocast_ctx
 
 
 class TinyGPT(nn.Module):
@@ -334,7 +335,11 @@ def extract_hierarchical_hidden(
                    layers' compute, for HFCausalLM it does not (see
                    HFCausalLM.forward_to_layer)
 
-    Always runs under torch.no_grad() — never affects LM gradients.
+    Always runs under torch.no_grad() — never affects LM gradients. Also runs
+    under bf16 autocast on CUDA (see autocast_ctx) since this forward pass
+    covers the whole pool (cfg.pool candidates, much larger than the
+    eventually-selected training batch) and is the dominant memory cost when
+    enable_text_hierarchical=True.
 
     Accepts model wrapped in DistributedDataParallel: forward_to_hidden/
     tok_embed/pos_embed are accessed via model.module in that case, since
@@ -342,7 +347,7 @@ def extract_hierarchical_hidden(
     a whole) through __getattr__, not the wrapped module's own attributes.
     """
     m = model.module if isinstance(model, DDP) else model
-    with torch.no_grad():
+    with torch.no_grad(), autocast_ctx(cfg.device):
         repr_mode = getattr(cfg, "hierarchical_representation", "full")
         if repr_mode == "full":
             h = m.forward_to_hidden(X)  # [B, L, D]
@@ -370,7 +375,11 @@ def extract_hierarchical_hidden(
     chunk_len = L // cfg.n_chunks
     h_reshaped = h.view(B, cfg.n_chunks, chunk_len, D)
     pooled = h_reshaped.mean(dim=2)          # [B, n_chunks, D]
-    return pooled.reshape(B, cfg.n_chunks * D)
+    # Autocast may have produced h in bf16; cast back to fp32 so callers
+    # (e.g. extract_router_features()'s torch.cat with fp32 text-stat/
+    # external-embedding features) always see a consistent dtype, regardless
+    # of whether this ran under autocast_ctx.
+    return pooled.reshape(B, cfg.n_chunks * D).float()
 
 
 
