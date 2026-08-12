@@ -133,6 +133,16 @@ COMPARE_USE_ORIGINAL_SEQUENCE: Dict[str, tuple[Any, List[Any]]] = {
     "use_original_sequence": (False, [True])
 }
 
+# Baseline: router updates (REINFORCE/GRPO/PPO) for the whole run (current
+# default, router_freeze_progress=None). Alternative: stop updating the
+# router after 30% of training progress, but keep using its now-frozen
+# weights to select samples for the remaining 70% -- tests whether continued
+# router training helps past that point, or an early-converged router is
+# already "good enough". See config.py's router_freeze_progress docstring.
+COMPARE_ROUTER_FREEZE: Dict[str, tuple[Any, List[Any]]] = {
+    "router_freeze_progress": (None, [0.3])
+}
+
 COMPARE_TRANSFORMER_LAYER: Dict[str, tuple[Any, List[Any]]] = {
     "hierarchical_layer_index": (0, [2, 4, 6, 8, 10, 12])
 }
@@ -214,6 +224,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "sentence_embedder_ablation": SENTENCE_EMBEDDER_ABLATION,
     "sentence-embedder-ablation": SENTENCE_EMBEDDER_ABLATION,  # alias
     "router_feature_ablation": ROUTER_FEATURE_ABLATION,
+    "compare_router_freeze": COMPARE_ROUTER_FREEZE,
+    "compare-router-freeze": COMPARE_ROUTER_FREEZE,  # alias
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

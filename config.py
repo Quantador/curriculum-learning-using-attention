@@ -239,6 +239,12 @@ class ExperimentConfig(Config):
                     "different reward_signal."
                 )
 
+        if self.router_freeze_progress is not None and not (0.0 <= self.router_freeze_progress <= 1.0):
+            raise ValueError(
+                f"router_freeze_progress={self.router_freeze_progress} must be in "
+                "[0, 1] (a fraction of total training progress), or None to disable."
+            )
+
         if self.use_original_sequence and self.feature_cache_epochs > 0:
             # build_feature_cache() (rl_training.py) always caches
             # extract_hierarchical_hidden() output, so the cached-features
@@ -326,6 +332,16 @@ class ExperimentConfig(Config):
     
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo
+
+    # Router freeze: once training progress (global_step / total_steps)
+    # reaches this fraction, stop updating the router (no more REINFORCE/
+    # GRPO/PPO policy-gradient steps) but keep using its current, now-frozen
+    # weights to score/select samples for the rest of training -- an
+    # ablation for whether continued router training helps past some point,
+    # vs. an early-converged router already being "good enough". The LM
+    # itself keeps training normally throughout; only the router's own
+    # parameter updates stop. None = never freeze (current behavior).
+    router_freeze_progress: float | None = None
 
     # Reward signal options:
     #   - loss_improvement: (loss_before - loss_after).clamp(0) - reward progress

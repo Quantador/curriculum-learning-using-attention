@@ -888,6 +888,15 @@ def train_router_experiments(
             # Compute training progress for schedules
             progress = global_step / total_steps
 
+            # Router freeze: past this point the router keeps scoring/
+            # selecting samples with its current weights (selection logic
+            # below is completely unchanged), it just stops learning -- see
+            # config.py's router_freeze_progress docstring.
+            router_frozen = (
+                cfg.router_freeze_progress is not None
+                and progress >= cfg.router_freeze_progress
+            )
+
             # Get scheduled values
             current_temp = get_scheduled_value(
                 cfg.temp_schedule, cfg.temp, cfg.temp_min, progress,
@@ -1125,7 +1134,16 @@ def train_router_experiments(
             }
 
             # --- Router update based on training algorithm ---
-            if cfg.training_algorithm == "reinforce":
+            if router_frozen:
+                # Router already scored/selected this step's samples above
+                # with its current (frozen) weights -- just skip the
+                # backward/optimizer step. Zero placeholders keep the
+                # unconditional logging code below (which reads loss_router/
+                # policy_loss/entropy every step) working unchanged.
+                loss_router = torch.zeros((), device=cfg.device)
+                policy_loss = torch.zeros((), device=cfg.device)
+                entropy = torch.zeros((), device=cfg.device)
+            elif cfg.training_algorithm == "reinforce":
                 baseline = compute_baseline(reward, cfg.baseline_type, moving_avg_baseline)
                 loss_router, policy_loss, entropy = reinforce_update(
                     router=router,
@@ -1183,8 +1201,10 @@ def train_router_experiments(
                     **ent_kwargs,
                 )
 
-            # Update entropy targeting if enabled
-            if entropy_targeting is not None:
+            # Update entropy targeting if enabled -- skipped once frozen,
+            # since entropy is a zero placeholder there, not a real signal
+            # from an actual router update.
+            if entropy_targeting is not None and not router_frozen:
                 entropy_targeting.update(-entropy)  # Note: entropy is negative
 
             # Update coverage tracker if enabled
