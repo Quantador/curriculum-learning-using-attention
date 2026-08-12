@@ -160,7 +160,13 @@ class DiversityTracker:
 
         if world_size > 1:
             counts = counts.clone()
+            if dist.get_backend() == "nccl":
+                # selection_counts lives on CPU (see __init__), but NCCL only
+                # supports CUDA tensors -- move to this rank's GPU for the
+                # collective, then back so downstream indexing stays as before.
+                counts = counts.cuda()
             dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            counts = counts.cpu()
 
             gathered_domain_counts: List[Optional[dict]] = [None] * world_size
             dist.all_gather_object(gathered_domain_counts, self.domain_counts)
