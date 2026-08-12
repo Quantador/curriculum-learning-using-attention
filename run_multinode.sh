@@ -5,8 +5,9 @@
 # this script turns those into a torchrun invocation so every spawned process
 # gets its own real RANK/LOCAL_RANK/WORLD_SIZE (see utils/distributed_utils.py).
 #
-# Usage (all args after the script path are forwarded to parallel_experiments.py):
-#   ./run_multinode.sh --profile final_presentation
+# Usage (all args after the script path are forwarded to parallel_experiments.py;
+# --config is also required so the dataset cache can be built before training):
+#   ./run_multinode.sh --config configs/gpt2_ddp.yaml --profile final_presentation
 set -euo pipefail
 
 echo "START TIME: $(date)"
@@ -14,6 +15,31 @@ echo "Role: $(hostname -s | tr -dc '0-9')"
 echo "Num nodes: $PET_NNODES"
 echo "GPUs/node: $RUNAI_NUM_OF_GPUS"
 echo "rdzv endpoint: $MASTER_ADDR:$MASTER_PORT"
+
+# Pull out --config's value: needed standalone to build the dataset cache
+# below, in addition to being forwarded to parallel_experiments.py as-is.
+CONFIG_PATH=""
+args=("$@")
+for i in "${!args[@]}"; do
+    if [ "${args[$i]}" = "--config" ]; then
+        CONFIG_PATH="${args[$((i + 1))]}"
+        break
+    fi
+done
+if [ -z "$CONFIG_PATH" ]; then
+    echo "run_multinode.sh: --config <path> is required" >&2
+    exit 1
+fi
+
+# RunAI runs this identical command on every pod, but build_dataset_cache.py
+# isn't safe for concurrent multi-pod writes to the same cache dir -- only
+# rank 0 builds it. The other pods don't need an explicit wait: they reach
+# torchrun's rendezvous below immediately and simply block there until rank
+# 0 (which builds the cache first) reaches its own torchrun call, so no
+# process starts training against a half-written cache.
+if [ "$RANK" = "0" ]; then
+    python build_dataset_cache.py --config "$CONFIG_PATH" --workers 32 --tasks 128
+fi
 
 # RDMA for efficient inter-node NCCL comms -- see docs/multinode.md in
 # getting-started for why these are needed across nodes (not just single-node).
