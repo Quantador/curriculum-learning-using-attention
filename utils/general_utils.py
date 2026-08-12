@@ -1,14 +1,15 @@
-import torch 
-import re 
+import torch
+import re
 import os
 import sys
-import subprocess 
-import yaml 
-from pathlib import Path 
-from typing import Any, Dict, List, Tuple 
+import subprocess
+import yaml
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 from consts import EXPERIMENT_PROFILES, PER_PROC_BUFFER, CONTEXT_OVERHEAD_BYTES, EXPERIMENTAL_FIELDS
 from config import ExperimentConfig
-from dataclasses import asdict 
+from dataclasses import asdict
 
 def get_baseline_config() -> Dict[str, Any]:
     """Get the baseline values for all experimental fields."""
@@ -43,6 +44,38 @@ def dump_config(cfg: ExperimentConfig, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         yaml.safe_dump(asdict(cfg), f)
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+@contextmanager
+def tee_stdio(log_path: Path):
+    """Mirror stdout/stderr to `log_path` for the duration of the block, in
+    addition to the real console -- unlike run_scheduler()'s subprocess path
+    (stdout=log_f fully replaces the console), run_ddp_sweep() runs each
+    experiment in-process under torchrun, where an external supervisor
+    (Slurm/k8s/etc.) may already be the only thing capturing stdout, so we
+    tee rather than redirect to avoid losing that visibility."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as f:
+        tee_out, tee_err = _Tee(sys.stdout, f), _Tee(sys.stderr, f)
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = tee_out, tee_err
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
 
 def memory_signature(cfg: ExperimentConfig) -> Tuple[Any, ...]:
     """Fields that plausibly change GPU memory use. Configs sharing a

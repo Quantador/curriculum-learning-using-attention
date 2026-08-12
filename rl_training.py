@@ -1325,7 +1325,7 @@ def train_aux_baseline(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             config=vars(cfg),
-            name=f"{cfg.experiment_name}_aux_baseline",
+            name=cfg.experiment_name,
         )
         if cfg.config_path:
             wandb.save(cfg.config_path, policy="now")

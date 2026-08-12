@@ -72,6 +72,7 @@ GPU selection comes from torchrun's LOCAL_RANK).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -100,7 +101,7 @@ from utils.distributed_utils import cleanup_distributed, setup_distributed
 from utils.metrics import MetricsTracker
 from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
 from utils.general_utils import (get_profile_fields, safe_name,
-                                 query_free_memory_bytes, compute_costs, dump_config)
+                                 query_free_memory_bytes, compute_costs, dump_config, tee_stdio)
 
 def generate_experiment_configs(
     base_cfg: ExperimentConfig | None = None,
@@ -118,9 +119,10 @@ def generate_experiment_configs(
     training_algorithm yields two configs: one with 'grpo', one with
     'reinforce', both with all other fields at baseline values.
 
-    Also always includes (unless include_baseline=False) three fixed reference
-    runs, non-router controls that every sweep should be judged against:
-      - 'baseline':             plain baseline_values, RL router as usual.
+    Also always includes (unless include_baseline=False) four fixed reference
+    runs that every sweep should be judged against:
+      - 'experiment_baseline':  plain baseline_values, RL router as usual --
+                                the sweep's own control condition.
       - 'aux_baseline':         supervised MSE alternative to the router
                                 (rl_training.train_aux_baseline()).
       - 'random_batch_baseline': uniform random cfg.batch-sized selection,
@@ -155,7 +157,7 @@ def generate_experiment_configs(
     if include_baseline:
         reference_overrides = {
             "random_pool_baseline": {"run_random_pool_baseline": True},
-            "baseline": {},
+            "experiment_baseline": {},
             "aux_baseline": {"run_aux_baseline": True},
             "random_batch_baseline": {"run_random_batch_baseline": True},
         }
@@ -318,6 +320,7 @@ def run_ddp_sweep(
     rank: int,
     local_rank: int,
     world_size: int,
+    scratch_dir: Path,
 ) -> None:
     """
     DDP-mode sweep runner: entered instead of run_scheduler() when launched
@@ -374,14 +377,24 @@ def run_ddp_sweep(
             loaded_by_signature[sig_key] = load_dataset_cache(dataset_cache_by_name[cfg.experiment_name], cfg)
         train_ds, val_ds = loaded_by_signature[sig_key]
 
+        name = safe_name(cfg.experiment_name)
+        if rank == 0:
+            dump_config(cfg, scratch_dir / "configs" / f"{name}.yaml")
+
         try:
-            run_single_experiment(
-                cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
-                base_metrics=base_metrics, router_metrics=router_metrics,
-            )
+            # Only rank 0 prints anything meaningful (tqdm/wandb/logging are
+            # all rank==0-gated in train_baseline/train_router_experiments/
+            # train_aux_baseline), so only its stdio needs teeing to line up
+            # with what run_scheduler()'s subprocess-per-experiment log files
+            # capture on the single-GPU path.
+            with tee_stdio(scratch_dir / "logs" / f"{name}.log") if rank == 0 else contextlib.nullcontext():
+                run_single_experiment(
+                    cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
+                    base_metrics=base_metrics, router_metrics=router_metrics,
+                )
         except Exception:
             if rank == 0:
-                print(f"[FAILED] {cfg.experiment_name}")
+                print(f"[FAILED] {cfg.experiment_name} — see {scratch_dir}/logs/{name}.log")
             import traceback
             traceback.print_exc()
             # Every rank must keep moving through the same config sequence in
@@ -509,6 +522,20 @@ def main() -> None:
             f"distinct dataset signature(s)"
         )
 
+    # Timestamp must be agreed on by every rank (not just computed
+    # independently by each), or ranks would race to different
+    # results/_parallel_run/<timestamp>/ folders -- rank 0 picks it and
+    # broadcasts the string to the rest.
+    stamp = [datetime.now().strftime("%Y%m%d_%H%M%S")] if rank == 0 else [None]
+    if world_size > 1:
+        dist.broadcast_object_list(stamp, src=0)
+    scratch_dir = SCRATCH_DIR / stamp[0]
+    if rank == 0:
+        scratch_dir.mkdir(parents=True, exist_ok=False)
+        print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
+    if world_size > 1:
+        dist.barrier()  # other ranks wait for rank 0's mkdir before writing into it
+
     if world_size > 1:
         # DDP mode (launched via torchrun): one experiment at a time, using
         # every GPU in this process group via DistributedDataParallel --
@@ -519,13 +546,9 @@ def main() -> None:
                 f"\n=== DDP mode: {world_size} ranks, running {len(configs)} experiments "
                 f"sequentially (--max-parallel/--safety-margin/--gpu ignored) ===\n"
             )
-        run_ddp_sweep(configs, dataset_cache_by_name, signature_of_name, rank, local_rank, world_size)
+        run_ddp_sweep(configs, dataset_cache_by_name, signature_of_name, rank, local_rank, world_size, scratch_dir)
         cleanup_distributed()
         return
-
-    scratch_dir = SCRATCH_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
-    scratch_dir.mkdir(parents=True, exist_ok=False)
-    print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
 
     if args.max_parallel is not None:
         cost_by_name = {cfg.experiment_name: 1 for cfg in configs}

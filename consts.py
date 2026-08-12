@@ -25,7 +25,7 @@ DATASET_REGISTRY: dict[str, dict] = {
 }
 
 # Maps each experimental dimension to (baseline_value, [alternative_values]).
-# The baseline_value is used in the control experiment (experiment_name="baseline").
+# The baseline_value is used in the control experiment (experiment_name="experiment_baseline").
 # Each alternative generates one experiment that changes only this single field.
 # This one-factor-at-a-time design lets us isolate the effect of each choice.
 EXPERIMENTAL_FIELDS: Dict[str, tuple[Any, List[Any]]] = {

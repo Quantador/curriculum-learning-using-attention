@@ -1,6 +1,6 @@
-experiment_name: best_embedder_setup
+experiment_name: best_embedder_setup_one_gpu
 epochs: 10
-batch: 64
+batch: 16
 pool_mult: 10
 lr_lm: 0.0003
 use_wandb: true
