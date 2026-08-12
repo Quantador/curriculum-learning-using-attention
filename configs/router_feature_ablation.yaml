@@ -4,7 +4,7 @@ global_batch_size: 64
 pool_mult: 10
 lr_lm: 0.0003
 use_wandb: true
-max_chunks: 2000000
+max_chunks: 500000
 model_type: hf_pretrained
 hf_model_name: openai-community/gpt2-xl
 # Baseline stays "full"; pinning the layer index here (valid for gpt2's 12

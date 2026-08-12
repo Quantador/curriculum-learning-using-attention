@@ -133,6 +133,10 @@ COMPARE_USE_ORIGINAL_SEQUENCE: Dict[str, tuple[Any, List[Any]]] = {
     "use_original_sequence": (False, [True])
 }
 
+CHECK_GREATS: Dict[str, tuple[Any, List[Any]]] = {
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], ["greats_score"])
+}
+
 # Baseline: router updates (REINFORCE/GRPO/PPO) for the whole run (current
 # default, router_freeze_progress=None). Alternative: stop updating the
 # router after 30% of training progress, but keep using its now-frozen
@@ -226,6 +230,7 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "router_feature_ablation": ROUTER_FEATURE_ABLATION,
     "compare_router_freeze": COMPARE_ROUTER_FREEZE,
     "compare-router-freeze": COMPARE_ROUTER_FREEZE,  # alias
+    "check_greats": CHECK_GREATS
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")
