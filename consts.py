@@ -20,6 +20,12 @@ DATASET_REGISTRY: dict[str, dict] = {
     "CShorten/ML-ArXiv-Papers":                 {"split": "train", "text_col": "abstract"},
     "HuggingFaceFW/fineweb-edu":                {"split": "train", "text_col": "text"},
     "HuggingFaceFW/fineweb":                    {"split": "train", "name": "sample-10BT", "text_col": "text"},
+    # Bigger sample of the same underlying repo, for token budgets past 10B --
+    # a distinct registry key (not a mutation of the entry above) so existing
+    # configs pinned to the 10BT scope are unaffected. "repo_id" decouples the
+    # registry key from the literal load_dataset() argument -- see
+    # tokenization.py's registry_entry(path).get("repo_id", path) call sites.
+    "HuggingFaceFW/fineweb-100BT":               {"repo_id": "HuggingFaceFW/fineweb", "split": "train", "name": "sample-100BT", "text_col": "text"},
     "allenai/c4":                               {"split": "train", "name": "en", "text_col": "text"},
     "DKYoon/SlimPajama-6B":                     {"split": "train", "text_col": "text"}
 }

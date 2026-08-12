@@ -837,6 +837,7 @@ def train_router_experiments(
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
 
+    budget_reached = False
     for epoch in range(cfg.epochs):
         # DistributedSampler reshuffles from `seed + epoch`; without this call
         # every rank would see the identical pool order every epoch. No-op
@@ -966,6 +967,10 @@ def train_router_experiments(
             selected_domains = [domains[i] for i in sel_idx.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx.tolist()]
             total_tokens_seen += X_sel.numel() * cfg.world_size
+            # Deterministic on every rank (fixed per-step increment, no data
+            # dependence), so checking/breaking here is DDP-safe without a
+            # broadcast -- every rank reaches the same verdict at the same point.
+            budget_reached = cfg.max_tokens is not None and total_tokens_seen >= cfg.max_tokens
 
             # --- GREATS ghost-gradient scoring (before the real LM update: a separate
             # scoring backward on X_sel/Y_sel against the fixed val batch, discarded
@@ -1250,6 +1255,9 @@ def train_router_experiments(
                         f"temp={current_temp:.3f} | "
                     )
 
+            if budget_reached:
+                break
+
         # --- Validation ---
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
         # other ranks wait so nobody starts the next epoch's DDP-synchronizing
@@ -1274,6 +1282,9 @@ def train_router_experiments(
             )
         if cfg.world_size > 1:
             dist.barrier()
+
+        if budget_reached:
+            break
 
     # --- Final per-domain perplexity, fully trained model ---
     if cfg.rank == 0:
@@ -1375,6 +1386,7 @@ def train_aux_baseline(
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
 
+    budget_reached = False
     for epoch in range(cfg.epochs):
         if hasattr(pool_loader.sampler, "set_epoch"):
             pool_loader.sampler.set_epoch(epoch)
@@ -1415,6 +1427,10 @@ def train_aux_baseline(
             selected_diffs   = [diffs[i] for i in sel_idx_local.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
             total_tokens_seen += X_sel.numel() * cfg.world_size
+            # Deterministic on every rank (fixed per-step increment, no data
+            # dependence), so checking/breaking here is DDP-safe without a
+            # broadcast -- every rank reaches the same verdict at the same point.
+            budget_reached = cfg.max_tokens is not None and total_tokens_seen >= cfg.max_tokens
 
             # --- Compute actual improvement ---
             with torch.no_grad(), autocast_ctx(cfg.device):
@@ -1486,6 +1502,9 @@ def train_aux_baseline(
                         f"loss_aux={agg_loss_aux:.6f}"
                     )
 
+            if budget_reached:
+                break
+
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
         # other ranks wait so nobody starts the next epoch's DDP-synchronizing
         # .backward() calls before rank 0 has finished its forward-only pass.
@@ -1505,6 +1524,9 @@ def train_aux_baseline(
             )
         if cfg.world_size > 1:
             dist.barrier()
+
+        if budget_reached:
+            break
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this

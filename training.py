@@ -203,6 +203,7 @@ def train_baseline(
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
+    budget_reached = False
     for epoch in range(cfg.epochs):
         # See PooledBatchSampler.set_epoch(): required under DDP so pools
         # reshuffle across epochs (its RNG is local, not the global `random`
@@ -215,6 +216,10 @@ def train_baseline(
             X = X.to(cfg.device, non_blocking=True)
             Y = Y.to(cfg.device, non_blocking=True)
             total_tokens_seen += X.numel() * cfg.world_size
+            # Deterministic on every rank (fixed per-step increment, no data
+            # dependence), so checking/breaking here is DDP-safe without a
+            # broadcast -- every rank reaches the same verdict at the same point.
+            budget_reached = cfg.max_tokens is not None and total_tokens_seen >= cfg.max_tokens
 
             opt.zero_grad()
             with autocast_ctx(cfg.device):
@@ -260,6 +265,9 @@ def train_baseline(
 
                     print(f"[Baseline] Step {global_step} - loss_lm={log_loss.item():.4f}")
 
+            if budget_reached:
+                break
+
         # Only rank 0 evaluates (val_ds is small and identical on every rank);
         # other ranks wait so nobody starts the next epoch's DDP-synchronizing
         # .backward() calls before rank 0 has finished its forward-only pass.
@@ -277,6 +285,9 @@ def train_baseline(
             )
         if cfg.world_size > 1:
             dist.barrier()
+
+        if budget_reached:
+            break
 
     # --- Final per-domain perplexity, fully trained model ---
     if cfg.rank == 0:

@@ -56,6 +56,11 @@ class Config:
     global_batch_size: int = 16
     pool_mult: int = 5
     epochs: int = 10
+    # Stop training once total_tokens_seen reaches this many tokens, cutting
+    # a run short mid-epoch if needed (logging still fires normally for the
+    # terminating step/epoch). None = unlimited, bounded only by cfg.epochs
+    # as before.
+    max_tokens: int | None = None
     lr_lm: float = 3e-4
     lr_router: float = 1e-3
     temp: float = 1.0

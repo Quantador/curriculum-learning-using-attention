@@ -136,7 +136,7 @@ def discover_domains(
     Sorted (not first-seen) order so domain ids are stable no matter how many
     rows the discovery pass happens to look at.
     """
-    ds = load_dataset(path, split=split, streaming=True, **{
+    ds = load_dataset(registry_entry(path).get("repo_id", path), split=split, streaming=True, **{
         k: v for k, v in dataset_options(path, split).items() if k != "split"
     })
     domains: set[str] = set()
@@ -148,7 +148,7 @@ def discover_domains(
 
 
 def n_shards_for(path: str, split: str) -> int:
-    ds = load_dataset(path, streaming=True, **dataset_options(path, split))
+    ds = load_dataset(registry_entry(path).get("repo_id", path), streaming=True, **dataset_options(path, split))
     return max(1, ds.n_shards)
 
 
@@ -182,8 +182,13 @@ def make_domain_filter(domain: str) -> LambdaFilter:
 def plan_jobs(cfg: ExperimentConfig, split: str) -> list[dict]:
     """One tokenization job per domain for `split`.
 
-    Each job is {domain, path, options, text_col, split_column} -- everything
-    build_tokenized_cache() needs to assemble an executor pipeline.
+    Each job is {domain, path, registry_key, options, text_col, split_column}
+    -- everything build_tokenized_cache() needs to assemble an executor
+    pipeline. `path` is the resolved repo id (what load_dataset()/
+    HuggingFaceDatasetReader() actually need); `registry_key` is the
+    DATASET_REGISTRY key it came from (what n_shards_for()/registry_entry()
+    need) -- the two differ whenever a registry entry sets "repo_id" to point
+    a friendly key at a different HF config/subset of the same repo.
     """
     if cfg.use_external_embeddings:
         raise NotImplementedError(
@@ -196,6 +201,7 @@ def plan_jobs(cfg: ExperimentConfig, split: str) -> list[dict]:
             {
                 "domain": VALIDATION_PATH,
                 "path": VALIDATION_PATH,
+                "registry_key": VALIDATION_PATH,
                 "options": {"split": split, "name": VALIDATION_DATASET_NAME},
                 "text_col": "text",
                 "split_column": None,
@@ -220,10 +226,12 @@ def plan_jobs(cfg: ExperimentConfig, split: str) -> list[dict]:
         if not domains:
             raise RuntimeError(f"No domains discovered in {path} ({split}).")
         print(f"[{split}] discovered {len(domains)} domains: {', '.join(domains)}")
+        repo_id = registry_entry(path).get("repo_id", path)
         return [
             {
                 "domain": domain,
-                "path": path,
+                "path": repo_id,
+                "registry_key": path,
                 "options": dataset_options(path, split),
                 "text_col": text_col,
                 "split_column": cfg.split_column,
@@ -234,7 +242,8 @@ def plan_jobs(cfg: ExperimentConfig, split: str) -> list[dict]:
     return [
         {
             "domain": path,
-            "path": path,
+            "path": registry_entry(path).get("repo_id", path),
+            "registry_key": path,
             "options": dataset_options(path, split),
             "text_col": registry_entry(path)["text_col"],
             "split_column": None,
@@ -320,14 +329,17 @@ def build_tokenized_cache(
         print(f"\n[{split}] {len(jobs)} domain(s) to tokenize")
 
         # Each dataset has its own shard count, so tasks are resolved per
-        # source path, not once for the split.
+        # registry key (not job["path"], which is the underlying repo id --
+        # two registry keys can share a repo id with different HF config
+        # names/subsets, e.g. fineweb's 10BT vs 100BT samples, and must not
+        # collide here).
         shards_of_path = {
-            path: n_shards_for(path, split) for path in {j["path"] for j in jobs}
+            key: n_shards_for(key, split) for key in {j["registry_key"] for j in jobs}
         }
 
         for job in jobs:
             domain = job["domain"]
-            split_tasks = min(tasks, shards_of_path[job["path"]])
+            split_tasks = min(tasks, shards_of_path[job["registry_key"]])
             # reader `limit` is per task, so spread the row budget across them.
             limit = (
                 -1
