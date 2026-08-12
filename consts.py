@@ -147,6 +147,16 @@ COMPARE_ROUTER_FREEZE: Dict[str, tuple[Any, List[Any]]] = {
     "router_freeze_progress": (None, [0.3])
 }
 
+# Baseline: router reward/update every LM training step (current default,
+# router_update_every=1). Alternatives: only every 2nd/5th step -- the router
+# still scores/selects the pool every step with its current weights, this
+# just throttles how often it pays for the extra loss_after forward pass and
+# actually learns from a reward. See config.py's router_update_every
+# docstring.
+COMPARE_ROUTER_UPDATE_EVERY: Dict[str, tuple[Any, List[Any]]] = {
+    "router_update_every": (1, [2, 5])
+}
+
 COMPARE_TRANSFORMER_LAYER: Dict[str, tuple[Any, List[Any]]] = {
     "hierarchical_layer_index": (0, [2, 4, 6, 8, 10, 12])
 }
@@ -230,6 +240,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "router_feature_ablation": ROUTER_FEATURE_ABLATION,
     "compare_router_freeze": COMPARE_ROUTER_FREEZE,
     "compare-router-freeze": COMPARE_ROUTER_FREEZE,  # alias
+    "compare_router_update_every": COMPARE_ROUTER_UPDATE_EVERY,
+    "compare-router-update-every": COMPARE_ROUTER_UPDATE_EVERY,  # alias
     "check_greats": CHECK_GREATS
 }
 

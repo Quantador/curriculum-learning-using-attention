@@ -897,6 +897,14 @@ def train_router_experiments(
                 and progress >= cfg.router_freeze_progress
             )
 
+            # Router update cadence: only the every-router_update_every-th
+            # step actually pays for the extra loss_after forward pass and
+            # performs a policy-gradient update below -- see config.py's
+            # router_update_every docstring. Deterministic on every rank
+            # (fixed per-step counter, no data dependence), so this is
+            # DDP-safe without a broadcast, same as router_frozen above.
+            router_update_due = global_step % cfg.router_update_every == 0
+
             # Get scheduled values
             current_temp = get_scheduled_value(
                 cfg.temp_schedule, cfg.temp, cfg.temp_min, progress,
@@ -1078,10 +1086,17 @@ def train_router_experiments(
             # entirely (its reward comes from the ghost gradient-dot-product
             # score instead) and entropy_after is already unused in that mode
             # (only computed for 'uncertainty_reduction'/'combined', which
-            # greats_score can't simultaneously be). The one other consumer,
-            # coverage_tracker.update()'s uncertainty-based bonus, still
-            # needs a real per-sample loss, so keep computing it then.
-            needs_real_loss_after = cfg.reward_signal != "greats_score" or (
+            # greats_score can't simultaneously be). Also skip it on steps
+            # that won't perform a router update anyway (router_update_due is
+            # False -- see config.py's router_update_every docstring); note
+            # router_frozen deliberately does NOT skip this, so reward stays
+            # logged every step even once the router has stopped learning.
+            # The one other consumer, coverage_tracker.update()'s
+            # uncertainty-based bonus, still needs a real per-sample loss
+            # regardless, so keep computing it then.
+            needs_real_loss_after = (
+                cfg.reward_signal != "greats_score" and router_update_due
+            ) or (
                 coverage_tracker is not None and cfg.coverage_type == "uncertainty"
             )
             with torch.no_grad(), autocast_ctx(cfg.device):
@@ -1134,10 +1149,12 @@ def train_router_experiments(
             }
 
             # --- Router update based on training algorithm ---
-            if router_frozen:
+            if router_frozen or not router_update_due:
                 # Router already scored/selected this step's samples above
-                # with its current (frozen) weights -- just skip the
-                # backward/optimizer step. Zero placeholders keep the
+                # with its current weights -- just skip the backward/
+                # optimizer step, either because it's permanently frozen
+                # (router_frozen) or because this isn't a router_update_every
+                # update step (router_update_due). Zero placeholders keep the
                 # unconditional logging code below (which reads loss_router/
                 # policy_loss/entropy every step) working unchanged.
                 loss_router = torch.zeros((), device=cfg.device)
@@ -1201,10 +1218,11 @@ def train_router_experiments(
                     **ent_kwargs,
                 )
 
-            # Update entropy targeting if enabled -- skipped once frozen,
-            # since entropy is a zero placeholder there, not a real signal
-            # from an actual router update.
-            if entropy_targeting is not None and not router_frozen:
+            # Update entropy targeting if enabled -- skipped when frozen or
+            # this isn't a router_update_every update step, since entropy is
+            # a zero placeholder then, not a real signal from an actual
+            # router update.
+            if entropy_targeting is not None and not router_frozen and router_update_due:
                 entropy_targeting.update(-entropy)  # Note: entropy is negative
 
             # Update coverage tracker if enabled

@@ -245,6 +245,12 @@ class ExperimentConfig(Config):
                 "[0, 1] (a fraction of total training progress), or None to disable."
             )
 
+        if self.router_update_every < 1:
+            raise ValueError(
+                f"router_update_every={self.router_update_every} must be >= 1 "
+                "(1 = update every step)."
+            )
+
         if self.use_original_sequence and self.feature_cache_epochs > 0:
             # build_feature_cache() (rl_training.py) always caches
             # extract_hierarchical_hidden() output, so the cached-features
@@ -342,6 +348,18 @@ class ExperimentConfig(Config):
     # itself keeps training normally throughout; only the router's own
     # parameter updates stop. None = never freeze (current behavior).
     router_freeze_progress: float | None = None
+
+    # Router update cadence: only compute the reward signal's extra
+    # loss_after forward pass and perform the router's policy-gradient
+    # update (REINFORCE/GRPO/PPO) once every router_update_every LM training
+    # steps. On the other steps the router still scores/selects the pool
+    # with its current weights each step (selection logic unchanged) --
+    # this only throttles how often it *learns* from a reward, trading
+    # update frequency for the compute of that extra forward pass. Composes
+    # with router_freeze_progress above: once frozen, the router never
+    # updates regardless of this value. 1 = every step (current behavior,
+    # default).
+    router_update_every: int = 1
 
     # Reward signal options:
     #   - loss_improvement: (loss_before - loss_after).clamp(0) - reward progress
