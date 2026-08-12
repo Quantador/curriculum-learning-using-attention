@@ -98,8 +98,9 @@ def memory_signature(cfg: ExperimentConfig) -> Tuple[Any, ...]:
     cfg.per_rank_batch_size would understate its real peak memory and risk an
     OOM once the scheduler packs it alongside other jobs. GPU-memory probing
     only ever runs single-process (world_size=1 -- see run_ddp_sweep()'s
-    docstring), so per_rank_batch_size == global_batch_size here regardless."""
-    effective_batch = cfg.pool if cfg.run_random_pool_baseline else cfg.per_rank_batch_size
+    docstring), so per_rank_pool_size == cfg.pool and per_rank_batch_size ==
+    global_batch_size here regardless."""
+    effective_batch = cfg.per_rank_pool_size if cfg.run_random_pool_baseline else cfg.per_rank_batch_size
     return (
         cfg.model_type, cfg.hf_model_name,
         cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff, cfg.n_chunks,

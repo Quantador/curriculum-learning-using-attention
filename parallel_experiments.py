@@ -119,6 +119,12 @@ def generate_experiment_configs(
     training_algorithm yields two configs: one with 'grpo', one with
     'reinforce', both with all other fields at baseline values.
 
+    An alternative may instead be a dict of {field: value} overrides (with a
+    required "_name" key for its experiment_name) when a single scalar can't
+    express the comparison -- e.g. "sentence embedder alone" needs
+    enable_text_hierarchical AND enable_text_stat turned off together with
+    sentence_embedder_model set, not just one field changed from baseline.
+
     Also always includes (unless include_baseline=False) four fixed reference
     runs that every sweep should be judged against:
       - 'experiment_baseline':  plain baseline_values, RL router as usual --
@@ -172,12 +178,17 @@ def generate_experiment_configs(
     # Generate one experiment per alternative value (one-factor-at-a-time)
     for field_name, (_, alternatives) in experimental_fields.items():
         for alt_value in alternatives:
-            # Start from baseline, change only this one field
+            # Start from baseline, change only this one field -- unless
+            # alt_value is a multi-field combo dict (see docstring), which
+            # applies all its overrides together under its own "_name".
             overrides = baseline_values.copy()
-            overrides[field_name] = alt_value
-
-            # Generate descriptive experiment name
-            experiment_name = f"{field_name}={alt_value}"
+            if isinstance(alt_value, dict):
+                combo = dict(alt_value)
+                experiment_name = combo.pop("_name")
+                overrides.update(combo)
+            else:
+                overrides[field_name] = alt_value
+                experiment_name = f"{field_name}={alt_value}"
 
             new_cfg = replace(
                 base_cfg,
@@ -381,28 +392,32 @@ def run_ddp_sweep(
         if rank == 0:
             dump_config(cfg, scratch_dir / "configs" / f"{name}.yaml")
 
-        try:
-            # Only rank 0 prints anything meaningful (tqdm/wandb/logging are
-            # all rank==0-gated in train_baseline/train_router_experiments/
-            # train_aux_baseline), so only its stdio needs teeing to line up
-            # with what run_scheduler()'s subprocess-per-experiment log files
-            # capture on the single-GPU path.
-            with tee_stdio(scratch_dir / "logs" / f"{name}.log") if rank == 0 else contextlib.nullcontext():
+        # Only rank 0 prints anything meaningful (tqdm/wandb/logging are all
+        # rank==0-gated in train_baseline/train_router_experiments/
+        # train_aux_baseline), so only its stdio needs teeing to line up with
+        # what run_scheduler()'s subprocess-per-experiment log files capture
+        # on the single-GPU path. The try/except stays INSIDE this block so
+        # a failure's traceback lands in the log file too, not just the raw
+        # console -- otherwise the one thing you'd actually want to read to
+        # debug a failed experiment (e.g. a CUDA OOM message) never makes it
+        # into results/_parallel_run/.../logs/<name>.log.
+        with tee_stdio(scratch_dir / "logs" / f"{name}.log") if rank == 0 else contextlib.nullcontext():
+            try:
                 run_single_experiment(
                     cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
                     base_metrics=base_metrics, router_metrics=router_metrics,
                 )
-        except Exception:
-            if rank == 0:
-                print(f"[FAILED] {cfg.experiment_name} — see {scratch_dir}/logs/{name}.log")
-            import traceback
-            traceback.print_exc()
-            # Every rank must keep moving through the same config sequence in
-            # lockstep (they share one process group) -- letting one rank
-            # raise while others continue would desync the next config's
-            # collective calls, or hang if others are still mid-.backward().
-            # Continuing the loop on every rank keeps them aligned; a bad
-            # config just fails identically everywhere instead of hanging.
+            except Exception:
+                if rank == 0:
+                    print(f"[FAILED] {cfg.experiment_name} — see {scratch_dir}/logs/{name}.log")
+                import traceback
+                traceback.print_exc()
+                # Every rank must keep moving through the same config sequence in
+                # lockstep (they share one process group) -- letting one rank
+                # raise while others continue would desync the next config's
+                # collective calls, or hang if others are still mid-.backward().
+                # Continuing the loop on every rank keeps them aligned; a bad
+                # config just fails identically everywhere instead of hanging.
 
         if world_size > 1:
             dist.barrier()  # hold every rank at the same config boundary before moving on

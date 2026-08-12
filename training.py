@@ -156,9 +156,9 @@ def train_baseline(
     Train TinyGPT with uniform random batch selection (no curriculum).
 
     At each step, draws cfg.per_rank_batch_size samples uniformly at random
-    from a pool of cfg.pool candidates (pool_mult × global_batch_size).
-    global_batch_size is split evenly across ranks, so under DDP each rank
-    only ever draws its own cfg.per_rank_batch_size-sized slice. This is the
+    from a pool of cfg.per_rank_pool_size candidates (cfg.pool = pool_mult ×
+    global_batch_size, split evenly across ranks same as global_batch_size
+    itself, preserving the pool_mult ratio at any world_size). This is the
     control condition — it sets the performance floor that the router should
     beat.
     """
@@ -199,7 +199,7 @@ def train_baseline(
     global_step = 0
     total_tokens_seen = 0
     baseline_loader = make_baseline_loader(
-        train_ds, cfg.pool, cfg.per_rank_batch_size,
+        train_ds, cfg.per_rank_pool_size, cfg.per_rank_batch_size,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )

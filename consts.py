@@ -170,9 +170,15 @@ SENTENCE_EMBEDDER_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
 #   - use_original_sequence=True      -> bypass every feature group; router scores
 #                                         the raw token ids directly
 #   - sentence_embedder_model set     -> concatenate a frozen precomputed sentence
-#                                         embedding (only one representative model
-#                                         here; see SENTENCE_EMBEDDER_ABLATION above
-#                                         to compare models against each other)
+#                                         embedding onto the hierarchical+text-stat
+#                                         baseline features (additive; only one
+#                                         representative model here -- see
+#                                         SENTENCE_EMBEDDER_ABLATION above to compare
+#                                         models against each other)
+#   - sentence_embedder_alone (combo) -> same sentence embedding, but with
+#                                         enable_text_hierarchical/enable_text_stat
+#                                         both off -- isolates the embedder's own
+#                                         signal instead of adding it on top
 # use_external_embeddings (config.py) is intentionally excluded: it's rejected by
 # tokenization.py's datatrove path (NotImplementedError) and can't currently run.
 ROUTER_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
@@ -180,7 +186,15 @@ ROUTER_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
     "enable_text_stat": (True, [False]),
     "hierarchical_representation": ("full", ["embedder", "layer"]),
     "use_original_sequence": (False, [True]),
-    "sentence_embedder_model": ("", ["intfloat/e5-base-v2"]),
+    "sentence_embedder_model": ("", [
+        "intfloat/e5-base-v2",
+        {
+            "_name": "sentence_embedder_alone",
+            "sentence_embedder_model": "intfloat/e5-base-v2",
+            "enable_text_hierarchical": False,
+            "enable_text_stat": False,
+        },
+    ]),
 }
 
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {

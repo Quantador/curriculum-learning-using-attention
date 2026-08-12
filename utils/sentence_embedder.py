@@ -20,6 +20,16 @@ and assigns the result to TokenizedCorpus.embeddings when
 cfg.sentence_embedder_model is set; every training loop that branches on
 `train_ds.embeddings is not None` (train_router_experiments, train_aux_baseline
 in rl_training.py) picks it up automatically with no further changes.
+
+Under DDP (cfg.world_size > 1): load_dataset_cache() is called identically on
+every rank, so without sharding, every rank would redundantly re-encode the
+*entire* dataset on its own single GPU -- world_size times the necessary work,
+using only one of the world_size available GPUs at a time. Instead, each rank
+encodes only its own ~1/world_size contiguous slice of windows (its own GPU,
+in parallel with every other rank), then all ranks combine their slices via
+dist.all_gather_object so every rank ends up with the identical, complete
+[N, dim] tensor -- required since any rank's pool sampling can reference any
+window index, not just the ones it personally encoded.
 """
 from __future__ import annotations
 
@@ -27,6 +37,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from config import ExperimentConfig
@@ -42,6 +53,7 @@ def build_sentence_embeddings(
 
     Returns an [N, cfg.sentence_embedder_dim] fp16 CPU tensor, one row per
     window, in train_ds order (so `embeddings[i]` matches `train_ds[i]`).
+    Identical on every rank under DDP (see module docstring).
 
     Cache validity mirrors build_feature_cache(): if cfg.sentence_embedder_cache_path
     points at a file whose shape/dtype don't match, it is discarded and rebuilt.
@@ -74,19 +86,40 @@ def build_sentence_embeddings(
             f"Set cfg.sentence_embedder_dim={actual_dim} to match."
         )
 
-    cache = torch.zeros(n_windows, expected_dim, dtype=torch.float16)
+    # Contiguous per-rank shard: rank i owns windows [i*chunk, (i+1)*chunk),
+    # last rank absorbs the remainder (n_windows rarely divides evenly).
+    # world_size=1 (the default) reduces to the whole dataset, unchanged.
+    if cfg.world_size > 1:
+        chunk = n_windows // cfg.world_size
+        shard_start = cfg.rank * chunk
+        shard_end = n_windows if cfg.rank == cfg.world_size - 1 else shard_start + chunk
+    else:
+        shard_start, shard_end = 0, n_windows
+
+    local_cache = torch.zeros(shard_end - shard_start, expected_dim, dtype=torch.float16)
     batch_size = cfg.sentence_embedder_batch_size
-    for start in tqdm(range(0, n_windows, batch_size), desc="Building sentence-embedder cache"):
-        end = min(start + batch_size, n_windows)
+    for start in tqdm(
+        range(shard_start, shard_end, batch_size),
+        desc=f"Building sentence-embedder cache (rank {cfg.rank}'s shard)",
+        disable=cfg.rank != 0,
+    ):
+        end = min(start + batch_size, shard_end)
         texts = tokenizer.batch_decode(
             [train_ds[i][0] for i in range(start, end)], skip_special_tokens=True
         )
         embs = encoder.encode(
             texts, batch_size=batch_size, convert_to_tensor=True, show_progress_bar=False
         )
-        cache[start:end] = embs.cpu().half()
+        local_cache[start - shard_start : end - shard_start] = embs.cpu().half()
 
-    if cache_path:
+    if cfg.world_size > 1:
+        gathered: list = [None] * cfg.world_size
+        dist.all_gather_object(gathered, local_cache)
+        cache = torch.cat(gathered, dim=0)
+    else:
+        cache = local_cache
+
+    if cache_path and cfg.rank == 0:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         torch.save(cache, cache_path)
         print(f"[SentenceEmbedder] Saved to {cache_path}")

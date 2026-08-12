@@ -795,7 +795,7 @@ def train_router_experiments(
     # Initialize entropy targeting if enabled
     entropy_targeting = None
     if cfg.use_entropy_targeting:
-        max_ent = compute_max_entropy(cfg.pool)
+        max_ent = compute_max_entropy(cfg.per_rank_pool_size)
         target_entropy = cfg.target_entropy_ratio * max_ent
         entropy_targeting = EntropyTargeting(
             target_entropy=target_entropy,
@@ -814,12 +814,14 @@ def train_router_experiments(
             device=cfg.device,
         )
 
-    # // world_size before // pool: under DDP each rank only sees its shard
-    # (make_pool_loader's DistributedSampler truncates to len(ds)//world_size
-    # candidates per rank, drop_last=True -- see data.py), so this must match
+    # // world_size before // per_rank_pool_size: under DDP each rank only
+    # sees its shard (make_pool_loader's DistributedSampler truncates to
+    # len(ds)//world_size candidates per rank, drop_last=True -- see data.py),
+    # then chunked into cfg.per_rank_pool_size-sized steps (cfg.pool split
+    # across ranks -- see Config.per_rank_pool_size), so this must match
     # steps actually taken per rank per epoch, not the single-process count,
     # or progress (used below to drive every schedule) would never reach 1.0.
-    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.pool) * cfg.epochs)
+    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.per_rank_pool_size) * cfg.epochs)
     global_step = 0
     # Tokens fed to the LM so far. TokenizedCorpus yields fixed-length windows
     # (block tokens, no padding — see data.py), so this is just
@@ -832,7 +834,7 @@ def train_router_experiments(
     feature_cache: torch.Tensor | None = None
 
     pool_loader = make_pool_loader(
-        train_ds, cfg.pool,
+        train_ds, cfg.per_rank_pool_size,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
@@ -866,7 +868,7 @@ def train_router_experiments(
 
         # ── Per-step curriculum loop ──────────────────────────────────────────
         # Each iteration implements the core curriculum learning cycle:
-        #   1. Sample M = cfg.pool candidate indices (pre-shuffled each epoch,
+        #   1. Sample M = cfg.per_rank_pool_size candidate indices (pre-shuffled each epoch,
         #      prefetched by pool_loader's workers while the previous step's
         #      GPU work is still running -- see cfg.dataloader_num_workers).
         #   2. Extract router features for all M samples.
@@ -1371,17 +1373,19 @@ def train_aux_baseline(
     opt_lm  = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
     opt_aux = torch.optim.AdamW(aux_net.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
-    # // world_size before // pool: under DDP each rank only sees its shard
-    # (make_pool_loader's DistributedSampler truncates to len(ds)//world_size
-    # candidates per rank, drop_last=True -- see data.py), so this must match
+    # // world_size before // per_rank_pool_size: under DDP each rank only
+    # sees its shard (make_pool_loader's DistributedSampler truncates to
+    # len(ds)//world_size candidates per rank, drop_last=True -- see data.py),
+    # then chunked into cfg.per_rank_pool_size-sized steps (cfg.pool split
+    # across ranks -- see Config.per_rank_pool_size), so this must match
     # steps actually taken per rank per epoch, not the single-process count,
     # or training_progress (used below) would never reach 1.0.
-    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.pool) * cfg.epochs)
+    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.per_rank_pool_size) * cfg.epochs)
     global_step = 0
     total_tokens_seen = 0
 
     pool_loader = make_pool_loader(
-        train_ds, cfg.pool,
+        train_ds, cfg.per_rank_pool_size,
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )

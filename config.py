@@ -154,9 +154,26 @@ class Config:
                 f"world_size={self.world_size}: each rank would get 0 samples per step."
             )
         return per_rank
-    
-    
-    
+
+    @property
+    def per_rank_pool_size(self) -> int:
+        """cfg.pool (pool_mult * global_batch_size) split evenly across
+        ranks -- the number of candidate samples each GPU actually pulls per
+        step for pool-based feature extraction (train_router_experiments/
+        train_aux_baseline's make_pool_loader) and pool-windowed baseline
+        training (train_baseline's make_baseline_loader/PooledBatchSampler).
+        Dividing both pool and batch by the same world_size preserves the
+        pool_mult ratio (per_rank_pool_size / per_rank_batch_size ==
+        pool_mult) at any GPU count, exactly like per_rank_batch_size.
+        world_size=1 (the default) leaves this equal to cfg.pool."""
+        per_rank = self.pool // self.world_size
+        if per_rank < 1:
+            raise ValueError(
+                f"pool={self.pool} is smaller than world_size={self.world_size}: "
+                f"each rank would get 0 candidates per step."
+            )
+        return per_rank
+
     
 @dataclass
 
