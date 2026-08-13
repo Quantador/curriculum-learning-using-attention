@@ -75,6 +75,7 @@ import argparse
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -99,6 +100,7 @@ from utils.shared_dataset import (
 )
 from utils.distributed_utils import cleanup_distributed, setup_distributed
 from utils.metrics import MetricsTracker
+from utils import run_status
 from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
 from utils.general_utils import (get_profile_fields, safe_name,
                                  query_free_memory_bytes, compute_costs, dump_config, tee_stdio)
@@ -262,6 +264,8 @@ def run_scheduler(
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
+    status_dir = run_status.status_dir_for(scratch_dir)
+
     def launch(cfg: ExperimentConfig, cost: int) -> None:
         nonlocal committed
         # Create logging folders 
@@ -278,6 +282,7 @@ def run_scheduler(
                 sys.executable, "utils/experiment_worker.py",
                 "--config", str(cfg_path),
                 "--dataset-cache", str(dataset_cache_by_name[cfg.experiment_name]),
+                "--status-dir", str(status_dir),
             ],
             stdout=log_f, stderr=subprocess.STDOUT, env=env,
         )
@@ -308,13 +313,22 @@ def run_scheduler(
             log_f.close()
             committed -= cost
             name = safe_name(cfg.experiment_name)
+            # From the parent's side, so a worker that died too abruptly to
+            # write its own status (SIGKILL / host OOM-killer) still gets one.
+            run_status.record_child_exit(status_dir, name, p.returncode)
             if p.returncode == 0:
                 results["succeeded"].append(cfg.experiment_name)
                 print(f"[done]   {cfg.experiment_name}")
             else:
                 results["failed"].append(cfg.experiment_name)
+                # Popen reports a signal death as -signum. Spelling it out
+                # here matters because the two cases have nothing to do with
+                # each other: a positive code is the experiment's own bug, a
+                # negative one is something outside it reaching in.
+                how = (f"killed by {signal.Signals(-p.returncode).name}"
+                       if p.returncode < 0 else f"exit {p.returncode}")
                 print(
-                    f"[FAILED] {cfg.experiment_name} (exit {p.returncode}) "
+                    f"[FAILED] {cfg.experiment_name} ({how}) "
                     f"— see {scratch_dir}/logs/{name}.log"
                 )
 
@@ -401,12 +415,22 @@ def run_ddp_sweep(
         # console -- otherwise the one thing you'd actually want to read to
         # debug a failed experiment (e.g. a CUDA OOM message) never makes it
         # into results/_parallel_run/.../logs/<name>.log.
+        # Only rank 0 records status, for the same reason only rank 0 tees:
+        # every rank runs the identical sequence, so 16 ranks would write 16
+        # identical status files racing over one path.
+        tracker = (
+            run_status.track(run_status.status_dir_for(scratch_dir), name,
+                             experiment=cfg.experiment_name, world_size=world_size,
+                             wandb_project=cfg.wandb_project)
+            if rank == 0 else contextlib.nullcontext()
+        )
         with tee_stdio(scratch_dir / "logs" / f"{name}.log") if rank == 0 else contextlib.nullcontext():
             try:
-                run_single_experiment(
-                    cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
-                    base_metrics=base_metrics, router_metrics=router_metrics,
-                )
+                with tracker:
+                    run_single_experiment(
+                        cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
+                        base_metrics=base_metrics, router_metrics=router_metrics,
+                    )
             except Exception:
                 if rank == 0:
                     print(f"[FAILED] {cfg.experiment_name} — see {scratch_dir}/logs/{name}.log")
@@ -551,6 +575,15 @@ def main() -> None:
     if world_size > 1:
         dist.barrier()  # other ranks wait for rank 0's mkdir before writing into it
 
+    # From here on the process can live for hours, which is the whole window
+    # in which an external kill is both likely and unexplained. Installed on
+    # every rank, not just rank 0: under torchrun a preemption SIGTERMs all of
+    # them, and knowing whether rank 0 specifically got notice is worth the
+    # one small file per rank.
+    run_status.install_signal_handlers(
+        scratch_dir, role="orchestrator" if rank == 0 else f"rank{rank}"
+    )
+
     if world_size > 1:
         # DDP mode (launched via torchrun): one experiment at a time, using
         # every GPU in this process group via DistributedDataParallel --
@@ -578,17 +611,25 @@ def main() -> None:
         print(f"Estimated max concurrency: ~{max(1, int(usable / avg_cost))} experiments")
 
     print(f"\n=== Running {len(configs)} experiments (parallel) ===\n")
-    results = run_scheduler(
-        configs, cost_by_name, usable, dataset_cache_by_name, scratch_dir, args.gpu, args.poll_interval
-    )
+    # Tee'd, unlike everything above it: the scheduler's [launch]/[done]/
+    # [FAILED] lines are the only per-experiment verdict this path produces,
+    # and on RunAI plain stdout is the pod log -- which is discarded the
+    # moment the pod is deleted or preempted. The DDP path needs no
+    # equivalent: its [FAILED] print already sits inside run_ddp_sweep()'s
+    # per-experiment tee_stdio().
+    with tee_stdio(scratch_dir / "logs" / "_orchestrator.log"):
+        results = run_scheduler(
+            configs, cost_by_name, usable, dataset_cache_by_name, scratch_dir, args.gpu, args.poll_interval
+        )
 
-    print(f"\n{'=' * 60}")
-    print(f"=== {len(results['succeeded'])} succeeded, {len(results['failed'])} failed ===")
-    if results["failed"]:
-        print(f"Failed experiments (see {scratch_dir}/logs/<name>.log):")
-        for name in results["failed"]:
-            print(f"  - {name}")
-    print(f"{'=' * 60}")
+        print(f"\n{'=' * 60}")
+        print(f"=== {len(results['succeeded'])} succeeded, {len(results['failed'])} failed ===")
+        if results["failed"]:
+            print(f"Failed experiments (see {scratch_dir}/logs/<name>.log):")
+            for name in results["failed"]:
+                print(f"  - {name}")
+        print(f"{'=' * 60}")
+        print(f"Run fates: python -m utils.run_status {scratch_dir}")
 
 
 if __name__ == "__main__":

@@ -79,11 +79,30 @@ class Config:
     # to overlap next-batch loading with GPU compute.
     dataloader_num_workers: int = 0
 
-    # Distributed (DDP). Defaults are the single-process case; train_ddp.py
+    # Distributed. Defaults are the single-process case; train_ddp.py
     # overrides these after torch.distributed.init_process_group().
     rank: int = 0
     world_size: int = 1
     local_rank: int = 0
+
+    # How to parallelize the LM across those ranks. Ignored at world_size 1.
+    #   'DDP'  — replicate the whole model on every rank. Simplest and
+    #            fastest whenever a replica fits.
+    #   'FSDP' — FSDP2 (fully_shard): shard parameters, gradients and
+    #            optimizer state across ranks. The option for models whose
+    #            DDP replica does NOT fit — GPT2-XL is ~1.5B params, so an
+    #            fp32 replica plus AdamW's two moments is ~24 GB per rank
+    #            before activations.
+    # See utils/distributed_utils.wrap_model().
+    distributed: str = "DDP"
+
+    # Parameter dtype for FSDP2's MixedPrecisionPolicy ('bf16' | 'fp16' |
+    # 'none'); gradient reduction stays fp32 regardless. Ignored unless
+    # distributed == 'FSDP'.
+    # NOTE this changes numerics: FSDP runs at the 'bf16' default are not
+    # directly comparable with existing fp32 DDP ablation results. Set
+    # 'none' when a comparison has to be like-for-like.
+    fsdp_mixed_precision: str = "bf16"
 
     # Logging
     use_wandb: bool = True
@@ -112,6 +131,18 @@ class Config:
             self.n_layers = hf_cfg.num_hidden_layers
             self.n_heads = hf_cfg.num_attention_heads
             self.d_ff = getattr(hf_cfg, "intermediate_size", self.d_ff)
+
+        if self.distributed not in ("DDP", "FSDP"):
+            raise ValueError(
+                f"distributed={self.distributed!r} is not supported (expected "
+                f"'DDP' or 'FSDP')."
+            )
+
+        if self.fsdp_mixed_precision not in ("bf16", "fp16", "none"):
+            raise ValueError(
+                f"fsdp_mixed_precision={self.fsdp_mixed_precision!r} is not "
+                f"supported (expected 'bf16', 'fp16' or 'none')."
+            )
 
         if self.hierarchical_representation == "layer":
             if self.hierarchical_layer_index is None:
@@ -211,7 +242,34 @@ class ExperimentConfig(Config):
         if self.reward_signal in ("difficulty_weighted", "combined") and len(self.dataset_list) != 2:
             raise ValueError("In order to use difficulty scoring, you need to use 2 datasets, the first one "
                              "being the easy one and the second one the hard one.")
-        
+
+        if self.distributed == "FSDP":
+            # Both of these read raw per-rank .grad tensors off the LM, which
+            # FSDP2 does not leave lying around: gradients are reduce-scattered
+            # into DTensor shards during backward, so no rank ever holds this
+            # rank's own complete gradient. Rejected outright rather than
+            # silently scored against the wrong tensor -- under DDP these
+            # signals deliberately use no_sync() to keep .grad local (see
+            # rl_training.train_router_experiments), and there is no FSDP2
+            # equivalent that preserves that meaning.
+            if self.reward_signal in ("gradient_norm", "gradient_alignment"):
+                raise ValueError(
+                    f"reward_signal={self.reward_signal!r} is not supported with "
+                    "distributed='FSDP': it needs this rank's own unreduced "
+                    "gradients, but FSDP2 reduce-scatters them into shards during "
+                    "backward. Use distributed='DDP', or a reward_signal that "
+                    "doesn't read .grad (e.g. 'loss_improvement')."
+                )
+            if self.reward_signal == "greats_score":
+                raise ValueError(
+                    "reward_signal='greats_score' is not supported with "
+                    "distributed='FSDP': GhostSuite's per-sample-gradient hooks "
+                    "walk named_modules() and assume ordinary local parameter "
+                    "tensors, but FSDP2 replaces them with sharded DTensors. Use "
+                    "distributed='DDP'."
+                )
+
+
         if self.reward_signal == "greats_score":
             # GREATS-style ghost gradient-dot-product scoring (GhostSuite/ghostEngines,
             # via GhostEngineManager). Only supported for GPT-2-family HF checkpoints:

@@ -54,6 +54,7 @@ from models.router import extract_router_features
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 from utils.rl_utils import grpo_update, ppo_update, reinforce_update
 from utils.general_utils import autocast_ctx
+from utils.distributed_utils import eval_handles, wrap_model, wrap_replica
 
 @torch.no_grad()
 def compute_loss_per_sample_vectorized(
@@ -660,7 +661,26 @@ def build_feature_cache(
     (e.g. after changing d_model or n_chunks), the cache is discarded and rebuilt.
 
     Disk persistence: if cfg.feature_cache_path is non-empty, the cache is saved
-    as a .pt file and loaded on the next call instead of recomputing.
+    as a .pt file and loaded on the next call instead of recomputing. This is an
+    opt-in, cross-run cache -- if it's set and already holds a shape/dtype-matching
+    file, that file is reused as-is even on a mid-run rebuild call, so don't point
+    two runs with different model weights (or two feature_cache_epochs rebuilds
+    you want to actually diverge) at the same path.
+
+    Distributed (cfg.world_size > 1): only rank 0 runs the expensive full-dataset
+    forward pass; the other ranks block on a barrier and then load the identical
+    cache rank 0 just wrote to a same-run scratch file under
+    results/<experiment_name>/. Without this, every one of world_size ranks would
+    redundantly recompute (and separately hold in CPU RAM) its own byte-identical
+    copy -- at world_size=16 that's 16x the GPU compute for zero benefit. Each
+    rank still ends up with its own full in-memory copy afterwards (there's no
+    cross-process shared memory here), so CPU RAM use is unchanged at
+    world_size * cache_size_in_bytes -- only the redundant *compute* is removed.
+    This scratch file is intentionally separate from cfg.feature_cache_path
+    (that one is the user-facing, opt-in, persists-across-runs cache described
+    above; reusing it here would make every within-run rebuild after the first
+    silently reload the first rebuild's now-stale features instead of the fresh
+    ones this call just computed).
 
     Returns: [N, n_chunks * d_model] fp16 CPU tensor.
     """
@@ -671,11 +691,31 @@ def build_feature_cache(
         try:
             cache = torch.load(cfg.feature_cache_path, map_location="cpu", weights_only=True)
             if tuple(cache.shape) == expected_shape and cache.dtype == torch.float16:
-                print(f"[Cache] Loaded from {cfg.feature_cache_path}")
+                if cfg.rank == 0:
+                    print(f"[Cache] Loaded from {cfg.feature_cache_path}")
                 return cache
-            print(f"[Cache] Shape mismatch ({cache.shape} vs {expected_shape}), rebuilding...")
+            if cfg.rank == 0:
+                print(f"[Cache] Shape mismatch ({cache.shape} vs {expected_shape}), rebuilding...")
         except Exception as e:
-            print(f"[Cache] Could not load ({e}), rebuilding...")
+            if cfg.rank == 0:
+                print(f"[Cache] Could not load ({e}), rebuilding...")
+
+    ddp_sync_path = (
+        os.path.join("results", cfg.experiment_name, "_feature_cache_ddp_sync.pt")
+        if cfg.world_size > 1 else None
+    )
+    if ddp_sync_path and cfg.rank != 0:
+        # Rank 0 is about to (re)build and save the cache below -- wait for
+        # it instead of redundantly repeating the same full-dataset forward
+        # pass on this rank's own model replica.
+        dist.barrier()
+        cache = torch.load(ddp_sync_path, map_location="cpu", weights_only=True)
+        # Second barrier: only release rank 0 (waiting at the matching
+        # barrier below) once every rank has finished reading, so rank 0
+        # can't race ahead into a *later* rebuild and overwrite ddp_sync_path
+        # while a slow rank is still mid-load here.
+        dist.barrier()
+        return cache
 
     N, F = expected_shape
     cache = torch.zeros(N, F, dtype=torch.float16)
@@ -694,6 +734,12 @@ def build_feature_cache(
         os.makedirs(os.path.dirname(os.path.abspath(cfg.feature_cache_path)), exist_ok=True)
         torch.save(cache, cfg.feature_cache_path)
         print(f"[Cache] Saved to {cfg.feature_cache_path}")
+
+    if ddp_sync_path:
+        os.makedirs(os.path.dirname(ddp_sync_path), exist_ok=True)
+        torch.save(cache, ddp_sync_path)
+        dist.barrier()  # release the ranks waiting above
+        dist.barrier()  # wait until every rank has finished reading it
 
     return cache
 
@@ -728,21 +774,17 @@ def train_router_experiments(
 
     model.to(cfg.device).train()
     router.to(cfg.device).train()
-    if cfg.world_size > 1:
-        # device_ids must be None for CPU modules (only single/multi-GPU
-        # modules accept it) -- only relevant for the gloo/CPU smoke-test
-        # path, since real DDP training always runs on CUDA.
-        ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
-        model = DDP(model, device_ids=ddp_device_ids)
-        router = DDP(router, device_ids=ddp_device_ids)
-    # Unwrapped handle for rank-0-only eval: only rank 0 calls evaluate()/
-    # evaluate_per_domain() (see below), but DDP's forward() broadcasts
-    # module buffers whenever the last grad-enabled forward left
-    # require_forward_param_sync set (true for HF models with registered
-    # buffers, e.g. GPT-2's attn.bias) -- a collective every other rank
-    # isn't there to join, hanging NCCL. Evaluating the unwrapped module
-    # sidesteps DDP's forward entirely.
-    eval_model = model.module if isinstance(model, DDP) else model
+    # DDP-replicated or FSDP2-sharded per cfg.distributed. The router is
+    # always replicated, never sharded -- it's a few thousand parameters, so
+    # sharding it would cost collectives to save nothing.
+    model = wrap_model(model, cfg)
+    router = wrap_replica(router, cfg)
+
+    # Which module to evaluate, and whether this rank must join in: DDP
+    # evaluates the unwrapped replica on rank 0 alone, FSDP evaluates the
+    # sharded module on every rank (no rank holds a whole copy). See
+    # utils/distributed_utils.eval_handles().
+    eval_model, this_rank_evaluates = eval_handles(model, cfg)
 
     opt_lm = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
     opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router, weight_decay=0.0)
@@ -1048,6 +1090,14 @@ def train_router_experiments(
             # own selection -- useless as a per-rank RL reward. no_sync()
             # skips that automatic reduction so backward() leaves .grad
             # purely local to this rank's own X_sel/Y_sel.
+            #
+            # The isinstance(model, DDP) test is what keeps this DDP-only.
+            # FSDP2 has no no_sync() (its equivalent, set_requires_gradient_sync,
+            # doesn't preserve this meaning -- gradients are reduce-scattered
+            # into shards, so no rank ever holds its own complete gradient),
+            # which is why ExperimentConfig.__post_init__ rejects these two
+            # reward signals under distributed='FSDP' outright rather than
+            # letting them silently fall through to the unreduced branch here.
             local_grad_reward = cfg.world_size > 1 and isinstance(model, DDP) and cfg.reward_signal in ("gradient_norm", "gradient_alignment")
             backward_ctx = model.no_sync() if local_grad_reward else contextlib.nullcontext()
             with backward_ctx:
@@ -1299,27 +1349,30 @@ def train_router_experiments(
                 break
 
         # --- Validation ---
-        # Only rank 0 evaluates (val_ds is small and identical on every rank);
-        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
-        # .backward() calls before rank 0 has finished its forward-only pass.
-        if cfg.rank == 0:
+        # val_ds is small and identical on every rank. Under DDP only rank 0
+        # evaluates and the others wait at the barrier below, so nobody starts
+        # the next epoch's DDP-synchronizing .backward() mid-eval; under FSDP
+        # every rank must evaluate (the forward all-gathers), and they all
+        # compute the same number, so logging still happens on rank 0 only.
+        if this_rank_evaluates:
             loss_fn = nn.CrossEntropyLoss()
             val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
 
             epoch_time = time.perf_counter() - epoch_start
-            metrics.log(
-                epoch=epoch,
-                step=global_step,
-                val_loss=val_loss,
-                val_ppl=val_ppl,
-                epoch_time_s=epoch_time,
-            )
+            if cfg.rank == 0:
+                metrics.log(
+                    epoch=epoch,
+                    step=global_step,
+                    val_loss=val_loss,
+                    val_ppl=val_ppl,
+                    epoch_time_s=epoch_time,
+                )
 
-            print(
-                f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
-                f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
-                f"epoch_time={epoch_time:.1f}s"
-            )
+                print(
+                    f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
+                    f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
+                    f"epoch_time={epoch_time:.1f}s"
+                )
         if cfg.world_size > 1:
             dist.barrier()
 
@@ -1327,17 +1380,19 @@ def train_router_experiments(
             break
 
     # --- Final per-domain perplexity, fully trained model ---
-    if cfg.rank == 0:
+    # Same rank gating as the per-epoch validation above.
+    if this_rank_evaluates:
         loss_fn = nn.CrossEntropyLoss()
         per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
-        metrics.log(
-            step=global_step,
-            **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
-        )
-        print(
-            "[Final per-domain val perplexity] "
-            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
-        )
+        if cfg.rank == 0:
+            metrics.log(
+                step=global_step,
+                **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+            )
+            print(
+                "[Final per-domain val perplexity] "
+                + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+            )
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this
@@ -1393,17 +1448,11 @@ def train_aux_baseline(
     aux_net.to(cfg.device)
     model.train()
     aux_net.train()
-    if cfg.world_size > 1:
-        ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
-        model = DDP(model, device_ids=ddp_device_ids)
-        aux_net = DDP(aux_net, device_ids=ddp_device_ids)
-    # Unwrapped handle for rank-0-only eval: only rank 0 calls evaluate()
-    # (see below), but DDP's forward() broadcasts module buffers whenever
-    # the last grad-enabled forward left require_forward_param_sync set
-    # (true for HF models with registered buffers, e.g. GPT-2's attn.bias)
-    # -- a collective every other rank isn't there to join, hanging NCCL.
-    # Evaluating the unwrapped module sidesteps DDP's forward entirely.
-    eval_model = model.module if isinstance(model, DDP) else model
+    # DDP-replicated or FSDP2-sharded per cfg.distributed; aux_net is small
+    # enough to always replicate (see wrap_replica).
+    model = wrap_model(model, cfg)
+    aux_net = wrap_replica(aux_net, cfg)
+    eval_model, this_rank_evaluates = eval_handles(model, cfg)
 
     print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
@@ -1547,23 +1596,24 @@ def train_aux_baseline(
             if budget_reached:
                 break
 
-        # Only rank 0 evaluates (val_ds is small and identical on every rank);
-        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
-        # .backward() calls before rank 0 has finished its forward-only pass.
-        if cfg.rank == 0:
+        # DDP: rank 0 alone evaluates the unwrapped replica, others wait at
+        # the barrier below. FSDP: every rank must join the sharded forward's
+        # all-gathers. See utils/distributed_utils.eval_handles().
+        if this_rank_evaluates:
             val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
             epoch_time = time.perf_counter() - epoch_start
-            metrics.log(
-                epoch=epoch,
-                step=global_step,
-                val_loss=val_loss,
-                val_ppl=val_ppl,
-                epoch_time_s=epoch_time,
-            )
-            print(
-                f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
-                f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
-            )
+            if cfg.rank == 0:
+                metrics.log(
+                    epoch=epoch,
+                    step=global_step,
+                    val_loss=val_loss,
+                    val_ppl=val_ppl,
+                    epoch_time_s=epoch_time,
+                )
+                print(
+                    f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
+                    f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
+                )
         if cfg.world_size > 1:
             dist.barrier()
 

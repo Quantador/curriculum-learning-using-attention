@@ -5,10 +5,12 @@ process. Launched by parallel_experiments.py so that many experiments can
 run concurrently on the same GPU, each in its own CUDA context.
 
     python experiment_worker.py --config <yaml> --dataset-cache <path>
+                                [--status-dir <path>]
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import os
 import time
@@ -26,7 +28,8 @@ from training import train_baseline
 from models.model import build_model
 from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
-from utils.general_utils import set_seed
+from utils.general_utils import safe_name, set_seed
+from utils import run_status
 
 def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics):
     """Run a single experiment with the given configuration.
@@ -164,6 +167,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--dataset-cache", required=True)
+    parser.add_argument(
+        "--status-dir", default=None,
+        help="Where to record how this run ended (see utils/run_status.py). "
+             "Omitted when running this worker by hand; parallel_experiments.py "
+             "always passes the sweep's status dir.",
+    )
     args = parser.parse_args()
 
     cfg = load_config_from_yaml(args.config)
@@ -175,14 +184,28 @@ def main() -> None:
     base_metrics = MetricsTracker.load("results/baseline_metrics.json")
     router_metrics = MetricsTracker.load("results/router_metrics.json")
 
-    run_single_experiment(
-        cfg=cfg,
-        tokenizer=tokenizer,
-        train_ds=train_ds,
-        val_ds=val_ds,
-        base_metrics=base_metrics,
-        router_metrics=router_metrics,
+    # Installed only once the expensive setup above is done: everything before
+    # this point is fast and reproducible, so a kill during it needs no
+    # explaining, while a kill during training is exactly what we can't
+    # currently account for after the fact.
+    if args.status_dir:
+        run_status.install_signal_handlers(Path(args.status_dir).parent, role=f"worker.{os.getpid()}")
+
+    name = safe_name(cfg.experiment_name)
+    tracker = (
+        run_status.track(args.status_dir, name, experiment=cfg.experiment_name,
+                         config_path=args.config, wandb_project=cfg.wandb_project)
+        if args.status_dir else contextlib.nullcontext()
     )
+    with tracker:
+        run_single_experiment(
+            cfg=cfg,
+            tokenizer=tokenizer,
+            train_ds=train_ds,
+            val_ds=val_ds,
+            base_metrics=base_metrics,
+            router_metrics=router_metrics,
+        )
 
 
 if __name__ == "__main__":

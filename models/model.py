@@ -70,6 +70,12 @@ class TinyGPT(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.tok_embed.weight
 
+    def transformer_blocks(self) -> nn.ModuleList:
+        """The repeated blocks, for per-block FSDP2 sharding (see
+        utils/distributed_utils.wrap_model). nn.TransformerEncoder keeps them
+        in `.layers`; the model itself has no such attribute."""
+        return self.tr.layers
+
     def _causal_mask(self, L: int, device: torch.device) -> torch.Tensor:
         mask = torch.full((L, L), float("-inf"), device=device)
         mask = torch.triu(mask, diagonal=1)
@@ -160,6 +166,27 @@ class HFCausalLM(nn.Module):
             )
         return self._pos_embed_module
 
+    def transformer_blocks(self) -> nn.ModuleList:
+        """The repeated blocks, for per-block FSDP2 sharding (see
+        utils/distributed_utils.wrap_model).
+
+        self.hf.base_model is HF's architecture-agnostic backbone accessor
+        (same one forward_to_hidden uses), but the block list under it is
+        NOT consistently named: GPT-2 calls it `.h`, Llama/Qwen `.layers`.
+        Probe both rather than hardcoding either, since build_model() accepts
+        any causal-LM checkpoint.
+        """
+        backbone = self.hf.base_model
+        for attr in ("h", "layers"):
+            blocks = getattr(backbone, attr, None)
+            if isinstance(blocks, nn.ModuleList):
+                return blocks
+        raise AttributeError(
+            f"Cannot locate the transformer block list on "
+            f"{type(backbone).__name__} (tried .h and .layers) — needed to "
+            f"shard {self.hf.name_or_path!r} with FSDP."
+        )
+
     def _expanded_position_ids(self, x: torch.Tensor) -> torch.Tensor | None:
         # HF's default GPT-2 forward looks up wpe with a batch dim of 1
         # (position_ids = cache_position.unsqueeze(0)) and broadcasts the
@@ -177,13 +204,20 @@ class HFCausalLM(nn.Module):
         return torch.arange(L, device=x.device).unsqueeze(0).expand(b, L)
 
     def forward_to_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        # output_hidden_states works across HF causal LM architectures
-        # regardless of the backbone attribute name (Qwen3 uses `.model`,
-        # GPT-2 uses `.transformer`, etc.) — avoids hardcoding either.
+        # self.hf.base_model is HF's architecture-agnostic accessor for the
+        # backbone without the LM head (`.transformer` for GPT-2, `.model`
+        # for Qwen3, etc. -- avoids hardcoding either), and its forward
+        # returns last_hidden_state directly. Calling self.hf(...,
+        # output_hidden_states=True) instead would materialize and hold
+        # EVERY intermediate per-layer hidden state alive at once (49
+        # tensors for GPT2-XL's 48 layers) just to read out the last one --
+        # this is called once per training step over the whole router pool
+        # (cfg.pool candidates, see extract_hierarchical_hidden's docstring),
+        # so that waste is the dominant avoidable memory cost in this path.
         position_ids = self._expanded_position_ids(x)
-        return self.hf(
-            input_ids=x, position_ids=position_ids, output_hidden_states=True
-        ).hidden_states[-1]
+        return self.hf.base_model(
+            input_ids=x, position_ids=position_ids
+        ).last_hidden_state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         position_ids = self._expanded_position_ids(x)

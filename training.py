@@ -20,7 +20,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from tqdm import tqdm
@@ -28,6 +27,7 @@ from config import Config
 from data import make_baseline_loader, TokenizedCorpus
 from models.model import TinyGPT
 from utils.general_utils import autocast_ctx
+from utils.distributed_utils import eval_handles, wrap_model
 from utils.metrics import MetricsTracker, DiversityTracker
 
 
@@ -178,20 +178,12 @@ def train_baseline(
 
     model.to(cfg.device)
     model.train()
-    if cfg.world_size > 1:
-        # device_ids must be None for CPU modules (only single/multi-GPU
-        # modules accept it) -- only relevant for the gloo/CPU smoke-test
-        # path, since real DDP training always runs on CUDA.
-        ddp_device_ids = [cfg.local_rank] if torch.cuda.is_available() else None
-        model = DDP(model, device_ids=ddp_device_ids)
-    # Unwrapped handle for rank-0-only eval: only rank 0 calls evaluate()/
-    # evaluate_per_domain() (see below), but DDP's forward() broadcasts
-    # module buffers whenever the last grad-enabled forward left
-    # require_forward_param_sync set (true for HF models with registered
-    # buffers, e.g. GPT-2's attn.bias) -- a collective every other rank
-    # isn't there to join, hanging NCCL. Evaluating the unwrapped module
-    # sidesteps DDP's forward entirely.
-    eval_model = model.module if isinstance(model, DDP) else model
+    # DDP-replicated or FSDP2-sharded per cfg.distributed. This path matters
+    # for FSDP as much as the router one does: random_pool_baseline and the
+    # other non-router controls train the same LM, so leaving them
+    # DDP-only would OOM exactly where the router run now fits.
+    model = wrap_model(model, cfg)
+    eval_model, this_rank_evaluates = eval_handles(model, cfg)
 
     loss_fn = nn.CrossEntropyLoss()
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
@@ -268,21 +260,24 @@ def train_baseline(
             if budget_reached:
                 break
 
-        # Only rank 0 evaluates (val_ds is small and identical on every rank);
-        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
-        # .backward() calls before rank 0 has finished its forward-only pass.
-        if cfg.rank == 0:
+        # DDP: rank 0 alone evaluates the unwrapped replica, others wait at
+        # the barrier below so nobody starts the next epoch's synchronizing
+        # .backward() mid-eval. FSDP: every rank must join the sharded
+        # forward's all-gathers, and all compute the same number, so only
+        # rank 0 logs. See utils/distributed_utils.eval_handles().
+        if this_rank_evaluates:
             val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
-            metrics.log(
-                epoch=epoch,
-                step=global_step,
-                val_loss=val_loss,
-                val_ppl=val_ppl,
-            )
-            print(
-                f"[Baseline] Epoch {epoch+1}/{cfg.epochs} "
-                f"- val_loss={val_loss:.4f}, val_ppl={val_ppl:.1f}"
-            )
+            if cfg.rank == 0:
+                metrics.log(
+                    epoch=epoch,
+                    step=global_step,
+                    val_loss=val_loss,
+                    val_ppl=val_ppl,
+                )
+                print(
+                    f"[Baseline] Epoch {epoch+1}/{cfg.epochs} "
+                    f"- val_loss={val_loss:.4f}, val_ppl={val_ppl:.1f}"
+                )
         if cfg.world_size > 1:
             dist.barrier()
 
@@ -290,16 +285,18 @@ def train_baseline(
             break
 
     # --- Final per-domain perplexity, fully trained model ---
-    if cfg.rank == 0:
+    # Same rank gating as the per-epoch validation above.
+    if this_rank_evaluates:
         per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
-        metrics.log(
-            step=global_step,
-            **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
-        )
-        print(
-            "[Final per-domain val perplexity] "
-            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
-        )
+        if cfg.rank == 0:
+            metrics.log(
+                step=global_step,
+                **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+            )
+            print(
+                "[Final per-domain val perplexity] "
+                + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+            )
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this
