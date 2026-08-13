@@ -78,7 +78,14 @@ def tee_stdio(log_path: Path):
     (Slurm/k8s/etc.) may already be the only thing capturing stdout, so we
     tee rather than redirect to avoid losing that visibility."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w") as f:
+    # buffering=1 (line buffered), not the default block buffering: this log
+    # exists to survive the process being killed, and a 4 KB buffer that only
+    # flushes on close loses exactly the tail you need after a preemption --
+    # results/_parallel_run/20260813_134305/logs/_orchestrator.log sat at 0
+    # bytes for a whole sweep for this reason. Line buffering also leaves
+    # tqdm's \r-terminated progress redraws buffered (no newline, no flush),
+    # so only real log lines pay for the durability.
+    with log_path.open("w", buffering=1) as f:
         tee_out, tee_err = _Tee(sys.stdout, f), _Tee(sys.stderr, f)
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = tee_out, tee_err

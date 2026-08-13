@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import load_config_from_yaml
 from data import get_tokenizer
-from models.model import TinyGPT
+from models.model import build_model
 from models.router import build_router, get_router_feature_dim
 from utils.metrics import MetricsTracker, DiversityTracker
 from rl_training import train_router_experiments, train_aux_baseline
@@ -61,7 +61,16 @@ def main() -> None:
         args.dataset_cache, probe_cfg, max_train=train_size, max_val=32, warm_cache=False
     )
 
-    model = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=probe_cfg)
+    # build_model(), NOT TinyGPT directly: memory_signature() already keys the
+    # probe cache on (model_type, hf_model_name), so hardcoding TinyGPT here
+    # measured a completely different architecture than an
+    # 'hf_pretrained' config actually runs -- and understated it badly.
+    # __post_init__ copies the checkpoint's hidden size/layer count onto cfg,
+    # so the TinyGPT stand-in looked the right *size* while its MLP width came
+    # from the YAML's d_ff (2048) instead of the checkpoint's n_inner (6400
+    # for GPT2-XL). Activations are the dominant term for the wide-batch
+    # baselines, so the scheduler packed runs that could never fit.
+    model = build_model(tokenizer.vocab_size, probe_cfg)
     metrics = MetricsTracker(f"probe_{probe_cfg.experiment_name}", use_wandb=False)
     diversity = DiversityTracker(len(train_ds), domain_names=train_ds.domain_names)
 

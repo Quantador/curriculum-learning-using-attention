@@ -100,7 +100,7 @@ from utils.shared_dataset import (
 )
 from utils.distributed_utils import cleanup_distributed, setup_distributed
 from utils.metrics import MetricsTracker
-from utils import run_status
+from utils import memory_snapshot, run_status
 from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
 from utils.general_utils import (get_profile_fields, safe_name,
                                  query_free_memory_bytes, compute_costs, dump_config, tee_stdio)
@@ -427,10 +427,15 @@ def run_ddp_sweep(
         with tee_stdio(scratch_dir / "logs" / f"{name}.log") if rank == 0 else contextlib.nullcontext():
             try:
                 with tracker:
-                    run_single_experiment(
-                        cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
-                        base_metrics=base_metrics, router_metrics=router_metrics,
-                    )
+                    # Recorded on EVERY rank, unlike the status tracking above:
+                    # under FSDP the ranks hold different shards, so an OOM on
+                    # rank 7 is not visible in rank 0's allocator history.
+                    # Filenames carry the rank, so they don't collide.
+                    with memory_snapshot.record(scratch_dir / "snapshots", name, rank=rank):
+                        run_single_experiment(
+                            cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
+                            base_metrics=base_metrics, router_metrics=router_metrics,
+                        )
             except Exception:
                 if rank == 0:
                     print(f"[FAILED] {cfg.experiment_name} — see {scratch_dir}/logs/{name}.log")

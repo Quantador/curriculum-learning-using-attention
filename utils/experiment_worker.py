@@ -29,7 +29,7 @@ from models.model import build_model
 from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
 from utils.general_utils import safe_name, set_seed
-from utils import run_status
+from utils import memory_snapshot, run_status
 
 def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics):
     """Run a single experiment with the given configuration.
@@ -197,15 +197,22 @@ def main() -> None:
                          config_path=args.config, wandb_project=cfg.wandb_project)
         if args.status_dir else contextlib.nullcontext()
     )
+    # Snapshots go beside the run's other artifacts when the sweep gave us a
+    # status dir (its parent is the scratch dir), else the cwd for a
+    # hand-launched worker. Inside `tracker`, so on an OOM the allocator dump
+    # happens before run_status records the exception -- the inner context
+    # exits first, and the snapshot is only meaningful before unwinding.
+    snapshot_dir = (Path(args.status_dir).parent / "snapshots") if args.status_dir else Path("snapshots")
     with tracker:
-        run_single_experiment(
-            cfg=cfg,
-            tokenizer=tokenizer,
-            train_ds=train_ds,
-            val_ds=val_ds,
-            base_metrics=base_metrics,
-            router_metrics=router_metrics,
-        )
+        with memory_snapshot.record(snapshot_dir, name, rank=cfg.rank):
+            run_single_experiment(
+                cfg=cfg,
+                tokenizer=tokenizer,
+                train_ds=train_ds,
+                val_ds=val_ds,
+                base_metrics=base_metrics,
+                router_metrics=router_metrics,
+            )
 
 
 if __name__ == "__main__":
