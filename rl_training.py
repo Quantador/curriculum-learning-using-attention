@@ -979,9 +979,14 @@ def train_router_experiments(
             feat_start = time.perf_counter()
             external_embedding = None
             if train_ds.embeddings is not None:
+                # .float() on read: TokenizedCorpus.embeddings is the fp16
+                # sentence-embedder cache (a storage format, chosen to halve
+                # its footprint), and everything downstream of it -- the
+                # router, and the feature-cache concat below -- is fp32. Same
+                # upcast-on-read the feature cache itself already does.
                 external_embedding = torch.stack(
                     [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
+                ).to(cfg.device).float()
 
             if feature_cache is not None:
                 hidden_feats = feature_cache[pool_indices].to(cfg.device).float()
@@ -1493,9 +1498,14 @@ def train_aux_baseline(
             # --- Feature extraction ---
             external_embedding = None
             if train_ds.embeddings is not None:
+                # .float() on read: TokenizedCorpus.embeddings is the fp16
+                # sentence-embedder cache (a storage format, chosen to halve
+                # its footprint), and everything downstream of it -- the
+                # router, and the feature-cache concat below -- is fp32. Same
+                # upcast-on-read the feature cache itself already does.
                 external_embedding = torch.stack(
                     [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
+                ).to(cfg.device).float()
 
             feats = extract_router_features(
                 model=model,

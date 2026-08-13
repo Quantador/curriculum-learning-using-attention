@@ -153,7 +153,20 @@ def extract_router_features(
         full_dim = cfg.n_chunks * cfg.d_model + 4
         return torch.randn(X.size(0), full_dim, device=X.device)
 
-    return torch.cat(features, dim=1)  # [B, F]
+    # .float() is load-bearing, not defensive. The router is always fp32 (it
+    # is replicated, never sharded or autocast -- see
+    # utils/distributed_utils.wrap_replica), but two of the three feature
+    # groups arrive in reduced precision: the sentence-embedder cache is
+    # stored fp16 on purpose (utils/sentence_embedder.py), and under
+    # distributed='FSDP' the LM's hidden states come back in the
+    # MixedPrecisionPolicy param_dtype (bf16). torch.cat type-promotes, so a
+    # config with several groups enabled silently lands on fp32 and works --
+    # but a single-group config ('sentence embedder alone', or hierarchical
+    # alone under FSDP) hands the router a Half/BFloat16 tensor against its
+    # fp32 weights, and F.linear raises "expected mat1 and mat2 to have the
+    # same dtype". Pinning the contract here rather than at each call site
+    # makes that independent of which flags happen to be on.
+    return torch.cat(features, dim=1).float()  # [B, F]
 
 
 def get_router_feature_dim(cfg: ExperimentConfig, sequence_size: int) -> int:
