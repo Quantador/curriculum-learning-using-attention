@@ -28,7 +28,7 @@ from training import train_baseline
 from models.model import build_model
 from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
-from utils.general_utils import safe_name, set_seed
+from utils.general_utils import resolve_device, safe_name, set_seed
 from utils import memory_snapshot, run_status
 
 def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics):
@@ -175,6 +175,10 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config_from_yaml(args.config)
+    # Before anything touches a GPU: the YAML may have been written by a
+    # process that could not see one (parallel_experiments.py --submit runs on
+    # a login node), so the device is decided here, on the machine that trains.
+    cfg = resolve_device(cfg)
     set_seed(cfg.seed)
 
     tokenizer = get_tokenizer(cfg.tokenizer_name)

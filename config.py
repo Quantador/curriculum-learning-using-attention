@@ -16,7 +16,6 @@ Typical usage:
 """
 from dataclasses import dataclass, field, fields, replace
 import os
-import torch
 import yaml
 from transformers import AutoConfig
 
@@ -69,7 +68,7 @@ class Config:
 
     # System
     seed: int = 0
-    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+    device: str = ""
     # Background worker processes for the training/eval DataLoaders (data.py's
     # make_pool_loader/make_baseline_loader, and evaluate()/evaluate_per_domain()
     # in training.py). 0 = load in the main process (safe default -- sweeps in

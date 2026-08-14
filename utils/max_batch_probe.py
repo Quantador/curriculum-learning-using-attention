@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_config_from_yaml
 from data import get_tokenizer
 from models.model import build_model
-from utils.general_utils import autocast_ctx
+from utils.general_utils import autocast_ctx, resolve_device
 
 GB = 1024 ** 3
 
@@ -173,7 +173,7 @@ def main() -> None:
     overrides = {"use_wandb": False, "world_size": 1, "rank": 0}
     if args.block is not None:
         overrides["block"] = args.block
-    cfg = replace(cfg, **overrides)
+    cfg = resolve_device(replace(cfg, **overrides))
 
     tokenizer = get_tokenizer(cfg.tokenizer_name)
     total = torch.cuda.get_device_properties(0).total_memory

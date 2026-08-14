@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from consts import EXPERIMENT_PROFILES, PER_PROC_BUFFER, CONTEXT_OVERHEAD_BYTES, EXPERIMENTAL_FIELDS
 from config import ExperimentConfig
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 def get_baseline_config() -> Dict[str, Any]:
     """Get the baseline values for all experimental fields."""
@@ -48,6 +48,24 @@ def autocast_ctx(device: str):
     if device.startswith("cuda"):
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
+
+
+def resolve_device(cfg: ExperimentConfig) -> ExperimentConfig:
+    """Fill in cfg.device from the hardware this process can actually see.
+
+    cfg.device defaults to "" so that the choice is made by the machine that
+    trains, not the one that happened to build the config -- a config written
+    on a GPU-less login node (parallel_experiments.py --submit) must not pin
+    its jobs to CPU. Call this once, right after loading a config, in any
+    entrypoint that trains. A config that already names a device (set
+    explicitly in YAML, or by run_ddp_sweep's cuda:<local_rank>) is returned
+    untouched, so an explicit choice always wins.
+    """
+    if cfg.device:
+        return cfg
+    import torch
+
+    return replace(cfg, device="cuda" if torch.cuda.is_available() else "cpu")
 
 
 def dump_config(cfg: ExperimentConfig, path: Path) -> None:

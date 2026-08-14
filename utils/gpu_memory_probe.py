@@ -33,6 +33,7 @@ from config import load_config_from_yaml
 from data import get_tokenizer
 from models.model import build_model
 from models.router import build_router, build_router_for_cfg, get_router_feature_dim
+from utils.general_utils import resolve_device
 from utils.metrics import MetricsTracker, DiversityTracker
 from rl_training import train_router_experiments, train_aux_baseline
 from training import train_baseline
@@ -49,11 +50,11 @@ def main() -> None:
         raise RuntimeError("gpu_memory_probe requires a CUDA device")
 
     cfg = load_config_from_yaml(args.config)
-    probe_cfg = replace(
+    probe_cfg = resolve_device(replace(
         cfg,
         use_wandb=False,
         epochs=2 if cfg.feature_cache_epochs > 0 else 1,
-    )
+    ))
 
     train_size = max(probe_cfg.pool * 3, 64)
     tokenizer = get_tokenizer(cfg.tokenizer_name)

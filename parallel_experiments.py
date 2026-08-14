@@ -511,6 +511,8 @@ def submit_experiment_jobs(
     for i, cfg in enumerate(configs):
         name = safe_name(cfg.experiment_name)
         cfg_path = (cfg_dir / f"{name}.yaml").resolve()
+        # cfg.device is "" here (this runs on a GPU-less login node) and stays
+        # "" in the YAML; each job resolves it for itself via resolve_device().
         dump_config(cfg, cfg_path)
 
         script = JOB_TEMPLATE.format(
