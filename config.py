@@ -323,6 +323,45 @@ class ExperimentConfig(Config):
                 "Set feature_cache_epochs=0 or use_original_sequence=False."
             )
 
+        if self.router_feature_source not in ("features", "own_embeddings"):
+            raise ValueError(
+                f"router_feature_source={self.router_feature_source!r} must be "
+                "'features' or 'own_embeddings'."
+            )
+
+        if self.router_feature_source == "own_embeddings":
+            if self.feature_cache_epochs > 0:
+                # Same trap as use_original_sequence above, plus a worse one:
+                # the router's tables are *trained*, so their output changes
+                # every step and could never be cached even in principle.
+                raise ValueError(
+                    "router_feature_source='own_embeddings' is incompatible "
+                    f"with feature_cache_epochs={self.feature_cache_epochs} "
+                    "(>0): the router's embeddings are learned, so their "
+                    "output changes every step and cannot be cached. "
+                    "Set feature_cache_epochs=0."
+                )
+            if self.use_original_sequence:
+                raise ValueError(
+                    "router_feature_source='own_embeddings' and "
+                    "use_original_sequence=True both claim the router's input: "
+                    "the former embeds the token ids, the latter feeds them as "
+                    "raw floats. Set use_original_sequence=False."
+                )
+            if self.block % self.n_chunks != 0:
+                raise ValueError(
+                    f"router_feature_source='own_embeddings' needs block="
+                    f"{self.block} divisible by n_chunks={self.n_chunks} "
+                    "(the router chunk-pools its embeddings the same way "
+                    "extract_hierarchical_hidden does)."
+                )
+            if self.router_architecture == "random":
+                raise ValueError(
+                    "router_feature_source='own_embeddings' has no meaning "
+                    "with router_architecture='random' (no router is built, so "
+                    "there are no embeddings to learn). Set one or the other."
+                )
+
     # Dataset options by difficulty (see DATASET_REGISTRY in data.py):
     # Easy:         roneneldan/TinyStories
     #               ajibawa-2023/Children-Stories-Collection
@@ -392,8 +431,28 @@ class ExperimentConfig(Config):
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
-    use_original_sequence: bool = False # This uses the original tokens sequence, not passed through the model. 
-    
+    use_original_sequence: bool = False # This uses the original tokens sequence, not passed through the model.
+
+    # Where the router's input representation comes from.
+    #   'features'       — the concatenated feature groups above, built by
+    #                      extract_router_features() (default, current behavior)
+    #   'own_embeddings' — the router owns token + positional embedding tables
+    #                      and learns them from the policy-gradient signal,
+    #                      reading the raw token sequence directly (models/
+    #                      router.py EmbeddingRouter). The LM is never touched.
+    #
+    # Distinct from hierarchical_representation='embedder', which chunk-pools
+    # the *LM's* embedding tables under torch.no_grad() -- frozen, and shaped
+    # by the LM's own objective. Both pool identically (cfg.n_chunks segments,
+    # mean-pooled, concatenated), so the pair is a controlled comparison of
+    # learned-by-the-router vs. borrowed-from-the-LM embeddings.
+    router_feature_source: str = "features"  # options: features, own_embeddings
+    # Width of the router's own embedding tables. Only read when
+    # router_feature_source='own_embeddings'. The router head then sees
+    # n_chunks * router_embed_dim inputs.
+    router_embed_dim: int = 256
+
+
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo
 

@@ -55,12 +55,15 @@ def main() -> None:
         print("Status:    already built -- nothing to do (pass --overwrite to rebuild).")
         return
 
+    workers = args.workers or os.cpu_count() or 1 
+    print(f"Workers: {workers}")
+    print(f"Tasks: {args.tasks}")
     build_tokenized_cache(
         cfg,
         entry_dir,
         sig,
         tasks=args.tasks,
-        workers=args.workers or os.cpu_count() or 1,
+        workers=workers,
         splits=args.splits,
         overwrite=args.overwrite,
     )

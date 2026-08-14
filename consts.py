@@ -193,6 +193,14 @@ SENTENCE_EMBEDDER_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
 #                                 so this alternative is valid without touching that field)
 #   - use_original_sequence=True      -> bypass every feature group; router scores
 #                                         the raw token ids directly
+#   - router_feature_source:
+#       features      (baseline) -> the concatenated groups above
+#       own_embeddings           -> the router owns token+positional embedding
+#                                    tables and learns them from the routing
+#                                    objective, never touching the LM. Pools
+#                                    identically to hierarchical_representation=
+#                                    'embedder', so the pair isolates learned-
+#                                    by-the-router vs. frozen-from-the-LM
 #   - sentence_embedder_model set     -> concatenate a frozen precomputed sentence
 #                                         embedding onto the hierarchical+text-stat
 #                                         baseline features (additive; only one
@@ -206,10 +214,19 @@ SENTENCE_EMBEDDER_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
 # use_external_embeddings (config.py) is intentionally excluded: it's rejected by
 # tokenization.py's datatrove path (NotImplementedError) and can't currently run.
 ROUTER_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
-    "enable_text_hierarchical": (True, [False]),
-    "enable_text_stat": (True, [False]),
     "hierarchical_representation": ("full", ["embedder", "layer"]),
     "use_original_sequence": (False, [True]),
+    "router_feature_source": ("features", [
+        {
+            "_name": "own_embeddings",
+            "router_feature_source": "own_embeddings",
+            # The router's own tables replace every other group, so the
+            # baseline's feature flags have to come off or config validation
+            # would be describing a router input that is never built.
+            "enable_text_hierarchical": False,
+            "enable_text_stat": False,
+        },
+    ]),
     "sentence_embedder_model": ("", [
         "intfloat/e5-base-v2",
         {

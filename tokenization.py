@@ -47,13 +47,13 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from datasets import load_dataset
-from datatrove.executor.local import LocalPipelineExecutor
-from datatrove.pipeline.filters import LambdaFilter
-from datatrove.pipeline.readers import HuggingFaceDatasetReader
-from datatrove.pipeline.tokens.tokenizer import DocumentTokenizer
-from datatrove.utils.tokenization import load_tokenizer
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+# datatrove is imported lazily, inside the three functions that need it, so the
+# training path can reach read_manifest()/MANIFEST_NAME without it installed.
+# Only build_dataset_cache.py tokenizes, and it runs in its own venv --
+# datatrove needs numpy>=2, which the training venv's CUDA torch cannot take.
 
 from config import ExperimentConfig
 from consts import DATASET_REGISTRY
@@ -173,6 +173,8 @@ def make_adapter(text_col: str, split_column: str | None) -> Callable:
 
 
 def make_domain_filter(domain: str) -> LambdaFilter:
+    from datatrove.pipeline.filters import LambdaFilter
+
     return LambdaFilter(lambda doc, _d=domain: doc.metadata.get("domain") == _d)
 
 
@@ -261,6 +263,8 @@ def token_size_for(tokenizer_name: str) -> int:
     Same rule as datatrove's PipelineStepWithTokenizer.token_size: uint16 for
     vocabularies that fit, uint32 otherwise (GPT-2 -> 2, Qwen -> 4).
     """
+    from datatrove.utils.tokenization import load_tokenizer
+
     return 4 if load_tokenizer(tokenizer_name).get_vocab_size() > 65535 else 2
 
 
@@ -299,6 +303,10 @@ def build_tokenized_cache(
     never mistaken for a cache hit; re-running resumes, since datatrove's
     skip_completed reuses the per-task completion markers under logs/.
     """
+    from datatrove.executor.local import LocalPipelineExecutor
+    from datatrove.pipeline.readers import HuggingFaceDatasetReader
+    from datatrove.pipeline.tokens.tokenizer import DocumentTokenizer
+
     entry_dir = Path(entry_dir)
     if overwrite and entry_dir.exists():
         print(f"[tokenize] --overwrite: removing {entry_dir}")
@@ -371,7 +379,8 @@ def build_tokenized_cache(
                     save_filename=folders[domain],
                 )
             )
-
+            print(f"Number of split tasks: {split_tasks}")
+            print(f"Workers in tokenization: {workers}")
             LocalPipelineExecutor(
                 pipeline=pipeline,
                 tasks=split_tasks,

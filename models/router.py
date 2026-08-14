@@ -121,6 +121,11 @@ def extract_router_features(
     Returns [B, F] where F == get_router_feature_dim(cfg).
     """
     features = []
+    if cfg.router_feature_source == "own_embeddings":
+        # No features to build: EmbeddingRouter does its own embedding lookup,
+        # so it needs the integer ids. Deliberately not .float() -- that would
+        # make the ids unusable as nn.Embedding indices.
+        return X
     if cfg.use_original_sequence:
         return X.float()
     if cfg.enable_text_hierarchical:
@@ -182,6 +187,12 @@ def get_router_feature_dim(cfg: ExperimentConfig, sequence_size: int) -> int:
     dimension n_chunks * d_model + 4 to match the random-feature path in
     extract_router_features().
     """
+    if cfg.router_feature_source == "own_embeddings":
+        # The head's input width, after EmbeddingRouter's chunk-pool. The
+        # router itself is built by build_router_for_cfg() and sizes this
+        # internally; returned here so probes/logging that ask for "the
+        # router's input dim" get the real number rather than a stale one.
+        return cfg.n_chunks * cfg.router_embed_dim
     if cfg.use_original_sequence:
         return sequence_size
     has_precomputed_emb = getattr(cfg, "use_external_embeddings", False) or bool(
@@ -240,3 +251,102 @@ def build_router(
     if arch == "random":
         return None
     raise ValueError(f"Unknown router arch: {arch}")
+
+
+class EmbeddingRouter(nn.Module):
+    """
+    Router that learns its own representation of the raw token sequence.
+
+    Owns token and positional embedding tables, embeds X directly, chunk-pools
+    the result, and scores it with one of the standard heads from
+    build_router(). The LM is never involved -- no forward pass, no shared
+    weights -- and the tables receive gradients from the policy-gradient
+    update like any other router parameter (rl_training.py builds
+    opt_router over router.parameters()).
+
+    Contrast with cfg.hierarchical_representation='embedder', which pools the
+    *LM's* embedding tables under torch.no_grad(): those are frozen and shaped
+    by the LM's next-token objective, whereas these are shaped by the routing
+    objective. Pooling here is deliberately identical to
+    extract_hierarchical_hidden() -- cfg.n_chunks equal segments, mean-pooled,
+    concatenated -- so the two modes hand their head the same feature shape
+    and differ only in where the embeddings come from.
+
+    Input is the [B, L] *integer* token id tensor, not a float feature matrix;
+    extract_router_features() passes X through untouched in this mode.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        block: int,
+        n_chunks: int,
+        d_embed: int = 256,
+        *,
+        arch: str = "attention",
+        d_k: int = 128,
+        d_hidden: int = 256,
+        n_heads: int = 1,
+    ):
+        super().__init__()
+        if block % n_chunks != 0:
+            raise ValueError(
+                f"block={block} must be divisible by n_chunks={n_chunks}"
+            )
+        head = build_router(
+            d_input=n_chunks * d_embed,
+            arch=arch,
+            d_k=d_k,
+            d_hidden=d_hidden,
+            n_heads=n_heads,
+        )
+        if head is None:
+            raise ValueError(
+                "EmbeddingRouter has no use with arch='random' (random scoring "
+                "never trains the embeddings it would own)."
+            )
+        self.n_chunks = n_chunks
+        self.d_embed = d_embed
+        self.tok_embed = nn.Embedding(vocab_size, d_embed)
+        self.pos_embed = nn.Embedding(block, d_embed)
+        self.head = head
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """X: [B, L] token ids (long) -> [B] scores."""
+        B, L = X.shape
+        pos = torch.arange(L, device=X.device).unsqueeze(0).expand(B, L)
+        h = self.tok_embed(X) + self.pos_embed(pos)     # [B, L, d_embed]
+        chunk_len = L // self.n_chunks
+        pooled = h.view(B, self.n_chunks, chunk_len, self.d_embed).mean(dim=2)
+        return self.head(pooled.reshape(B, self.n_chunks * self.d_embed))
+
+
+def build_router_for_cfg(
+    cfg: ExperimentConfig,
+    sequence_size: int,
+    vocab_size: int,
+) -> nn.Module | None:
+    """
+    Build the router a config asks for -- the single entry point for callers.
+
+    Dispatches on cfg.router_feature_source: 'own_embeddings' returns an
+    EmbeddingRouter (which sizes its own head), anything else returns a plain
+    head over get_router_feature_dim(). Returns None for
+    router_architecture='random', same as build_router().
+    """
+    if cfg.router_feature_source == "own_embeddings":
+        return EmbeddingRouter(
+            vocab_size=vocab_size,
+            block=cfg.block,
+            n_chunks=cfg.n_chunks,
+            d_embed=cfg.router_embed_dim,
+            arch=cfg.router_architecture,
+            d_k=128,
+            n_heads=getattr(cfg, "router_n_heads", 1),
+        )
+    return build_router(
+        d_input=get_router_feature_dim(cfg, sequence_size),
+        arch=cfg.router_architecture,
+        d_k=128,
+        n_heads=getattr(cfg, "router_n_heads", 1),
+    )

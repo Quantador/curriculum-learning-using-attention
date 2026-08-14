@@ -14,7 +14,7 @@
 #SBATCH --job-name=curriculum-multinode
 #SBATCH --output=./logs/%x-%j.out
 #SBATCH --error=./logs/%x-%j.err
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --partition=normal
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
@@ -43,11 +43,14 @@ if [ -z "$CONFIG_PATH" ]; then
     exit 1
 fi
 
+nvidia-smi
+
 # Dataset cache build: single task, CPU-only. Uses a separate venv
 # (curriculum-datacache-venv) because datatrove requires numpy>=2, which is
 # incompatible with the training venv's prebuilt CUDA torch (numpy<2 ABI).
 srun --nodes=1 --ntasks=1 --environment="$CONTAINER_ENV" bash -c '
-    source /iopsstor/scratch/cscs/$USER/curriculum-datacache-venv/bin/activate
+    source /iopsstor/scratch/cscs/$USER/curriculum-datacache-venv/bin/activate &&
+    export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" &&
     python build_dataset_cache.py --config "'"$CONFIG_PATH"'" --workers 32 --tasks 128
 '
 

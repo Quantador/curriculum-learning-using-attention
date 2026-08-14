@@ -1,0 +1,21 @@
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2:alps4-dev-3f34f16a8d1f2fc0"
+
+mounts = [
+    "/users/staga/curriculum-learning-using-attention:/curriculum-learning-using-attention",
+    "/users/staga",
+    "/capstor/",
+    "/iopsstor/",
+]
+writable = true
+workdir = "/curriculum-learning-using-attention"
+
+[env]
+PMIX_MCA_psec = "native"
+FI_MR_CACHE_MAX_SIZE = "-1"
+FI_MR_CACHE_MAX_COUNT = "524288"
+FI_CXI_SAFE_DEVMEM_COPY_THRESHOLD = "16777216"
+FI_MR_CACHE_MONITOR = "userfaultfd"
+
+[annotations]
+com.hooks.cxi.enabled = "true"
+com.hooks.netstack.source = "artifact"

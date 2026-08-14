@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_config_from_yaml
 from data import get_tokenizer
 from models.model import build_model
-from models.router import build_router, get_router_feature_dim
+from models.router import build_router, build_router_for_cfg, get_router_feature_dim
 from utils.metrics import MetricsTracker, DiversityTracker
 from rl_training import train_router_experiments, train_aux_baseline
 from training import train_baseline
@@ -110,11 +110,10 @@ def main() -> None:
             diversity=diversity,
         )
     else:
-        router = build_router(
-            d_input=get_router_feature_dim(probe_cfg, model.block),
-            arch=probe_cfg.router_architecture,
-            d_k=128,
-            n_heads=getattr(probe_cfg, "router_n_heads", 1),
+        router = build_router_for_cfg(
+            probe_cfg,
+            sequence_size=model.block,
+            vocab_size=tokenizer.vocab_size,
         )
         train_router_experiments(
             cfg=probe_cfg,

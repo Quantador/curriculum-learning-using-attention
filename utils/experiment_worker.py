@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_config_from_yaml
 from data import get_tokenizer
 from utils.shared_dataset import load_dataset_cache
-from models.router import build_router, get_router_feature_dim
+from models.router import build_router, build_router_for_cfg, get_router_feature_dim
 from rl_training import train_router_experiments, train_aux_baseline, compare_runs_experiments
 from training import train_baseline
 from models.model import build_model
@@ -123,11 +123,10 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 diversity=router_div,
             )
         else:
-            router = build_router(
-                d_input=get_router_feature_dim(cfg, model_router.block),
-                arch=cfg.router_architecture,
-                d_k=128,
-                n_heads=getattr(cfg, "router_n_heads", 1),
+            router = build_router_for_cfg(
+                cfg,
+                sequence_size=model_router.block,
+                vocab_size=tokenizer.vocab_size,
             )
             model_router, router = train_router_experiments(
                 cfg=cfg,
