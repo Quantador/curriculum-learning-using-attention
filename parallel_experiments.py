@@ -444,6 +444,7 @@ def run_ddp_sweep(
                         run_single_experiment(
                             cfg=cfg, tokenizer=tokenizer, train_ds=train_ds, val_ds=val_ds,
                             base_metrics=base_metrics, router_metrics=router_metrics,
+                            save_dir=scratch_dir / "checkpoints",
                         )
             except Exception:
                 if rank == 0:
@@ -600,7 +601,8 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
         if args.profile or args.field or args.all or args.combinations:
             print("Error: --single cannot be combined with --profile/--field/--all/--combinations.")
             sys.exit(1)
-        return [load_config_from_yaml(args.config)]
+        cfg = load_config_from_yaml(args.config)
+        return [replace(cfg, save_model_at_end=True) if args.save_model else cfg]
 
     # base_cfg is what every generated experiment is built from. Fields NOT
     # under ablation (i.e. not in selected_fields below) carry through from
@@ -642,12 +644,16 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
         flat_fields = {
             f: [b] + a for f, (b, a) in (selected_fields or EXPERIMENTAL_FIELDS).items()
         }
-        return generate_combination_configs(base_cfg=base_cfg, experimental_fields=flat_fields)
-    return generate_experiment_configs(
-        base_cfg=base_cfg,
-        experimental_fields=selected_fields,
-        include_baseline=not args.no_baseline,
-    )
+        configs = generate_combination_configs(base_cfg=base_cfg, experimental_fields=flat_fields)
+    else:
+        configs = generate_experiment_configs(
+            base_cfg=base_cfg,
+            experimental_fields=selected_fields,
+            include_baseline=not args.no_baseline,
+        )
+    if args.save_model:
+        configs = [replace(c, save_model_at_end=True) for c in configs]
+    return configs
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run curriculum learning experiments in parallel on one GPU")
@@ -656,6 +662,7 @@ def main() -> None:
     parser.add_argument("--field", type=str, action="append", help="Run experiments for specific field(s) only")
     parser.add_argument("--profile", type=str, help="Run a predefined experiment profile")
     parser.add_argument("--no-baseline", action="store_true", help="Skip the aux_baseline and random_pool_baseline reference experiments (experiment_baseline and random_batch_baseline always run)")
+    parser.add_argument("--save-model", action="store_true", help="Checkpoint the trained LM (and router/aux_net, if any) for every experiment to <scratch_dir>/checkpoints/<name>.pt")
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML file with ExperimentConfig field overrides, used as the base config every experiment is built from (fields under ablation are still forced to their declared values)")
     parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: --config's, or presentation_experiment)")
     parser.add_argument("--list", action="store_true", help="List experiments that would run, without running them")

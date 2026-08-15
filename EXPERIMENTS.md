@@ -24,6 +24,7 @@ python parallel_experiments.py --all
 | `--field FIELD` | Run experiments for specific field(s) only (can be repeated) |
 | `--profile PROFILE` | Run a predefined experiment profile (e.g., `final_presentation`) |
 | `--no-baseline` | Skip the `aux_baseline` and `random_pool_baseline` reference experiments (`experiment_baseline` and `random_batch_baseline` always run) |
+| `--save-model` | Checkpoint the trained LM (and router/aux_net, if any) for every experiment to `<scratch_dir>/checkpoints/<name>.pt` (off by default -- opt in per run, since hf_pretrained models are multi-GB each) |
 | `--list` | List experiments without running them |
 | `--config PATH` | YAML file with `ExperimentConfig` overrides, used as the base config |
 | `--name NAME` | Sweep name; sets the shared wandb project `curriculum-learning-<name>` |

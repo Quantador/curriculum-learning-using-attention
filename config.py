@@ -613,6 +613,14 @@ class ExperimentConfig(Config):
     run_random_batch_baseline: bool = False
     run_random_pool_baseline: bool = False
 
+    # Checkpoint the trained LM (and router/aux_net, when one was trained) at
+    # the end of run_single_experiment() to <scratch_dir>/checkpoints/<name>.pt.
+    # Off by default: a sweep runs many experiments, and hf_pretrained models
+    # like GPT2-XL are multi-GB each -- opt in per run (parallel_experiments.py
+    # --save-model, or this field directly in a YAML) rather than paying that
+    # disk cost for every experiment in every sweep.
+    save_model_at_end: bool = False
+
 
 def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> ExperimentConfig:
     """
