@@ -1,15 +1,15 @@
 experiment_name: clariden_xl_freeze_router
 epochs: 10
-global_batch_size: 16
+global_batch_size: 160
 pool_mult: 10
 lr_lm: 0.0003
 use_wandb: true
-max_chunks: 500000
+max_chunks: 6000000
 model_type: hf_pretrained
 hf_model_name: openai-community/gpt2-xl
 enable_text_hierarchical: false 
 enable_text_stat: false 
 use_original_sequence: false
-sentence_embedder_dim: 768
+router_feature_source: "own_embeddings"
 dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
 dataset_proportions: [0.7, 0.3]

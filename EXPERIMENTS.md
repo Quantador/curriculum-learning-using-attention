@@ -23,7 +23,7 @@ python parallel_experiments.py --all
 | `--combinations` | Run full grid search of all combinations (warning: many experiments!) |
 | `--field FIELD` | Run experiments for specific field(s) only (can be repeated) |
 | `--profile PROFILE` | Run a predefined experiment profile (e.g., `final_presentation`) |
-| `--no-baseline` | Skip the baseline experiment |
+| `--no-baseline` | Skip the `aux_baseline` and `random_pool_baseline` reference experiments (`experiment_baseline` and `random_batch_baseline` always run) |
 | `--list` | List experiments without running them |
 | `--config PATH` | YAML file with `ExperimentConfig` overrides, used as the base config |
 | `--name NAME` | Sweep name; sets the shared wandb project `curriculum-learning-<name>` |

@@ -127,16 +127,19 @@ def generate_experiment_configs(
     enable_text_hierarchical AND enable_text_stat turned off together with
     sentence_embedder_model set, not just one field changed from baseline.
 
-    Also always includes (unless include_baseline=False) four fixed reference
-    runs that every sweep should be judged against:
+    Always includes two core reference runs that every sweep should be judged
+    against, regardless of include_baseline:
       - 'experiment_baseline':  plain baseline_values, RL router as usual --
                                 the sweep's own control condition.
-      - 'aux_baseline':         supervised MSE alternative to the router
-                                (rl_training.train_aux_baseline()).
       - 'random_batch_baseline': uniform random cfg.global_batch_size-sized
                                 selection, no router/aux_net (training.train_baseline()).
-      - 'random_pool_baseline':  same, but selecting cfg.pool samples (the
-                                router's whole candidate pool, unfiltered).
+    Additionally includes (unless include_baseline=False) two secondary
+    reference runs:
+      - 'aux_baseline':         supervised MSE alternative to the router
+                                (rl_training.train_aux_baseline()).
+      - 'random_pool_baseline':  same as random_batch_baseline, but selecting
+                                cfg.pool samples (the router's whole
+                                candidate pool, unfiltered).
     None of these are ablated EXPERIMENTAL_FIELDS entries — they're fixed
     reference points that ride along with every sweep instead of only
     appearing when someone happens to select them with --field.
@@ -144,7 +147,9 @@ def generate_experiment_configs(
     Args:
         base_cfg:            Starting config (defaults to ExperimentConfig()).
         experimental_fields: {field: (baseline, [alternatives])} mapping.
-        include_baseline:    Whether to prepend the reference configs first.
+        include_baseline:    Whether to also include aux_baseline and
+                             random_pool_baseline (experiment_baseline and
+                             random_batch_baseline are always included).
 
     Returns a list of ExperimentConfig with descriptive experiment_name fields.
     """
@@ -159,17 +164,21 @@ def generate_experiment_configs(
     # Get baseline values
     baseline_values = {field: values[0] for field, values in experimental_fields.items()}
 
-    # Optionally add the fixed reference experiments (router baseline +
-    # non-router controls), each identical to baseline_values except for the
-    # one flag that switches training loop.
-    if include_baseline:
-        reference_overrides = {
-            "random_pool_baseline": {"run_random_pool_baseline": True},
-            "experiment_baseline": {},
-            "aux_baseline": {"run_aux_baseline": True},
-            "random_batch_baseline": {"run_random_batch_baseline": True},
-        }
-        for name, overrides in reference_overrides.items():
+    # Reference experiments (router baseline + non-router controls), each
+    # identical to baseline_values except for the one flag that switches
+    # training loop. experiment_baseline and random_batch_baseline are the
+    # two every sweep is judged against, so they ride along unconditionally;
+    # aux_baseline and random_pool_baseline are secondary and gated behind
+    # include_baseline.
+    reference_overrides = {
+        "random_pool_baseline": {"run_random_pool_baseline": True},
+        "experiment_baseline": {},
+        "aux_baseline": {"run_aux_baseline": True},
+        "random_batch_baseline": {"run_random_batch_baseline": True},
+    }
+    unconditional_references = {"experiment_baseline", "random_batch_baseline"}
+    for name, overrides in reference_overrides.items():
+        if include_baseline or name in unconditional_references:
             configs.append(replace(
                 base_cfg,
                 experiment_name=name,
@@ -646,7 +655,7 @@ def main() -> None:
     parser.add_argument("--combinations", action="store_true", help="Run full grid search of all combinations")
     parser.add_argument("--field", type=str, action="append", help="Run experiments for specific field(s) only")
     parser.add_argument("--profile", type=str, help="Run a predefined experiment profile")
-    parser.add_argument("--no-baseline", action="store_true", help="Skip the baseline and aux_baseline reference experiments")
+    parser.add_argument("--no-baseline", action="store_true", help="Skip the aux_baseline and random_pool_baseline reference experiments (experiment_baseline and random_batch_baseline always run)")
     parser.add_argument("--config", type=str, default=None, help="Path to a YAML file with ExperimentConfig field overrides, used as the base config every experiment is built from (fields under ablation are still forced to their declared values)")
     parser.add_argument("--name", type=str, default=None, help="Sweep name; sets the shared wandb project curriculum-learning-<name> (default: --config's, or presentation_experiment)")
     parser.add_argument("--list", action="store_true", help="List experiments that would run, without running them")
