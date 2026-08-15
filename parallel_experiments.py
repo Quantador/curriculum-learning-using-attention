@@ -712,17 +712,45 @@ def main() -> None:
             f"distinct dataset signature(s)"
         )
 
-    # Timestamp must be agreed on by every rank (not just computed
-    # independently by each), or ranks would race to different
-    # results/_parallel_run/<timestamp>/ folders -- rank 0 picks it and
-    # broadcasts the string to the rest.
-    stamp = [datetime.now().strftime("%Y%m%d_%H%M%S")] if rank == 0 else [None]
-    if world_size > 1:
-        dist.broadcast_object_list(stamp, src=0)
-    scratch_dir = SCRATCH_DIR / stamp[0]
+    # Scratch dir name is <timestamp>_<label>, and rank 0 both picks it and
+    # creates it before telling anyone -- the two properties are related.
+    #
+    # The label exists because --submit launches N independent jobs: with a
+    # timestamp alone, any two starting in the same second picked the same
+    # results/_parallel_run/<timestamp>/ and whichever lost the mkdir race
+    # died on the exist_ok=False below. Since every submitted job runs a
+    # different experiment, the label makes that collision impossible.
+    # The numeric suffix then covers what the label cannot: the *same*
+    # experiment launched twice within one second (a resubmit, a retry).
+    #
+    # exist_ok=False is kept deliberately -- it is what makes the loop a real
+    # claim on the directory rather than a check-then-use race between two
+    # processes both finding it absent.
     if rank == 0:
-        scratch_dir.mkdir(parents=True, exist_ok=False)
-        print(f"\n=== Scratch dir for this run: {scratch_dir} ===")
+        label = safe_name(
+            configs[0].experiment_name if len(configs) == 1
+            else (args.name or "sweep")
+        )[:80]
+        base = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}"
+        candidate = SCRATCH_DIR / base
+        attempt = 1
+        while True:
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                attempt += 1
+                candidate = SCRATCH_DIR / f"{base}-{attempt}"
+        chosen = [candidate.name]
+        print(f"\n=== Scratch dir for this run: {candidate} ===")
+    else:
+        chosen = [None]
+    # Broadcast AFTER the mkdir, not before: the retry above can change the
+    # name, so sending the timestamp up front would leave the other ranks
+    # writing into a directory rank 0 ended up abandoning.
+    if world_size > 1:
+        dist.broadcast_object_list(chosen, src=0)
+    scratch_dir = SCRATCH_DIR / chosen[0]
     if world_size > 1:
         dist.barrier()  # other ranks wait for rank 0's mkdir before writing into it
 

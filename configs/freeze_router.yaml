@@ -1,6 +1,6 @@
 experiment_name: clariden_xl_freeze_router
 epochs: 10
-global_batch_size: 128
+global_batch_size: 16
 pool_mult: 10
 lr_lm: 0.0003
 use_wandb: true

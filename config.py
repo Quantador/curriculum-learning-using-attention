@@ -296,6 +296,19 @@ class ExperimentConfig(Config):
                     "different reward_signal."
                 )
 
+        if self.greats_diversity_term:
+            if self.reward_signal != "greats_score":
+                raise ValueError(
+                    "greats_diversity_term=True requires reward_signal='greats_score' -- it only "
+                    "modifies that reward's computation."
+                )
+            if not self.greats_log_grad_norms:
+                raise ValueError(
+                    "greats_diversity_term=True requires greats_log_grad_norms=True: the "
+                    "redundancy penalty needs per-sample train-gradient norms (sum_i ||g_i||^2), "
+                    "which the engine only computes when log_grad_norms is enabled."
+                )
+
         if self.router_freeze_progress is not None and not (0.0 <= self.router_freeze_progress <= 1.0):
             raise ValueError(
                 f"router_freeze_progress={self.router_freeze_progress} must be in "
@@ -498,6 +511,14 @@ class ExperimentConfig(Config):
     greats_score_metric: str = "dot"  # options: dot, cosine (cosine forces greats_log_grad_norms)
     greats_log_grad_norms: bool = False
     greats_score_exclude_params: list[str] = field(default_factory=list)
+    # Second-order (Hessian-approximated-as-identity) redundancy term, added on top of the
+    # first-order greats_score reward: penalizes gradient redundancy WITHIN the already-selected
+    # batch. Unlike GREATS's own greedy candidate selection (examples/greats/sft/gram_scorer.py),
+    # this doesn't need a candidate-candidate Gram matrix -- the router already fixed the batch, so
+    # the penalty sum_{i<j in S} <g_i,g_j> is evaluated directly via
+    # (||sum_i g_i||^2 - sum_i ||g_i||^2) / 2, both cheap for a fixed, already-known S. Requires
+    # greats_log_grad_norms=True (for sum_i ||g_i||^2) and reward_signal='greats_score'.
+    greats_diversity_term: bool = False
 
     # Weights for combined reward signal
     reward_weight_improvement: float = 1.0

@@ -18,15 +18,26 @@ Search is exponential ramp (1, 2, 4, ... until OOM or --max-batch) followed
 by binary search between the last success and first failure, so a batch
 ceiling of N costs ~2*log2(N) trials rather than N.
 
-SCOPE -- read this before trusting the number:
-this measures the LM's own training step ONLY. It does not model the router's
-feature pass over cfg.pool (= cfg.pool_mult * global_batch_size) candidates,
-which extract_hierarchical_hidden's docstring calls the dominant memory cost
-when enable_text_hierarchical=True. A real run of this repo at the batch size
-printed here will need substantially more. The summary prints the pool
-multiplier as a reminder; treat the result as an upper bound.
+Two scopes:
+
+  default        the LM's training step alone -- "what can this architecture
+                 hold". Ignores the router entirely, so the answer is an upper
+                 bound, not a setting to adopt.
+
+  --with-router  additionally pays, each step, what train_router_experiments pays
+                 before it trains: extract_router_features() over
+                 pool_mult * batch candidate rows, then a router
+                 forward/backward/step over the scores. Since the pool is
+                 pool_mult times the training batch and (with
+                 enable_text_hierarchical) runs the LM over every row of it,
+                 this term usually dominates -- expect a much smaller ceiling
+                 than the default scope reports.
+
+Neither scope models the reward signal's extra loss_after forward pass, the
+periodic evaluation, or the dataloader, so leave headroom either way.
 
     python utils/max_batch_probe.py --config configs/gpt2-ddp-multinode.yaml
+    python utils/max_batch_probe.py --config configs/gpt2-ddp-multinode.yaml --with-router
 
 Prints a parseable final line:
     MAX_BATCH=<int> PEAK_BYTES=<int>
@@ -47,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import load_config_from_yaml
 from data import get_tokenizer
 from models.model import build_model
+from models.router import build_router_for_cfg, extract_router_features
 from utils.general_utils import autocast_ctx, resolve_device
 
 GB = 1024 ** 3
@@ -78,16 +90,79 @@ def _release() -> None:
     torch.cuda.reset_peak_memory_stats()
 
 
-def try_batch(cfg, vocab_size: int, batch: int, steps: int) -> tuple[bool, int]:
-    """Run `steps` training steps at `batch`. Returns (fitted, peak_bytes)."""
-    model = opt = X = Y = logits = loss = None
+def _fake_external_embedding(cfg, rows: int):
+    """Stand-in for TokenizedCorpus.embeddings when a config expects one.
+
+    extract_router_features() raises unless external_embedding is supplied
+    whenever use_external_embeddings or sentence_embedder_model is set. The
+    real vectors come from a precomputed cache we have no reason to load here
+    -- only their width reaches the router -- so a correctly-shaped random
+    tensor measures the same memory.
+    """
+    if not (getattr(cfg, "use_external_embeddings", False)
+            or getattr(cfg, "sentence_embedder_model", "")):
+        return None
+    dim = 0
+    if getattr(cfg, "use_external_embeddings", False):
+        dim += getattr(cfg, "external_embedding_dim", 768)
+    if getattr(cfg, "sentence_embedder_model", ""):
+        dim += getattr(cfg, "sentence_embedder_dim", 768)
+    return torch.randn(rows, dim, device=cfg.device)
+
+
+def try_batch(cfg, vocab_size: int, pad_token_id: int, batch: int, steps: int,
+              with_router: bool) -> tuple[bool, int]:
+    """Run `steps` training steps at `batch`. Returns (fitted, peak_bytes).
+
+    With with_router, each step first pays what train_router_experiments pays
+    before it ever trains: a feature pass over the whole candidate pool
+    (cfg.pool_mult * batch rows, cfg.pool in a real run) and a router
+    forward/backward over the resulting scores. That pool pass is the dominant
+    memory term whenever enable_text_hierarchical is on -- it runs the LM over
+    pool_mult times more rows than the training batch -- so the LM-only ceiling
+    is a large overestimate for router configs.
+    """
+    model = opt = router = opt_router = None
+    X = Y = logits = loss = X_pool = feats = scores = None
     try:
         _release()
         model = build_model(vocab_size, cfg).to(cfg.device)
         opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm)
         loss_fn = nn.CrossEntropyLoss()
 
+        if with_router:
+            router = build_router_for_cfg(
+                cfg, sequence_size=model.block, vocab_size=vocab_size
+            )
+            if router is not None:
+                router = router.to(cfg.device)
+                # Router state is not free either: AdamW's moments over an
+                # EmbeddingRouter's tables are millions of params in their own
+                # right, and they allocate on the first step() like the LM's.
+                opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router)
+
+        pool_rows = batch * cfg.pool_mult
         for _ in range(steps):
+            if router is not None:
+                # Scoring the pool, exactly as the training loop does: the
+                # hierarchical branch runs under no_grad internally, but the
+                # router's own forward is grad-enabled so its update is real.
+                X_pool = torch.randint(0, vocab_size, (pool_rows, cfg.block),
+                                       device=cfg.device)
+                feats = extract_router_features(
+                    model=model, X=X_pool, cfg=cfg,
+                    pad_token_id=pad_token_id, vocab_size=vocab_size,
+                    external_embedding=_fake_external_embedding(cfg, pool_rows),
+                )
+                scores = router(feats)
+                opt_router.zero_grad()
+                # Stand-in for the policy-gradient objective. Its *value* is
+                # meaningless; what matters is that a backward pass over the
+                # router's graph really happens, since that is what holds the
+                # score-path activations alive.
+                scores.mean().backward()
+                opt_router.step()
+
             # Fresh ids per step so nothing is accidentally cached; contents
             # are irrelevant to memory, only shape and dtype are.
             X = torch.randint(0, vocab_size, (batch, cfg.block), device=cfg.device)
@@ -109,17 +184,18 @@ def try_batch(cfg, vocab_size: int, batch: int, steps: int) -> tuple[bool, int]:
         # Names must die before empty_cache() or their storages stay alive and
         # the release is a no-op. Locals are dropped explicitly rather than
         # left to scope exit because the except path above returns first.
-        del model, opt, X, Y, logits, loss
+        del model, opt, router, opt_router, X, Y, logits, loss, X_pool, feats, scores
         _release()
 
 
-def find_max_batch(cfg, vocab_size: int, lo: int, hi: int, steps: int) -> tuple[int, int]:
+def find_max_batch(cfg, vocab_size: int, pad_token_id: int, lo: int, hi: int,
+                   steps: int, with_router: bool) -> tuple[int, int]:
     """Exponential ramp to bracket the ceiling, then binary search it."""
     best, best_peak = 0, 0
     batch = lo
 
     while batch <= hi:
-        ok, peak = try_batch(cfg, vocab_size, batch, steps)
+        ok, peak = try_batch(cfg, vocab_size, pad_token_id, batch, steps, with_router)
         print(
             f"  batch={batch:<6} {'fits' if ok else 'OOM ':4}"
             + (f"  peak={peak / GB:6.2f} GiB" if ok else "")
@@ -141,7 +217,7 @@ def find_max_batch(cfg, vocab_size: int, lo: int, hi: int, steps: int) -> tuple[
     low, high = best, batch
     while high - low > 1:
         mid = (low + high) // 2
-        ok, peak = try_batch(cfg, vocab_size, mid, steps)
+        ok, peak = try_batch(cfg, vocab_size, pad_token_id, mid, steps, with_router)
         print(
             f"  batch={mid:<6} {'fits' if ok else 'OOM ':4}"
             + (f"  peak={peak / GB:6.2f} GiB" if ok else "")
@@ -162,6 +238,10 @@ def main() -> None:
                         help="Steps per trial; >=2 to include AdamW moments")
     parser.add_argument("--block", type=int, default=None,
                         help="Override cfg.block (sequence length)")
+    parser.add_argument("--with-router", action="store_true",
+                        help="Also pay the router's pool feature pass (pool_mult x batch "
+                             "rows through the LM) and a router update each step -- what "
+                             "train_router_experiments actually costs")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -183,9 +263,19 @@ def main() -> None:
           + (f" ({cfg.hf_model_name})" if cfg.model_type == "hf_pretrained" else ""))
     print(f"d_model={cfg.d_model} n_layers={cfg.n_layers} block={cfg.block} "
           f"vocab={tokenizer.vocab_size}")
+    if args.with_router:
+        print(f"scope       : LM step + router pool pass "
+              f"(pool_mult={cfg.pool_mult}, arch={cfg.router_architecture}, "
+              f"features={cfg.router_feature_source}, "
+              f"hierarchical={cfg.enable_text_hierarchical})")
+    else:
+        print("scope       : LM training step only (--with-router to include the pool pass)")
     print(f"searching {args.start}..{args.max_batch}, {args.steps} steps/trial\n")
 
-    best, peak = find_max_batch(cfg, tokenizer.vocab_size, args.start, args.max_batch, args.steps)
+    best, peak = find_max_batch(
+        cfg, tokenizer.vocab_size, tokenizer.pad_token_id or 0,
+        args.start, args.max_batch, args.steps, args.with_router,
+    )
 
     print()
     if best == 0:
@@ -198,11 +288,17 @@ def main() -> None:
           f"({100 * peak / total:.1f}%)")
     print(f"tokens per step     : {best * cfg.block:,}")
     print()
-    print(f"NOTE: LM training step only. A real run also forwards the router's "
-          f"pool of\n      pool_mult={cfg.pool_mult} x batch candidates "
-          f"({best * cfg.pool_mult} samples at this batch), which is not "
-          f"measured\n      here. Treat {best} as an upper bound, not a "
-          f"setting to adopt directly.")
+    if args.with_router:
+        print(f"Scope: LM step + router pool pass over {best * cfg.pool_mult} candidates.")
+        print(f"Still unmeasured: the reward signal's extra loss_after forward "
+              f"(every\n      router_update_every={cfg.router_update_every} steps), "
+              f"eval passes, and the dataloader. Leave headroom.")
+    else:
+        print(f"NOTE: LM training step only. A real run also forwards the router's "
+              f"pool of\n      pool_mult={cfg.pool_mult} x batch candidates "
+              f"({best * cfg.pool_mult} samples at this batch), which is not "
+              f"measured\n      here. Re-run with --with-router for the number "
+              f"you can actually use.")
     print(f"MAX_BATCH={best} PEAK_BYTES={peak}")
 
 

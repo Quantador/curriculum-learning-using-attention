@@ -522,7 +522,9 @@ def compute_reward(
         entropy_after: Per-sample entropy after update [B] (optional)
         gradient_reward: Scalar or per-sample gradient reward (optional)
         greats_reward: Scalar GREATS ghost-gradient-dot-product score, summed over
-            the selected batch (optional; see reward_signal='greats_score' in Config)
+            the selected batch (optional; see reward_signal='greats_score' in Config).
+            When cfg.greats_diversity_term is set, the caller has already folded the
+            second-order redundancy penalty into this value before passing it in.
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -1042,6 +1044,7 @@ def train_router_experiments(
             # scoring backward on X_sel/Y_sel against the fixed val batch, discarded
             # afterwards) ---
             greats_reward = None
+            greats_train_norms = None
             if ghost_engine is not None and cfg.reward_signal == "greats_score":
                 ghost_engine.begin_step()
                 ghost_engine.attach_train_batch(X_sel, Y_sel, global_step)
@@ -1057,6 +1060,11 @@ def train_router_experiments(
                 greats_reward = ghost_engine.read_scores(
                     metric=cfg.greats_score_metric
                 ).to(cfg.device).sum()
+                # Per-sample ||g_i|| for the diversity term below (config.__post_init__
+                # guarantees greats_log_grad_norms=True whenever greats_diversity_term is set).
+                greats_train_norms = (
+                    ghost_engine.read_train_grad_norms() if cfg.greats_diversity_term else None
+                )
                 ghost_engine.discard_scores()
 
             # --- LM forward and update ---
@@ -1122,6 +1130,34 @@ def train_router_experiments(
                     clip=cfg.gradient_reward_clip,
                 )
 
+            if greats_train_norms is not None:
+                # Second-order (Hessian ~= identity) redundancy penalty for the ALREADY-selected
+                # batch X_sel: for a fixed set S, sum_{i<j in S} <g_i,g_j> collapses to
+                # (||sum_i g_i||^2 - sum_i ||g_i||^2) / 2 -- no candidate-candidate Gram matrix and
+                # no greedy loop needed (those are only required to *choose* S; the router already
+                # did that). Read in the same post-backward, pre-zero_grad window as gradient_reward
+                # above, since ||sum_i g_i||^2 comes straight from the real update's own .grad.
+                #
+                # Both terms must land in the SAME per-sample scale as greats_reward (a sum of
+                # <g_i, g_val> dot products from the separate ghost pass over [X_sel ++ val]) to be
+                # combined with it. The ghost pass's loss is mean-reduced over the combined
+                # train+val batch, so every factor it produces implicitly carries a 1/total_bs
+                # scale: greats_train_norms holds ||g_i,ghost|| where g_i,ghost = g_i / total_bs.
+                # sum_i g_i,ghost = (train_bs / total_bs) * mean_i(g_i), and that mean IS the
+                # gradient loss_lm.backward() just populated in .grad (mean-reduced over X_sel
+                # alone, no val) -- so no extra forward/backward pass is needed for this term.
+                with torch.no_grad():
+                    train_bs = X_sel.shape[0]
+                    total_bs = train_bs + ghost_engine.val_batch_size
+                    agg_grad_norm_sq = sum(
+                        p.grad.float().pow(2).sum()
+                        for p in grad_params if p.grad is not None
+                    )
+                    agg_grad_norm_sq_native = (train_bs / total_bs) ** 2 * agg_grad_norm_sq
+                    sum_sq_norms_native = greats_train_norms.to(cfg.device).float().pow(2).sum()
+                    redundancy = (agg_grad_norm_sq_native - sum_sq_norms_native) / 2.0
+                    greats_reward = cfg.lr_lm * greats_reward - (cfg.lr_lm ** 2) * redundancy
+
             if local_grad_reward:
                 # no_sync() above skipped DDP's automatic averaging, so
                 # manually replicate it now (sum then divide by world_size)
@@ -1135,14 +1171,7 @@ def train_router_experiments(
 
             opt_lm.step()
 
-            # loss and entropy AFTER update: skip this extra full forward
-            # pass when reward_signal='greats_score', since compute_reward()'s
-            # greats_score branch below ignores loss_before/loss_after
-            # entirely (its reward comes from the ghost gradient-dot-product
-            # score instead) and entropy_after is already unused in that mode
-            # (only computed for 'uncertainty_reduction'/'combined', which
-            # greats_score can't simultaneously be). Also skip it on steps
-            # that won't perform a router update anyway (router_update_due is
+            # Skip it on steps that won't perform a router update (router_update_due is
             # False -- see config.py's router_update_every docstring); note
             # router_frozen deliberately does NOT skip this, so reward stays
             # logged every step even once the router has stopped learning.
