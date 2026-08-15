@@ -1,6 +1,6 @@
 experiment_name: fineweb_30b
-epochs: 2
-global_batch_size: 512
+epochs: 1
+global_batch_size: 640
 pool_mult: 10
 max_chunks: 130000000
 max_tokens: 30000000000

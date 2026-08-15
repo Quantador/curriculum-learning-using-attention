@@ -232,9 +232,16 @@ class HFCausalLM(nn.Module):
         unlike TinyGPT.forward_to_layer which actually skips later layers.
         hidden_states[0] is the embedding output, hidden_states[-1] matches
         forward_to_hidden's output.
+
+        self.hf.base_model, not self.hf, for the same reason as
+        forward_to_hidden: self.hf is the full LM-head model, so
+        output_hidden_states=True on it would additionally compute and hold
+        a [B, L, vocab_size] logits tensor that's never read -- for
+        GPT2-XL's 50257-wide vocab against d_model=1600, ~31x the size of
+        the hidden state actually wanted, over the whole pool.
         """
         position_ids = self._expanded_position_ids(x)
-        hidden_states = self.hf(
+        hidden_states = self.hf.base_model(
             input_ids=x, position_ids=position_ids, output_hidden_states=True
         ).hidden_states
         return hidden_states[num_layers]
