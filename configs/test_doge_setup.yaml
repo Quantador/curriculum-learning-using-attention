@@ -1,0 +1,11 @@
+experiment_name: test_doge_setup
+epochs: 10
+global_batch_size: 16
+lr_lm: 0.0003
+max_chunks: -1 # No limit on chunks
+use_wandb: true
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+split_dataset: true 
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

@@ -23,6 +23,9 @@ dependencies = [
     "evaluate>=0.4",
     "huggingface_hub>=0.24",
     "pyyaml>=6.0",
+    # cfg.sentence_embedder_model router-feature option (utils/sentence_embedder.py)
+    "sentence-transformers>=3.0",
+    "datatrove>=0.9.0",
 ]
 
 [project.optional-dependencies]

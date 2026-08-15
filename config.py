@@ -3,7 +3,7 @@
 Central configuration for all curriculum learning experiments.
 
 Two dataclasses:
-  - Config: base training hyperparameters (model size, batch, lr, etc.)
+  - Config: base training hyperparameters (model size, global_batch_size, lr, etc.)
   - ExperimentConfig: extends Config with all experiment-specific knobs —
     router architecture, training algorithm (REINFORCE/GRPO/PPO), reward
     signal, entropy formulation, dataset choices, coverage regularization,
@@ -16,7 +16,6 @@ Typical usage:
 """
 from dataclasses import dataclass, field, fields, replace
 import os
-import torch
 import yaml
 from transformers import AutoConfig
 
@@ -24,9 +23,7 @@ from transformers import AutoConfig
 class Config:
     # Data
     block: int = 256
-    easy_samples: int = 100_000
-    hard_samples: int = 20_000
-    max_chunks: int = 500_000
+    max_chunks: int = 500_000 # Can be overriden by -1 
 
     # Model
     d_model: int = 512
@@ -55,9 +52,14 @@ class Config:
     hf_model_name: str = "Qwen/Qwen3-1.7B"
 
     # Training
-    batch: int = 16
+    global_batch_size: int = 16
     pool_mult: int = 5
     epochs: int = 10
+    # Stop training once total_tokens_seen reaches this many tokens, cutting
+    # a run short mid-epoch if needed (logging still fires normally for the
+    # terminating step/epoch). None = unlimited, bounded only by cfg.epochs
+    # as before.
+    max_tokens: int | None = None
     lr_lm: float = 3e-4
     lr_router: float = 1e-3
     temp: float = 1.0
@@ -66,19 +68,45 @@ class Config:
 
     # System
     seed: int = 0
-    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+    device: str = ""
+    # Background worker processes for the training/eval DataLoaders (data.py's
+    # make_pool_loader/make_baseline_loader, and evaluate()/evaluate_per_domain()
+    # in training.py). 0 = load in the main process (safe default -- sweeps in
+    # parallel_experiments.py run several experiment subprocesses concurrently
+    # on one GPU without budgeting CPU workers, so raising this multiplies
+    # across however many are running at once). Raise it for standalone runs
+    # to overlap next-batch loading with GPU compute.
+    dataloader_num_workers: int = 0
 
-    # Distributed (DDP). Defaults are the single-process case; train_ddp.py
+    # Distributed. Defaults are the single-process case; train_ddp.py
     # overrides these after torch.distributed.init_process_group().
     rank: int = 0
     world_size: int = 1
     local_rank: int = 0
 
+    # How to parallelize the LM across those ranks. Ignored at world_size 1.
+    #   'DDP'  — replicate the whole model on every rank. Simplest and
+    #            fastest whenever a replica fits.
+    #   'FSDP' — FSDP2 (fully_shard): shard parameters, gradients and
+    #            optimizer state across ranks. The option for models whose
+    #            DDP replica does NOT fit — GPT2-XL is ~1.5B params, so an
+    #            fp32 replica plus AdamW's two moments is ~24 GB per rank
+    #            before activations.
+    # See utils/distributed_utils.wrap_model().
+    distributed: str = "DDP"
+
+    # Parameter dtype for FSDP2's MixedPrecisionPolicy ('bf16' | 'fp16' |
+    # 'none'); gradient reduction stays fp32 regardless. Ignored unless
+    # distributed == 'FSDP'.
+    # NOTE this changes numerics: FSDP runs at the 'bf16' default are not
+    # directly comparable with existing fp32 DDP ablation results. Set
+    # 'none' when a comparison has to be like-for-like.
+    fsdp_mixed_precision: str = "bf16"
+
     # Logging
     use_wandb: bool = True
     wandb_project: str = "curriculum-learning-final"
     wandb_entity: str | None = None
-    save_dir: str = "results"
     log_every: int = 100
 
     # Set automatically by load_config_from_yaml() to the source YAML path;
@@ -103,6 +131,18 @@ class Config:
             self.n_heads = hf_cfg.num_attention_heads
             self.d_ff = getattr(hf_cfg, "intermediate_size", self.d_ff)
 
+        if self.distributed not in ("DDP", "FSDP"):
+            raise ValueError(
+                f"distributed={self.distributed!r} is not supported (expected "
+                f"'DDP' or 'FSDP')."
+            )
+
+        if self.fsdp_mixed_precision not in ("bf16", "fp16", "none"):
+            raise ValueError(
+                f"fsdp_mixed_precision={self.fsdp_mixed_precision!r} is not "
+                f"supported (expected 'bf16', 'fp16' or 'none')."
+            )
+
         if self.hierarchical_representation == "layer":
             if self.hierarchical_layer_index is None:
                 raise ValueError(
@@ -116,12 +156,54 @@ class Config:
                     f"{self.n_layers})."
                 )
 
+        if self.use_curriculum_ratio_schedule:
+            if not (0.0 < self.curriculum_ratio_min <= self.curriculum_ratio_initial <= 1.0):
+                raise ValueError(
+                    "use_curriculum_ratio_schedule requires "
+                    "0 < curriculum_ratio_min <= curriculum_ratio_initial <= 1 "
+                    f"(got min={self.curriculum_ratio_min}, "
+                    f"initial={self.curriculum_ratio_initial})."
+                )
+
     @property
     def pool(self) -> int:
-        return self.pool_mult * self.batch
-    
-    
-    
+        return self.pool_mult * self.global_batch_size
+
+    @property
+    def per_rank_batch_size(self) -> int:
+        """global_batch_size split evenly across ranks -- the number of
+        samples each GPU actually draws/selects per step under DDP.
+        world_size=1 (the default) leaves this equal to global_batch_size.
+        Any remainder (global_batch_size not a multiple of world_size) is
+        dropped, same truncate-to-fit approach PooledBatchSampler already
+        uses for pool sharding."""
+        per_rank = self.global_batch_size // self.world_size
+        if per_rank < 1:
+            raise ValueError(
+                f"global_batch_size={self.global_batch_size} is smaller than "
+                f"world_size={self.world_size}: each rank would get 0 samples per step."
+            )
+        return per_rank
+
+    @property
+    def per_rank_pool_size(self) -> int:
+        """cfg.pool (pool_mult * global_batch_size) split evenly across
+        ranks -- the number of candidate samples each GPU actually pulls per
+        step for pool-based feature extraction (train_router_experiments/
+        train_aux_baseline's make_pool_loader) and pool-windowed baseline
+        training (train_baseline's make_baseline_loader/PooledBatchSampler).
+        Dividing both pool and batch by the same world_size preserves the
+        pool_mult ratio (per_rank_pool_size / per_rank_batch_size ==
+        pool_mult) at any GPU count, exactly like per_rank_batch_size.
+        world_size=1 (the default) leaves this equal to cfg.pool."""
+        per_rank = self.pool // self.world_size
+        if per_rank < 1:
+            raise ValueError(
+                f"pool={self.pool} is smaller than world_size={self.world_size}: "
+                f"each rank would get 0 candidates per step."
+            )
+        return per_rank
+
     
 @dataclass
 
@@ -145,19 +227,47 @@ class ExperimentConfig(Config):
     """
     experiment_name: str = "presentation_experiment"
 
-    # None = derive from experiment_name in __post_init__ below. Fields are
-    # computed once at class-definition time from the *default* experiment_name,
-    # so a plain string default here would silently ignore any override of
+    # None = derive from experiment_name in __post_init__ below. Computed
+    # once at class-definition time from the *default* experiment_name, so a
+    # plain string default here would silently ignore any override of
     # experiment_name (constructor kwarg, dataclasses.replace(), or YAML).
     wandb_project: str | None = None
-    save_dir: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
         if self.wandb_project is None:
-            self.wandb_project = f"curriculum-learning-{self.experiment_name}"
-        if self.save_dir is None:
-            self.save_dir = f"results/{self.experiment_name}"
+            self.wandb_project = f"{self.experiment_name}"
+
+        if self.reward_signal in ("difficulty_weighted", "combined") and len(self.dataset_list) != 2:
+            raise ValueError("In order to use difficulty scoring, you need to use 2 datasets, the first one "
+                             "being the easy one and the second one the hard one.")
+
+        if self.distributed == "FSDP":
+            # Both of these read raw per-rank .grad tensors off the LM, which
+            # FSDP2 does not leave lying around: gradients are reduce-scattered
+            # into DTensor shards during backward, so no rank ever holds this
+            # rank's own complete gradient. Rejected outright rather than
+            # silently scored against the wrong tensor -- under DDP these
+            # signals deliberately use no_sync() to keep .grad local (see
+            # rl_training.train_router_experiments), and there is no FSDP2
+            # equivalent that preserves that meaning.
+            if self.reward_signal in ("gradient_norm", "gradient_alignment"):
+                raise ValueError(
+                    f"reward_signal={self.reward_signal!r} is not supported with "
+                    "distributed='FSDP': it needs this rank's own unreduced "
+                    "gradients, but FSDP2 reduce-scatters them into shards during "
+                    "backward. Use distributed='DDP', or a reward_signal that "
+                    "doesn't read .grad (e.g. 'loss_improvement')."
+                )
+            if self.reward_signal == "greats_score":
+                raise ValueError(
+                    "reward_signal='greats_score' is not supported with "
+                    "distributed='FSDP': GhostSuite's per-sample-gradient hooks "
+                    "walk named_modules() and assume ordinary local parameter "
+                    "tensors, but FSDP2 replaces them with sharded DTensors. Use "
+                    "distributed='DDP'."
+                )
+
 
         if self.reward_signal == "greats_score":
             # GREATS-style ghost gradient-dot-product scoring (GhostSuite/ghostEngines,
@@ -186,10 +296,83 @@ class ExperimentConfig(Config):
                     "different reward_signal."
                 )
 
+        if self.greats_diversity_term:
+            if self.reward_signal != "greats_score":
+                raise ValueError(
+                    "greats_diversity_term=True requires reward_signal='greats_score' -- it only "
+                    "modifies that reward's computation."
+                )
+            if not self.greats_log_grad_norms:
+                raise ValueError(
+                    "greats_diversity_term=True requires greats_log_grad_norms=True: the "
+                    "redundancy penalty needs per-sample train-gradient norms (sum_i ||g_i||^2), "
+                    "which the engine only computes when log_grad_norms is enabled."
+                )
 
-    # Data mixing
-    easy_proportion: float = 0.7  # Proportion of easy samples in mixed chunks
-    hard_proportion: float = 0.3  # Proportion of hard samples in mixed chunks
+        if self.router_freeze_progress is not None and not (0.0 <= self.router_freeze_progress <= 1.0):
+            raise ValueError(
+                f"router_freeze_progress={self.router_freeze_progress} must be in "
+                "[0, 1] (a fraction of total training progress), or None to disable."
+            )
+
+        if self.router_update_every < 1:
+            raise ValueError(
+                f"router_update_every={self.router_update_every} must be >= 1 "
+                "(1 = update every step)."
+            )
+
+        if self.use_original_sequence and self.feature_cache_epochs > 0:
+            # build_feature_cache() (rl_training.py) always caches
+            # extract_hierarchical_hidden() output, so the cached-features
+            # branch in the training loop would silently ignore
+            # use_original_sequence and feed the router hierarchical hidden
+            # states instead of the raw token sequence.
+            raise ValueError(
+                "use_original_sequence=True is incompatible with "
+                f"feature_cache_epochs={self.feature_cache_epochs} (>0): the "
+                "feature cache only ever stores hierarchical hidden states, "
+                "so caching would silently override use_original_sequence. "
+                "Set feature_cache_epochs=0 or use_original_sequence=False."
+            )
+
+        if self.router_feature_source not in ("features", "own_embeddings"):
+            raise ValueError(
+                f"router_feature_source={self.router_feature_source!r} must be "
+                "'features' or 'own_embeddings'."
+            )
+
+        if self.router_feature_source == "own_embeddings":
+            if self.feature_cache_epochs > 0:
+                # Same trap as use_original_sequence above, plus a worse one:
+                # the router's tables are *trained*, so their output changes
+                # every step and could never be cached even in principle.
+                raise ValueError(
+                    "router_feature_source='own_embeddings' is incompatible "
+                    f"with feature_cache_epochs={self.feature_cache_epochs} "
+                    "(>0): the router's embeddings are learned, so their "
+                    "output changes every step and cannot be cached. "
+                    "Set feature_cache_epochs=0."
+                )
+            if self.use_original_sequence:
+                raise ValueError(
+                    "router_feature_source='own_embeddings' and "
+                    "use_original_sequence=True both claim the router's input: "
+                    "the former embeds the token ids, the latter feeds them as "
+                    "raw floats. Set use_original_sequence=False."
+                )
+            if self.block % self.n_chunks != 0:
+                raise ValueError(
+                    f"router_feature_source='own_embeddings' needs block="
+                    f"{self.block} divisible by n_chunks={self.n_chunks} "
+                    "(the router chunk-pools its embeddings the same way "
+                    "extract_hierarchical_hidden does)."
+                )
+            if self.router_architecture == "random":
+                raise ValueError(
+                    "router_feature_source='own_embeddings' has no meaning "
+                    "with router_architecture='random' (no router is built, so "
+                    "there are no embeddings to learn). Set one or the other."
+                )
 
     # Dataset options by difficulty (see DATASET_REGISTRY in data.py):
     # Easy:         roneneldan/TinyStories
@@ -200,24 +383,59 @@ class ExperimentConfig(Config):
     #               allenai/c4
     # Hard:         armanc/scientific_papers
     #               CShorten/ML-ArXiv-Papers
-    # Unstructured: HuggingFaceFW/fineweb  (use with use_single_dataset=True)
-    easy_dataset: str = "roneneldan/TinyStories"
-    hard_dataset: str = "Geralt-Targaryen/openwebtext2"
+    # Unstructured: HuggingFaceFW/fineweb  (use with use_single_dataset=True) 
 
-    # Single-dataset mode (no easy/hard split).
-    # When True, trains on one dataset only; easy/hard fields above are ignored.
-    use_single_dataset: bool = True
-    single_dataset: str = "HuggingFaceFW/fineweb"
-    single_dataset_samples: int = 120_000
-    single_dataset_val_split: float = 0.05
+    split_dataset: bool = False # Needs to be true when used with SlimPajama. Also overrides dataset proportions.
+    split_column: str = "" # Make sure a split column is specified to create different datasets
+    dataset_list: list[str] = field(default_factory=list)  # All datasets used
+    dataset_proportions: list[str] = field(default_factory=list) # The proportion for datasets in order
+
+    # --- tokenization (build time; see tokenization.py / build_dataset_cache.py) ---
+    # These are the ONLY dataset fields baked into the on-disk cache key
+    # (utils.shared_dataset.dataset_signature), together with dataset_list /
+    # split_dataset / split_column. Changing them means re-tokenizing.
+    #
+    # Tokenizer the cache is written with. Must match the student LM's
+    # vocabulary: keep "gpt2" for tiny_gpt / GPT-2 checkpoints, set it to
+    # hf_model_name when training a model with a different vocabulary.
+    tokenizer_name: str = "gpt2"
+    # Source rows to read per split during tokenization (-1 = the whole split).
+    # This is the cap that used to be conflated with max_chunks: max_chunks now
+    # only limits how many (block+1)-token windows training uses, and is applied
+    # at read time, so it can be changed without rebuilding the cache.
+    max_documents: int = -1
+    # Rows streamed when auto-discovering domains for split_dataset mode.
+    domain_discovery_rows: int = 100_000
+
+    single_dataset_val_split: float = 0.05 # Confused what this is 
 
     # External pre-computed embeddings (e.g. epfml/FineWeb-HQ).
     # The HuggingFace dataset must have a 'text' and an 'embeddings' column.
-    # Only used when use_single_dataset=True.
+    # Only used when len(dataset_list)=1.
     use_external_embeddings: bool = False
     external_embeddings_dataset: str = "epfml/FineWeb-HQ"
     external_embedding_dim: int = 768
-    
+
+    # Sentence-embedder router features: a frozen sentence-transformers model
+    # encodes each training window's decoded text once, up front (see
+    # utils.sentence_embedder.build_sentence_embeddings), and the result is
+    # concatenated onto the router's other features every step via
+    # TokenizedCorpus.embeddings -- same plug point train_router_experiments /
+    # train_aux_baseline (rl_training.py) already use for use_external_embeddings
+    # above, which this option is independent of.
+    # Empty model name = disabled.
+    sentence_embedder_model: str = ""
+    sentence_embedder_dim: int = 768
+    # These are small (100-400M param) encoders relative to a modern GPU, so
+    # this can go much higher than a training batch size would; 512 is a safe
+    # default and can be raised further on GPUs with more headroom.
+    sentence_embedder_batch_size: int = 512
+    # Optional .pt path to persist/reload the embedding cache. Safe to reuse
+    # across runs and even rebuild indefinitely: the encoder is frozen, so a
+    # window's embedding never changes, unlike the periodically-rebuilt
+    # hierarchical feature cache (rl_training.build_feature_cache).
+    sentence_embedder_cache_path: str = ""
+
     # Router architecture
     router_architecture: str = "attention"  # options: attention, linear, mlp
     router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter
@@ -225,9 +443,52 @@ class ExperimentConfig(Config):
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
+    use_original_sequence: bool = False # This uses the original tokens sequence, not passed through the model.
+
+    # Where the router's input representation comes from.
+    #   'features'       — the concatenated feature groups above, built by
+    #                      extract_router_features() (default, current behavior)
+    #   'own_embeddings' — the router owns token + positional embedding tables
+    #                      and learns them from the policy-gradient signal,
+    #                      reading the raw token sequence directly (models/
+    #                      router.py EmbeddingRouter). The LM is never touched.
+    #
+    # Distinct from hierarchical_representation='embedder', which chunk-pools
+    # the *LM's* embedding tables under torch.no_grad() -- frozen, and shaped
+    # by the LM's own objective. Both pool identically (cfg.n_chunks segments,
+    # mean-pooled, concatenated), so the pair is a controlled comparison of
+    # learned-by-the-router vs. borrowed-from-the-LM embeddings.
+    router_feature_source: str = "features"  # options: features, own_embeddings
+    # Width of the router's own embedding tables. Only read when
+    # router_feature_source='own_embeddings'. The router head then sees
+    # n_chunks * router_embed_dim inputs.
+    router_embed_dim: int = 256
+
 
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo
+
+    # Router freeze: once training progress (global_step / total_steps)
+    # reaches this fraction, stop updating the router (no more REINFORCE/
+    # GRPO/PPO policy-gradient steps) but keep using its current, now-frozen
+    # weights to score/select samples for the rest of training -- an
+    # ablation for whether continued router training helps past some point,
+    # vs. an early-converged router already being "good enough". The LM
+    # itself keeps training normally throughout; only the router's own
+    # parameter updates stop. None = never freeze (current behavior).
+    router_freeze_progress: float | None = None
+
+    # Router update cadence: only compute the reward signal's extra
+    # loss_after forward pass and perform the router's policy-gradient
+    # update (REINFORCE/GRPO/PPO) once every router_update_every LM training
+    # steps. On the other steps the router still scores/selects the pool
+    # with its current weights each step (selection logic unchanged) --
+    # this only throttles how often it *learns* from a reward, trading
+    # update frequency for the compute of that extra forward pass. Composes
+    # with router_freeze_progress above: once frozen, the router never
+    # updates regardless of this value. 1 = every step (current behavior,
+    # default).
+    router_update_every: int = 1
 
     # Reward signal options:
     #   - loss_improvement: (loss_before - loss_after).clamp(0) - reward progress
@@ -250,6 +511,14 @@ class ExperimentConfig(Config):
     greats_score_metric: str = "dot"  # options: dot, cosine (cosine forces greats_log_grad_norms)
     greats_log_grad_norms: bool = False
     greats_score_exclude_params: list[str] = field(default_factory=list)
+    # Second-order (Hessian-approximated-as-identity) redundancy term, added on top of the
+    # first-order greats_score reward: penalizes gradient redundancy WITHIN the already-selected
+    # batch. Unlike GREATS's own greedy candidate selection (examples/greats/sft/gram_scorer.py),
+    # this doesn't need a candidate-candidate Gram matrix -- the router already fixed the batch, so
+    # the penalty sum_{i<j in S} <g_i,g_j> is evaluated directly via
+    # (||sum_i g_i||^2 - sum_i ||g_i||^2) / 2, both cheap for a fixed, already-known S. Requires
+    # greats_log_grad_norms=True (for sum_i ||g_i||^2) and reward_signal='greats_score'.
+    greats_diversity_term: bool = False
 
     # Weights for combined reward signal
     reward_weight_improvement: float = 1.0
@@ -263,6 +532,19 @@ class ExperimentConfig(Config):
     # Selection strategy
     selection_strategy: str = "topk"  # options: topk, sample, epsilon_greedy
     epsilon_greedy: float = 0.1  # epsilon for epsilon_greedy selection
+
+    # Curriculum-ratio schedule: instead of a fixed cfg.per_rank_batch_size,
+    # the number of samples selected into the training batch each step is
+    # round(ratio * pool_size), with `ratio` annealed from
+    # curriculum_ratio_initial down to curriculum_ratio_min over training
+    # progress. Starts weakly selective (rate/accept most of the pool) and
+    # tightens into a strongly selective curriculum (only the router's
+    # top few percent) by the end of training. cfg.global_batch_size is
+    # unused while this is on -- see train_router_experiments() in rl_training.py.
+    use_curriculum_ratio_schedule: bool = False
+    curriculum_ratio_schedule: str = "linear_decay"  # same vocabulary as temp_schedule
+    curriculum_ratio_initial: float = 0.9  # fraction of pool selected at progress=0
+    curriculum_ratio_min: float = 0.1  # fraction of pool selected at progress=1
 
     # Baseline for variance reduction (REINFORCE)
     baseline_type: str = "batch_mean"  # options: batch_mean, moving_avg, none
@@ -322,6 +604,23 @@ class ExperimentConfig(Config):
     run_aux_baseline: bool = False
     aux_net_hidden: int = 256
 
+    # Non-learned control baselines (training.train_baseline: uniform random
+    # selection, no router/aux_net at all). run_random_batch_baseline draws
+    # cfg.global_batch_size random samples per step (same shape as the
+    # router's selected batch, split across ranks like any other run);
+    # run_random_pool_baseline draws cfg.pool (the router's full candidate
+    # pool, unfiltered, also split across ranks) -- see utils/experiment_worker.py.
+    run_random_batch_baseline: bool = False
+    run_random_pool_baseline: bool = False
+
+    # Checkpoint the trained LM (and router/aux_net, when one was trained) at
+    # the end of run_single_experiment() to <scratch_dir>/checkpoints/<name>.pt.
+    # Off by default: a sweep runs many experiments, and hf_pretrained models
+    # like GPT2-XL are multi-GB each -- opt in per run (parallel_experiments.py
+    # --save-model, or this field directly in a YAML) rather than paying that
+    # disk cost for every experiment in every sweep.
+    save_model_at_end: bool = False
+
 
 def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> ExperimentConfig:
     """
@@ -345,16 +644,21 @@ def load_config_from_yaml(path: str, cfg: ExperimentConfig | None = None) -> Exp
     with open(path) as f:
         overrides = yaml.safe_load(f) or {}
 
-    # save_dir/wandb_project are lazily derived from experiment_name in
-    # __post_init__, but only when still None; by this point cfg already has
-    # them resolved to concrete strings (from the ExperimentConfig() default
-    # above, or from the caller-supplied cfg). If the YAML overrides
-    # experiment_name without also overriding these, force them back to None
-    # so __post_init__ re-derives from the new name instead of keeping the
+    # experiment_name defaults to the YAML file's own name (without
+    # extension) so a run's name/wandb_project track the config file used to
+    # launch it. An explicit experiment_name: key in the YAML still takes
+    # precedence over this default.
+    if "experiment_name" not in overrides:
+        overrides["experiment_name"] = os.path.splitext(os.path.basename(path))[0]
+
+    # wandb_project is lazily derived from experiment_name in __post_init__,
+    # but only when still None; by this point cfg already has it resolved to
+    # a concrete string (from the ExperimentConfig() default above, or from
+    # the caller-supplied cfg). Since experiment_name is now always being set
+    # (explicitly or via the filename default above), force it back to None
+    # so __post_init__ re-derives it from the new name instead of keeping the
     # stale resolved value from the old one.
-    if "experiment_name" in overrides:
-        overrides.setdefault("save_dir", None)
-        overrides.setdefault("wandb_project", None)
+    overrides.setdefault("wandb_project", None)
 
     valid_fields = {f.name for f in fields(cfg)}
     unknown = set(overrides) - valid_fields

@@ -1,0 +1,3 @@
+[submodule "GhostSuite"]
+	path = GhostSuite
+	url = https://github.com/Jiachen-T-Wang/GhostSuite.git

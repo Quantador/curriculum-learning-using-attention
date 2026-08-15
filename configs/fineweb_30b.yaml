@@ -1,0 +1,13 @@
+experiment_name: fineweb_30b
+epochs: 1
+global_batch_size: 640
+pool_mult: 10
+max_chunks: 130000000
+max_tokens: 30000000000
+block: 256
+lr_lm: 0.0003
+use_wandb: true
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+dataset_list: ["HuggingFaceFW/fineweb-100BT"]
+dataset_proportions: [1]

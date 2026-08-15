@@ -1,0 +1,13 @@
+experiment_name: transformer_layer_ablation
+epochs: 10
+global_batch_size: 16
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 200000
+model_type: hf_pretrained
+hierarchical_representation: layer
+hierarchical_layer_index: 0
+hf_model_name: openai-community/gpt2
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7 , 0.3]

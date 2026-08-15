@@ -1,0 +1,19 @@
+experiment_name: fsdp_xl_only_sentence
+epochs: 10
+global_batch_size: 128
+pool_mult: 10
+log_every: 1
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 500000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+use_original_sequence: false
+sentence_embedder_dim: 768
+distributed: FSDP 
+fsdp_mixed_precision: bf16
+enable_text_hierarchical: false
+enable_text_stat: false
+sentence_embedder_model: "intfloat/e5-base-v2"
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7 , 0.3]

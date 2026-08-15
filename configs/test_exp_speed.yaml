@@ -1,0 +1,11 @@
+experiment_name: test_exp_speed
+epochs: 10
+global_batch_size: 16
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 200000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2
+dataset_list: ["HuggingFaceFW/fineweb"]
+dataset_proportions: [1]

@@ -1,8 +1,8 @@
 """
 Advanced RL-based training loops for curriculum learning experiments.
 
-This is the experiment-grade router training loop used by experiments.py
-(ablation studies) and compare.py (single runs with all variants enabled).
+This is the experiment-grade router training loop used by parallel_experiments.py
+/ utils/experiment_worker.py (ablation studies, one subprocess per config).
 
 Key features over the reference loop in training.py:
   - Three policy gradient algorithms: REINFORCE, GRPO, PPO
@@ -30,6 +30,7 @@ Entry points:
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import random
@@ -41,16 +42,19 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 from config import ExperimentConfig
-from data import make_index_loader, MixedLMDataset
+from data import make_pool_loader, TokenizedCorpus
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from utils.metrics import MetricsTracker, DiversityTracker
-from training import evaluate  # keep using your existing evaluate()
+from training import evaluate, evaluate_per_domain  # keep using your existing evaluate()
 from models.router import extract_router_features
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
-
+from utils.rl_utils import grpo_update, ppo_update, reinforce_update
+from utils.general_utils import autocast_ctx
+from utils.distributed_utils import eval_handles, wrap_model, wrap_replica
 
 @torch.no_grad()
 def compute_loss_per_sample_vectorized(
@@ -81,7 +85,7 @@ def get_scheduled_value(
     schedule: str,
     initial: float,
     minimum: float,
-    progress: float,  # 0.0 to 1.0
+    progress: float,  # 0.0 to 1.0 , usually calculated from how many steps have passed.
     step: int = 0,
     cycle_length: int = 1000,
 ) -> float:
@@ -128,134 +132,6 @@ def get_scheduled_value(
 
     else:
         return initial
-
-
-# =============================================================================
-# Entropy formulations
-# =============================================================================
-
-def compute_shannon_entropy(probs: torch.Tensor) -> torch.Tensor:
-    """
-    Standard Shannon entropy: H = -sum(p * log(p))
-
-    Args:
-        probs: Probability distribution [M]
-
-    Returns:
-        Scalar entropy value
-    """
-    return (probs * probs.clamp_min(1e-12).log()).sum()
-
-
-def compute_renyi_entropy(probs: torch.Tensor, alpha: float = 2.0) -> torch.Tensor:
-    """
-    Rényi entropy: H_α = (1/(1-α)) * log(sum(p^α))
-
-    Special cases:
-    - α → 1: Shannon entropy
-    - α = 0: Max entropy (log of support size)
-    - α = 2: Collision entropy (related to collision probability)
-    - α → ∞: Min-entropy
-
-    Args:
-        probs: Probability distribution [M]
-        alpha: Rényi parameter (> 0, != 1)
-
-    Returns:
-        Scalar Rényi entropy value (negated for use as loss)
-    """
-    if abs(alpha - 1.0) < 1e-6:
-        # Limit case: Shannon entropy
-        return compute_shannon_entropy(probs)
-
-    # Rényi entropy: (1/(1-α)) * log(sum(p^α))
-    p_alpha = probs.clamp_min(1e-12).pow(alpha)
-    renyi = (1.0 / (1.0 - alpha)) * p_alpha.sum().clamp_min(1e-12).log()
-
-    # Return negative for consistency (minimizing = maximizing entropy)
-    return -renyi
-
-
-def compute_tsallis_entropy(probs: torch.Tensor, q: float = 2.0) -> torch.Tensor:
-    """
-    Tsallis entropy: S_q = (1/(q-1)) * (1 - sum(p^q))
-
-    Non-extensive entropy that generalizes Boltzmann-Gibbs.
-    - q → 1: Shannon entropy
-    - q < 1: Favors rare events
-    - q > 1: Favors common events
-
-    Args:
-        probs: Probability distribution [M]
-        q: Tsallis parameter (> 0)
-
-    Returns:
-        Scalar Tsallis entropy value (negated for use as loss)
-    """
-    if abs(q - 1.0) < 1e-6:
-        # Limit case: Shannon entropy
-        return compute_shannon_entropy(probs)
-
-    p_q = probs.clamp_min(1e-12).pow(q)
-    tsallis = (1.0 / (q - 1.0)) * (1.0 - p_q.sum())
-
-    # Return negative for consistency
-    return -tsallis
-
-
-def compute_kl_from_uniform(probs: torch.Tensor) -> torch.Tensor:
-    """
-    KL divergence from uniform distribution: KL(p || u)
-
-    Measures how far the distribution is from uniform (maximum entropy).
-    KL(p || u) = sum(p * log(p)) - log(1/n) = -H(p) + log(n)
-
-    Args:
-        probs: Probability distribution [M]
-
-    Returns:
-        KL divergence (0 = uniform, higher = more peaked)
-    """
-    n = probs.shape[0]
-    log_n = math.log(n)
-    shannon = -compute_shannon_entropy(probs)  # H(p)
-    return log_n - shannon  # KL(p || u)
-
-
-def compute_entropy(
-    probs: torch.Tensor,
-    entropy_type: str = "shannon",
-    alpha: float = 2.0,
-    q: float = 2.0,
-) -> torch.Tensor:
-    """
-    Compute entropy using specified formulation.
-
-    Args:
-        probs: Probability distribution [M]
-        entropy_type: 'shannon', 'renyi', 'tsallis', or 'kl_uniform'
-        alpha: Parameter for Rényi entropy
-        q: Parameter for Tsallis entropy
-
-    Returns:
-        Entropy value (to be used in loss with positive lambda_ent)
-    """
-    if entropy_type == "shannon":
-        return compute_shannon_entropy(probs)
-
-    elif entropy_type == "renyi":
-        return compute_renyi_entropy(probs, alpha)
-
-    elif entropy_type == "tsallis":
-        return compute_tsallis_entropy(probs, q)
-
-    elif entropy_type == "kl_uniform":
-        # Return negative KL so that minimizing increases uniformity
-        return -compute_kl_from_uniform(probs)
-
-    else:
-        return compute_shannon_entropy(probs)
-
 
 # =============================================================================
 # Entropy targeting (SAC-style automatic temperature adjustment)
@@ -439,14 +315,33 @@ class CoverageTracker:
 
         return bonus
 
-    def get_coverage_stats(self) -> dict:
-        """Get coverage statistics for logging."""
-        selected_mask = self.counts > 0
+    def get_coverage_stats(self, world_size: int = 1) -> dict:
+        """
+        Get coverage statistics for logging.
+
+        world_size > 1: self.counts only reflects this rank's own
+        DistributedSampler-sharded slice of the dataset (see data.py's
+        make_pool_loader and CoverageTracker's class docstring on why that's
+        the *correct* rank-local state for get_coverage_bonus()'s training
+        signal). For logging, though, pass cfg.world_size to merge every
+        rank's counts via all_reduce first so the reported coverage
+        describes the whole world, not just this rank's shard. Uses a local
+        copy -- self.counts (and therefore get_coverage_bonus()) is never
+        mutated by this call. Every rank must call this the same number of
+        times with the same world_size (it's a collective) -- true here
+        since it's only ever invoked from a cfg.log_every-gated block that
+        every rank reaches in lockstep.
+        """
+        counts = self.counts
+        if world_size > 1:
+            counts = counts.clone()
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        selected_mask = counts > 0
         return {
             "coverage_ratio": selected_mask.float().mean().item(),
-            "avg_selection_count": self.counts[selected_mask].mean().item() if selected_mask.any() else 0,
-            "max_selection_count": self.counts.max().item(),
-            "min_selection_count": self.counts[selected_mask].min().item() if selected_mask.any() else 0,
+            "avg_selection_count": counts[selected_mask].mean().item() if selected_mask.any() else 0,
+            "max_selection_count": counts.max().item(),
+            "min_selection_count": counts[selected_mask].min().item() if selected_mask.any() else 0,
         }
 
 
@@ -538,6 +433,25 @@ def compute_entropy_per_sample(logits: torch.Tensor) -> torch.Tensor:
     return entropy.mean(dim=1)  # [B]
 
 
+def pool_difficulty_stats(values: torch.Tensor, diffs: torch.Tensor, name: str) -> dict:
+    """min/max/mean/count of `values` (aligned with the full candidate pool,
+    not just the selected batch), split by difficulty label (0=easy, 1=hard).
+
+    Used to diagnose curriculum collapse: whether hard samples are getting
+    low router scores/probs, or low measured loss-improvement, or both.
+    """
+    stats = {}
+    for label, group in (("easy", 0), ("hard", 1)):
+        mask = diffs == group
+        if mask.any():
+            group_vals = values[mask]
+            stats[f"{name}_{label}_min"] = group_vals.min().item()
+            stats[f"{name}_{label}_max"] = group_vals.max().item()
+            stats[f"{name}_{label}_mean"] = group_vals.mean().item()
+            stats[f"{name}_{label}_count"] = float(mask.sum().item())
+    return stats
+
+
 def compute_gradient_reward(
     params: list[torch.nn.Parameter],
     grad_ema: list[torch.Tensor] | None,
@@ -608,7 +522,9 @@ def compute_reward(
         entropy_after: Per-sample entropy after update [B] (optional)
         gradient_reward: Scalar or per-sample gradient reward (optional)
         greats_reward: Scalar GREATS ghost-gradient-dot-product score, summed over
-            the selected batch (optional; see reward_signal='greats_score' in Config)
+            the selected batch (optional; see reward_signal='greats_score' in Config).
+            When cfg.greats_diversity_term is set, the caller has already folded the
+            second-order redundancy penalty into this value before passing it in.
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -729,190 +645,9 @@ def compute_baseline(
 # Training algorithms
 # =============================================================================
 
-def reinforce_update(
-    router: AttentionRouter,
-    opt_router: torch.optim.Optimizer,
-    reward: torch.Tensor,
-    baseline: torch.Tensor,
-    sel_probs: torch.Tensor,
-    all_probs: torch.Tensor,
-    lambda_ent: float,
-    entropy_type: str = "shannon",
-    entropy_alpha: float = 2.0,
-    entropy_q: float = 2.0,
-    coverage_loss: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Standard REINFORCE (vanilla policy gradient) router update.
-
-    Advantage = reward - baseline (reduces gradient variance).
-    Policy loss = -mean(advantage * log_prob_of_selected_samples).
-    Total loss = policy_loss + lambda_ent * entropy_term.
-
-    See module docstring for the entropy sign convention.
-
-    Returns (loss_router, reinforce_loss, entropy) where entropy = -H.
-    """
-    advantage = reward - baseline
-    reinforce_loss = -(advantage * sel_probs.log()).mean()
-
-    # Use configurable entropy formulation
-    entropy = compute_entropy(all_probs, entropy_type, entropy_alpha, entropy_q)
-
-    loss_router = reinforce_loss + lambda_ent * entropy
-
-    # Add coverage regularization if provided
-    if coverage_loss is not None:
-        loss_router = loss_router + coverage_loss
-
-    opt_router.zero_grad()
-    loss_router.backward()
-    opt_router.step()
-
-    return loss_router, reinforce_loss, entropy
-
-
-def grpo_update(
-    router: AttentionRouter,
-    opt_router: torch.optim.Optimizer,
-    reward: torch.Tensor,
-    sel_probs: torch.Tensor,
-    all_probs: torch.Tensor,
-    lambda_ent: float,
-    group_size: int,
-    entropy_type: str = "shannon",
-    entropy_alpha: float = 2.0,
-    entropy_q: float = 2.0,
-    coverage_loss: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Group Relative Policy Optimization (GRPO) router update.
-
-    Instead of a single global baseline, advantages are normalised within
-    small groups of group_size samples:
-        advantage_i = (r_i - group_mean) / group_std
-    This provides lower-variance gradient estimates when rewards vary
-    substantially across samples, without needing a learned value function.
-
-    Returns (loss_router, grpo_loss, entropy) where entropy = -H.
-    """
-    B = len(reward)
-    n_groups = max(1, B // group_size)
-
-    # Split rewards into groups and compute group-relative advantages
-    advantages = torch.zeros_like(reward)
-    for i in range(n_groups):
-        start = i * group_size
-        end = min((i + 1) * group_size, B)
-        group_reward = reward[start:end]
-        group_baseline = group_reward.mean()
-        group_std = group_reward.std().clamp(min=1e-8)
-        advantages[start:end] = (group_reward - group_baseline) / group_std
-
-    # Handle remainder
-    if B % group_size != 0:
-        remainder_start = n_groups * group_size
-        group_reward = reward[remainder_start:]
-        group_baseline = group_reward.mean()
-        group_std = group_reward.std().clamp(min=1e-8)
-        advantages[remainder_start:] = (group_reward - group_baseline) / group_std
-
-    grpo_loss = -(advantages.detach() * sel_probs.log()).mean()
-
-    # Use configurable entropy formulation
-    entropy = compute_entropy(all_probs, entropy_type, entropy_alpha, entropy_q)
-
-    loss_router = grpo_loss + lambda_ent * entropy
-
-    # Add coverage regularization if provided
-    if coverage_loss is not None:
-        loss_router = loss_router + coverage_loss
-
-    opt_router.zero_grad()
-    loss_router.backward()
-    opt_router.step()
-
-    return loss_router, grpo_loss, entropy
-
-
-def ppo_update(
-    model: TinyGPT,
-    router: AttentionRouter,
-    opt_router: torch.optim.Optimizer,
-    X_sel: torch.Tensor,
-    Y_sel: torch.Tensor,
-    old_log_probs: torch.Tensor,
-    reward: torch.Tensor,
-    baseline: torch.Tensor,
-    feats: torch.Tensor,
-    sel_idx: torch.Tensor,
-    cfg: ExperimentConfig,
-    lambda_ent: float,
-    entropy_type: str = "shannon",
-    entropy_alpha: float = 2.0,
-    entropy_q: float = 2.0,
-    coverage_loss: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Proximal Policy Optimization (PPO) router update.
-
-    Runs cfg.ppo_epochs inner update steps with the clipped surrogate:
-        L = min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)
-    where ratio = new_log_prob / old_log_prob and ε = cfg.ppo_clip.
-    Clipping prevents destructively large policy updates in a single step.
-
-    Advantages are normalised across the selected batch before clipping.
-    Coverage loss is applied only on the first inner epoch to avoid
-    double-counting the coverage penalty.
-
-    Returns averaged (loss_router, policy_loss, entropy) over inner steps,
-    where entropy = -H.
-    """
-    advantage = (reward - baseline).detach()
-    # Normalize advantages
-    adv_std = advantage.std().clamp(min=1e-8)
-    advantage = (advantage - advantage.mean()) / adv_std
-
-    total_loss = torch.tensor(0.0, device=cfg.device)
-    total_policy_loss = torch.tensor(0.0, device=cfg.device)
-    total_entropy = torch.tensor(0.0, device=cfg.device)
-
-    for _ in range(cfg.ppo_epochs):
-        # Recompute probabilities with current router
-        scores = router(feats)
-        probs = torch.softmax(scores / cfg.temp, dim=0)
-        new_log_probs = probs[sel_idx].clamp_min(1e-12).log()
-
-        # PPO clipped objective
-        ratio = torch.exp(new_log_probs - old_log_probs.detach())
-        clipped_ratio = torch.clamp(ratio, 1 - cfg.ppo_clip, 1 + cfg.ppo_clip)
-
-        policy_loss = -torch.min(ratio * advantage, clipped_ratio * advantage).mean()
-
-        # Use configurable entropy formulation
-        entropy = compute_entropy(probs, entropy_type, entropy_alpha, entropy_q)
-
-        loss_router = policy_loss + lambda_ent * entropy
-
-        # Add coverage regularization if provided (only on first PPO epoch)
-        if coverage_loss is not None and _ == 0:
-            loss_router = loss_router + coverage_loss
-
-        opt_router.zero_grad()
-        loss_router.backward()
-        opt_router.step()
-
-        total_loss += loss_router.detach()
-        total_policy_loss += policy_loss.detach()
-        total_entropy += entropy.detach()
-
-    n = cfg.ppo_epochs
-    return total_loss / n, total_policy_loss / n, total_entropy / n
-
-
 def build_feature_cache(
     model: TinyGPT,
-    train_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
     cfg: ExperimentConfig,
 ) -> torch.Tensor:
     """
@@ -928,7 +663,26 @@ def build_feature_cache(
     (e.g. after changing d_model or n_chunks), the cache is discarded and rebuilt.
 
     Disk persistence: if cfg.feature_cache_path is non-empty, the cache is saved
-    as a .pt file and loaded on the next call instead of recomputing.
+    as a .pt file and loaded on the next call instead of recomputing. This is an
+    opt-in, cross-run cache -- if it's set and already holds a shape/dtype-matching
+    file, that file is reused as-is even on a mid-run rebuild call, so don't point
+    two runs with different model weights (or two feature_cache_epochs rebuilds
+    you want to actually diverge) at the same path.
+
+    Distributed (cfg.world_size > 1): only rank 0 runs the expensive full-dataset
+    forward pass; the other ranks block on a barrier and then load the identical
+    cache rank 0 just wrote to a same-run scratch file under
+    results/<experiment_name>/. Without this, every one of world_size ranks would
+    redundantly recompute (and separately hold in CPU RAM) its own byte-identical
+    copy -- at world_size=16 that's 16x the GPU compute for zero benefit. Each
+    rank still ends up with its own full in-memory copy afterwards (there's no
+    cross-process shared memory here), so CPU RAM use is unchanged at
+    world_size * cache_size_in_bytes -- only the redundant *compute* is removed.
+    This scratch file is intentionally separate from cfg.feature_cache_path
+    (that one is the user-facing, opt-in, persists-across-runs cache described
+    above; reusing it here would make every within-run rebuild after the first
+    silently reload the first rebuild's now-stale features instead of the fresh
+    ones this call just computed).
 
     Returns: [N, n_chunks * d_model] fp16 CPU tensor.
     """
@@ -939,11 +693,31 @@ def build_feature_cache(
         try:
             cache = torch.load(cfg.feature_cache_path, map_location="cpu", weights_only=True)
             if tuple(cache.shape) == expected_shape and cache.dtype == torch.float16:
-                print(f"[Cache] Loaded from {cfg.feature_cache_path}")
+                if cfg.rank == 0:
+                    print(f"[Cache] Loaded from {cfg.feature_cache_path}")
                 return cache
-            print(f"[Cache] Shape mismatch ({cache.shape} vs {expected_shape}), rebuilding...")
+            if cfg.rank == 0:
+                print(f"[Cache] Shape mismatch ({cache.shape} vs {expected_shape}), rebuilding...")
         except Exception as e:
-            print(f"[Cache] Could not load ({e}), rebuilding...")
+            if cfg.rank == 0:
+                print(f"[Cache] Could not load ({e}), rebuilding...")
+
+    ddp_sync_path = (
+        os.path.join("results", cfg.experiment_name, "_feature_cache_ddp_sync.pt")
+        if cfg.world_size > 1 else None
+    )
+    if ddp_sync_path and cfg.rank != 0:
+        # Rank 0 is about to (re)build and save the cache below -- wait for
+        # it instead of redundantly repeating the same full-dataset forward
+        # pass on this rank's own model replica.
+        dist.barrier()
+        cache = torch.load(ddp_sync_path, map_location="cpu", weights_only=True)
+        # Second barrier: only release rank 0 (waiting at the matching
+        # barrier below) once every rank has finished reading, so rank 0
+        # can't race ahead into a *later* rebuild and overwrite ddp_sync_path
+        # while a slow rank is still mid-load here.
+        dist.barrier()
+        return cache
 
     N, F = expected_shape
     cache = torch.zeros(N, F, dtype=torch.float16)
@@ -963,6 +737,12 @@ def build_feature_cache(
         torch.save(cache, cfg.feature_cache_path)
         print(f"[Cache] Saved to {cfg.feature_cache_path}")
 
+    if ddp_sync_path:
+        os.makedirs(os.path.dirname(ddp_sync_path), exist_ok=True)
+        torch.save(cache, ddp_sync_path)
+        dist.barrier()  # release the ranks waiting above
+        dist.barrier()  # wait until every rank has finished reading it
+
     return cache
 
 
@@ -970,8 +750,8 @@ def train_router_experiments(
     cfg: ExperimentConfig,
     model: TinyGPT,
     router: AttentionRouter,
-    train_ds: MixedLMDataset,
-    val_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
+    val_ds: TokenizedCorpus,
     tokenizer,
     metrics: MetricsTracker,
     diversity: DiversityTracker,
@@ -996,9 +776,20 @@ def train_router_experiments(
 
     model.to(cfg.device).train()
     router.to(cfg.device).train()
+    # DDP-replicated or FSDP2-sharded per cfg.distributed. The router is
+    # always replicated, never sharded -- it's a few thousand parameters, so
+    # sharding it would cost collectives to save nothing.
+    model = wrap_model(model, cfg)
+    router = wrap_replica(router, cfg)
 
-    opt_lm = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
-    opt_router = torch.optim.Adam(router.parameters(), lr=cfg.lr_router)
+    # Which module to evaluate, and whether this rank must join in: DDP
+    # evaluates the unwrapped replica on rank 0 alone, FSDP evaluates the
+    # sharded module on every rank (no rank holds a whole copy). See
+    # utils/distributed_utils.eval_handles().
+    eval_model, this_rank_evaluates = eval_handles(model, cfg)
+
+    opt_lm = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
     grad_params = [p for p in model.parameters() if p.requires_grad]
     grad_param_count = sum(p.numel() for p in grad_params)
@@ -1017,7 +808,7 @@ def train_router_experiments(
         ghost_engine = GhostEngineManager(
             config=SimpleNamespace(
                 method="GradDotProd",
-                result_dir=os.path.join(cfg.save_dir, "ghost"),
+                result_dir=os.path.join("results", cfg.experiment_name, "ghost"),
                 val_batch_size=cfg.greats_val_batch_size,
                 log_grad_norms=cfg.greats_log_grad_norms,
                 score_exclude_params=cfg.greats_score_exclude_params,
@@ -1027,7 +818,14 @@ def train_router_experiments(
                 decoupled_fn=False,
                 separate_val=False,
             ),
-            model=model,
+            # Unwrapped: GhostSuite's per-sample-gradient hooks match
+            # nn.Linear/nn.Embedding/nn.LayerNorm/HF Conv1D by exact type (see
+            # the model_type check above) and walk named_modules() directly --
+            # a DDP wrapper would shadow every submodule path under "module."
+            # and could interfere with per-sample gradient capture, so hand it
+            # the real model regardless of whether DDP is wrapping it for the
+            # actual LM forward/backward elsewhere in this function.
+            model=model.module if isinstance(model, DDP) else model,
             optimizer=opt_lm,
             ddp_info={"master_process": cfg.rank == 0},
             val_data=(X_val, Y_val),
@@ -1041,7 +839,7 @@ def train_router_experiments(
     # Initialize entropy targeting if enabled
     entropy_targeting = None
     if cfg.use_entropy_targeting:
-        max_ent = compute_max_entropy(cfg.pool)
+        max_ent = compute_max_entropy(cfg.per_rank_pool_size)
         target_entropy = cfg.target_entropy_ratio * max_ent
         entropy_targeting = EntropyTargeting(
             target_entropy=target_entropy,
@@ -1060,13 +858,41 @@ def train_router_experiments(
             device=cfg.device,
         )
 
-    total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
+    # // world_size before // per_rank_pool_size: under DDP each rank only
+    # sees its shard (make_pool_loader's DistributedSampler truncates to
+    # len(ds)//world_size candidates per rank, drop_last=True -- see data.py),
+    # then chunked into cfg.per_rank_pool_size-sized steps (cfg.pool split
+    # across ranks -- see Config.per_rank_pool_size), so this must match
+    # steps actually taken per rank per epoch, not the single-process count,
+    # or progress (used below to drive every schedule) would never reach 1.0.
+    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.per_rank_pool_size) * cfg.epochs)
     global_step = 0
+    # Tokens fed to the LM so far. TokenizedCorpus yields fixed-length windows
+    # (block tokens, no padding — see data.py), so this is just
+    # X_sel.numel() accumulated each step; no tokenizer call needed.
+    # Multiplied by world_size since only rank 0 logs but every rank processes
+    # its own equally-sized shard each step under DDP.
+    total_tokens_seen = 0
 
     # Feature cache: None until first rebuild (never built during epoch 0)
     feature_cache: torch.Tensor | None = None
 
+    pool_loader = make_pool_loader(
+        train_ds, cfg.per_rank_pool_size,
+        num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+        rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
+    )
+
+    budget_reached = False
     for epoch in range(cfg.epochs):
+        # DistributedSampler reshuffles from `seed + epoch`; without this call
+        # every rank would see the identical pool order every epoch. No-op
+        # (AttributeError-free via hasattr) in the single-process case, where
+        # the default RandomSampler already reshuffles on every fresh
+        # `for ... in loader`.
+        if hasattr(pool_loader.sampler, "set_epoch"):
+            pool_loader.sampler.set_epoch(epoch)
+
         # The feature cache is never built at epoch 0: the model's weights are
         # randomly initialised, so the hidden states are noise. Caching garbage
         # features would waste memory and mislead the router. Rebuilding every
@@ -1081,25 +907,47 @@ def train_router_experiments(
         ):
             feature_cache = build_feature_cache(model, train_ds, cfg)
 
-        idx_loader = make_index_loader(len(train_ds), cfg.pool)
         epoch_start = time.perf_counter()
         total_feat_time = 0.0
 
         # ── Per-step curriculum loop ──────────────────────────────────────────
         # Each iteration implements the core curriculum learning cycle:
-        #   1. Sample M = cfg.pool candidate indices (pre-shuffled each epoch).
+        #   1. Sample M = cfg.per_rank_pool_size candidate indices (pre-shuffled each epoch,
+        #      prefetched by pool_loader's workers while the previous step's
+        #      GPU work is still running -- see cfg.dataloader_num_workers).
         #   2. Extract router features for all M samples.
-        #   3. Router scores pool → softmax(/ temp) → select k = cfg.batch samples.
+        #   3. Router scores pool → softmax(/ temp) → select k samples (k =
+        #      cfg.per_rank_batch_size, or an annealed fraction of the pool when
+        #      cfg.use_curriculum_ratio_schedule is on).
         #   4. LM forward + backward on selected batch.
         #   5. Compute reward signal (loss improvement, gradient norm, etc.).
         #   6. Router RL update (REINFORCE / GRPO / PPO + entropy regularisation).
         # ─────────────────────────────────────────────────────────────────────
-        for pool_indices in tqdm(idx_loader, disable=(cfg.rank != 0)):
-            if len(pool_indices) < cfg.batch:
-                continue
+        for pool_idx, X, Y, domains in tqdm(pool_loader, disable=(cfg.rank != 0)):
+            pool_indices = pool_idx.tolist()
+            domains = domains.tolist()
+            X = X.to(cfg.device, non_blocking=True)  # [M, L]
+            Y = Y.to(cfg.device, non_blocking=True)  # [M, L]
 
             # Compute training progress for schedules
             progress = global_step / total_steps
+
+            # Router freeze: past this point the router keeps scoring/
+            # selecting samples with its current weights (selection logic
+            # below is completely unchanged), it just stops learning -- see
+            # config.py's router_freeze_progress docstring.
+            router_frozen = (
+                cfg.router_freeze_progress is not None
+                and progress >= cfg.router_freeze_progress
+            )
+
+            # Router update cadence: only the every-router_update_every-th
+            # step actually pays for the extra loss_after forward pass and
+            # performs a policy-gradient update below -- see config.py's
+            # router_update_every docstring. Deterministic on every rank
+            # (fixed per-step counter, no data dependence), so this is
+            # DDP-safe without a broadcast, same as router_frozen above.
+            router_update_due = global_step % cfg.router_update_every == 0
 
             # Get scheduled values
             current_temp = get_scheduled_value(
@@ -1116,16 +964,35 @@ def train_router_experiments(
                     step=global_step, cycle_length=cfg.entropy_cycle_length,
                 )
 
-            batch = [train_ds[i] for i in pool_indices]
-            xs, ys, diffs = zip(*batch)
-
-            X = torch.stack(xs).to(cfg.device)  # [M, L]
-            Y = torch.stack(ys).to(cfg.device)  # [M, L]
+            # Curriculum-ratio schedule: shrink the selected batch from a
+            # weakly-selective fraction of the pool down to a strongly-selective
+            # one over training, instead of a fixed cfg.per_rank_batch_size. See
+            # config.py's use_curriculum_ratio_schedule docstring.
+            if cfg.use_curriculum_ratio_schedule:
+                current_ratio = get_scheduled_value(
+                    cfg.curriculum_ratio_schedule, cfg.curriculum_ratio_initial, cfg.curriculum_ratio_min,
+                    progress, step=global_step, cycle_length=cfg.entropy_cycle_length,
+                )
+                select_k = max(1, min(len(pool_indices), round(current_ratio * len(pool_indices))))
+            else:
+                select_k = cfg.per_rank_batch_size
 
             # --- Router features over the full pool ---
             feat_start = time.perf_counter()
+            external_embedding = None
+            if train_ds.embeddings is not None:
+                # .float() on read: TokenizedCorpus.embeddings is the fp16
+                # sentence-embedder cache (a storage format, chosen to halve
+                # its footprint), and everything downstream of it -- the
+                # router, and the feature-cache concat below -- is fp32. Same
+                # upcast-on-read the feature cache itself already does.
+                external_embedding = torch.stack(
+                    [train_ds.embeddings[i] for i in pool_indices]
+                ).to(cfg.device).float()
+
             if feature_cache is not None:
                 hidden_feats = feature_cache[pool_indices].to(cfg.device).float()
+                parts = [hidden_feats]
                 if cfg.enable_text_stat:
                     stats = compute_text_statistics(
                         X,
@@ -1133,9 +1000,10 @@ def train_router_experiments(
                         vocab_size=tokenizer.vocab_size,
                         block=cfg.block,
                     )
-                    feats = torch.cat([hidden_feats, stats], dim=1)
-                else:
-                    feats = hidden_feats
+                    parts.append(stats)
+                if external_embedding is not None:
+                    parts.append(external_embedding)
+                feats = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
             else:
                 feats = extract_router_features(
                     model=model,
@@ -1143,15 +1011,9 @@ def train_router_experiments(
                     cfg=cfg,
                     pad_token_id=tokenizer.pad_token_id,
                     vocab_size=tokenizer.vocab_size,
+                    external_embedding=external_embedding,
                 )  # [M, F]
             total_feat_time += time.perf_counter() - feat_start
-
-            # Append pre-computed external embeddings when available.
-            if train_ds.embeddings is not None:
-                pool_embs = torch.stack(
-                    [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
-                feats = torch.cat([feats, pool_embs], dim=1)
 
             scores = router(feats)  # [M]
             probs = torch.softmax(scores / current_temp, dim=0)  # [M]
@@ -1159,7 +1021,7 @@ def train_router_experiments(
             # --- Sample selection based on strategy ---
             sel_idx = select_samples(
                 probs=probs,
-                k=cfg.batch,
+                k=select_k,
                 strategy=cfg.selection_strategy,
                 epsilon=cfg.epsilon_greedy,
             )
@@ -1170,13 +1032,19 @@ def train_router_experiments(
 
             X_sel = X[sel_idx]  # [B, L]
             Y_sel = Y[sel_idx]  # [B, L]
-            selected_diffs = [diffs[i] for i in sel_idx.tolist()]
+            selected_domains = [domains[i] for i in sel_idx.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx.tolist()]
+            total_tokens_seen += X_sel.numel() * cfg.world_size
+            # Deterministic on every rank (fixed per-step increment, no data
+            # dependence), so checking/breaking here is DDP-safe without a
+            # broadcast -- every rank reaches the same verdict at the same point.
+            budget_reached = cfg.max_tokens is not None and total_tokens_seen >= cfg.max_tokens
 
             # --- GREATS ghost-gradient scoring (before the real LM update: a separate
             # scoring backward on X_sel/Y_sel against the fixed val batch, discarded
             # afterwards) ---
             greats_reward = None
+            greats_train_norms = None
             if ghost_engine is not None and cfg.reward_signal == "greats_score":
                 ghost_engine.begin_step()
                 ghost_engine.attach_train_batch(X_sel, Y_sel, global_step)
@@ -1192,6 +1060,11 @@ def train_router_experiments(
                 greats_reward = ghost_engine.read_scores(
                     metric=cfg.greats_score_metric
                 ).to(cfg.device).sum()
+                # Per-sample ||g_i|| for the diversity term below (config.__post_init__
+                # guarantees greats_log_grad_norms=True whenever greats_diversity_term is set).
+                greats_train_norms = (
+                    ghost_engine.read_train_grad_norms() if cfg.greats_diversity_term else None
+                )
                 ghost_engine.discard_scores()
 
             # --- LM forward and update ---
@@ -1199,7 +1072,14 @@ def train_router_experiments(
             # zeroing for this real step.
             opt_lm.zero_grad()
 
-            logits = model(X_sel)  # [B, L, V]
+            with autocast_ctx(cfg.device):
+                logits = model(X_sel)  # [B, L, V]
+            # Cast back to fp32 so every downstream consumer (entropy/reward
+            # functions, GhostSuite's per-sample gradient hooks, DDP grad
+            # sync) sees the same dtype as before -- autocast's memory win
+            # comes from the transformer's internal activations having run
+            # in bf16, not from the dtype of this final tensor.
+            logits = logits.float()
 
             # per-sample loss and entropy BEFORE update
             with torch.no_grad():
@@ -1214,7 +1094,27 @@ def train_router_experiments(
                 reduction="mean",
             )
 
-            loss_lm.backward()
+            # DDP's Reducer all-reduces (averages) gradients across ranks as
+            # part of backward() itself -- by the time backward() returns,
+            # .grad is already the world-averaged gradient, not this rank's
+            # own. That's exactly right for opt_lm.step() (one shared model),
+            # but it means compute_gradient_reward() below would read a value
+            # that's identical on every rank and barely moved by this rank's
+            # own selection -- useless as a per-rank RL reward. no_sync()
+            # skips that automatic reduction so backward() leaves .grad
+            # purely local to this rank's own X_sel/Y_sel.
+            #
+            # The isinstance(model, DDP) test is what keeps this DDP-only.
+            # FSDP2 has no no_sync() (its equivalent, set_requires_gradient_sync,
+            # doesn't preserve this meaning -- gradients are reduce-scattered
+            # into shards, so no rank ever holds its own complete gradient),
+            # which is why ExperimentConfig.__post_init__ rejects these two
+            # reward signals under distributed='FSDP' outright rather than
+            # letting them silently fall through to the unreduced branch here.
+            local_grad_reward = cfg.world_size > 1 and isinstance(model, DDP) and cfg.reward_signal in ("gradient_norm", "gradient_alignment")
+            backward_ctx = model.no_sync() if local_grad_reward else contextlib.nullcontext()
+            with backward_ctx:
+                loss_lm.backward()
 
             gradient_reward = None
             if cfg.reward_signal in ("gradient_norm", "gradient_alignment"):
@@ -1229,16 +1129,77 @@ def train_router_experiments(
                     param_count=grad_param_count,
                     clip=cfg.gradient_reward_clip,
                 )
+
+            if greats_train_norms is not None:
+                # Second-order (Hessian ~= identity) redundancy penalty for the ALREADY-selected
+                # batch X_sel: for a fixed set S, sum_{i<j in S} <g_i,g_j> collapses to
+                # (||sum_i g_i||^2 - sum_i ||g_i||^2) / 2 -- no candidate-candidate Gram matrix and
+                # no greedy loop needed (those are only required to *choose* S; the router already
+                # did that). Read in the same post-backward, pre-zero_grad window as gradient_reward
+                # above, since ||sum_i g_i||^2 comes straight from the real update's own .grad.
+                #
+                # Both terms must land in the SAME per-sample scale as greats_reward (a sum of
+                # <g_i, g_val> dot products from the separate ghost pass over [X_sel ++ val]) to be
+                # combined with it. The ghost pass's loss is mean-reduced over the combined
+                # train+val batch, so every factor it produces implicitly carries a 1/total_bs
+                # scale: greats_train_norms holds ||g_i,ghost|| where g_i,ghost = g_i / total_bs.
+                # sum_i g_i,ghost = (train_bs / total_bs) * mean_i(g_i), and that mean IS the
+                # gradient loss_lm.backward() just populated in .grad (mean-reduced over X_sel
+                # alone, no val) -- so no extra forward/backward pass is needed for this term.
+                with torch.no_grad():
+                    train_bs = X_sel.shape[0]
+                    total_bs = train_bs + ghost_engine.val_batch_size
+                    agg_grad_norm_sq = sum(
+                        p.grad.float().pow(2).sum()
+                        for p in grad_params if p.grad is not None
+                    )
+                    agg_grad_norm_sq_native = (train_bs / total_bs) ** 2 * agg_grad_norm_sq
+                    sum_sq_norms_native = greats_train_norms.to(cfg.device).float().pow(2).sum()
+                    redundancy = (agg_grad_norm_sq_native - sum_sq_norms_native) / 2.0
+                    greats_reward = cfg.lr_lm * greats_reward - (cfg.lr_lm ** 2) * redundancy
+
+            if local_grad_reward:
+                # no_sync() above skipped DDP's automatic averaging, so
+                # manually replicate it now (sum then divide by world_size)
+                # before opt_lm.step() -- otherwise every rank's LM replica
+                # would drift out of sync, applying only its own local
+                # gradient instead of the shared, averaged update.
+                for p in grad_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(cfg.world_size)
+
             opt_lm.step()
 
-            # loss and entropy AFTER update
-            with torch.no_grad():
-                logits_after = model(X_sel)
-                loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
-                entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
-
+            # Skip it on steps that won't perform a router update (router_update_due is
+            # False -- see config.py's router_update_every docstring); note
+            # router_frozen deliberately does NOT skip this, so reward stays
+            # logged every step even once the router has stopped learning.
+            # The one other consumer, coverage_tracker.update()'s
+            # uncertainty-based bonus, still needs a real per-sample loss
+            # regardless, so keep computing it then.
+            needs_real_loss_after = (
+                cfg.reward_signal != "greats_score" and router_update_due
+            ) or (
+                coverage_tracker is not None and cfg.coverage_type == "uncertainty"
+            )
+            with torch.no_grad(), autocast_ctx(cfg.device):
+                if needs_real_loss_after:
+                    logits_after = model(X_sel).float()
+                    loss_after = compute_loss_per_sample_vectorized(logits_after, Y_sel)
+                    entropy_after = compute_entropy_per_sample(logits_after) if cfg.reward_signal in ("uncertainty_reduction", "combined") else None
+                else:
+                    # Discarded stand-in: never read by compute_reward()'s
+                    # greats_score branch, and coverage_tracker.update()'s
+                    # `losses` arg is only read when coverage_type ==
+                    # 'uncertainty', ruled out above.
+                    loss_after = loss_before
+                    entropy_after = None
+    
             # Get difficulty scores for selected samples
-            difficulty_tensor = torch.tensor(selected_diffs, device=cfg.device, dtype=torch.float32) if cfg.reward_signal in ("difficulty_weighted", "combined") else None
+            # Conditions for selected_domains to act as difficulty markers 
+            # are checked in config.py in post_init
+            difficulty_tensor = torch.tensor(selected_domains, device=cfg.device, dtype=torch.float32) if cfg.reward_signal in ("difficulty_weighted", "combined") else None
 
             # --- Compute reward ---
             reward = compute_reward(
@@ -1272,7 +1233,18 @@ def train_router_experiments(
             }
 
             # --- Router update based on training algorithm ---
-            if cfg.training_algorithm == "reinforce":
+            if router_frozen or not router_update_due:
+                # Router already scored/selected this step's samples above
+                # with its current weights -- just skip the backward/
+                # optimizer step, either because it's permanently frozen
+                # (router_frozen) or because this isn't a router_update_every
+                # update step (router_update_due). Zero placeholders keep the
+                # unconditional logging code below (which reads loss_router/
+                # policy_loss/entropy every step) working unchanged.
+                loss_router = torch.zeros((), device=cfg.device)
+                policy_loss = torch.zeros((), device=cfg.device)
+                entropy = torch.zeros((), device=cfg.device)
+            elif cfg.training_algorithm == "reinforce":
                 baseline = compute_baseline(reward, cfg.baseline_type, moving_avg_baseline)
                 loss_router, policy_loss, entropy = reinforce_update(
                     router=router,
@@ -1312,6 +1284,7 @@ def train_router_experiments(
                     sel_idx=sel_idx,
                     cfg=cfg,
                     lambda_ent=current_lambda_ent,
+                    temperature=current_temp,
                     **ent_kwargs,
                 )
 
@@ -1329,78 +1302,135 @@ def train_router_experiments(
                     **ent_kwargs,
                 )
 
-            # Update entropy targeting if enabled
-            if entropy_targeting is not None:
+            # Update entropy targeting if enabled -- skipped when frozen or
+            # this isn't a router_update_every update step, since entropy is
+            # a zero placeholder then, not a real signal from an actual
+            # router update.
+            if entropy_targeting is not None and not router_frozen and router_update_due:
                 entropy_targeting.update(-entropy)  # Note: entropy is negative
 
             # Update coverage tracker if enabled
             if coverage_tracker is not None:
                 coverage_tracker.update(selected_indices, loss_after)
 
-            diversity.update(selected_indices, selected_diffs)
+            diversity.update(selected_indices, selected_domains)
 
             # --- Logging ---
             global_step += 1
-            if global_step % cfg.log_every == 0 and cfg.rank == 0:
-                curriculum_strength = 1.0 - progress
+            if global_step % cfg.log_every == 0:
+                # loss_lm/loss_router/policy_loss/entropy/avg_reward are all
+                # this rank's own local-shard values; average across ranks
+                # before logging so world_size>1 runs plot the whole step,
+                # not just rank 0's 1/world_size sliver. Every rank hits this
+                # collective in lockstep (equal per-rank step counts, see
+                # make_pool_loader's DistributedSampler) -- only rank 0
+                # then actually writes to wandb/prints below.
+                log_scalars = torch.stack([
+                    loss_lm.detach(), loss_router.detach(), policy_loss.detach(),
+                    entropy.detach(), reward.mean().detach(),
+                ])
+                if cfg.world_size > 1:
+                    log_scalars = log_scalars.clone()
+                    dist.all_reduce(log_scalars, op=dist.ReduceOp.SUM)
+                    log_scalars /= cfg.world_size
+                agg_loss_lm, agg_loss_router, agg_policy_loss, agg_entropy, agg_avg_reward = log_scalars.tolist()
 
-                log_data = {
-                    "epoch": epoch,
-                    "step": global_step,
-                    "loss_lm": loss_lm.item(),
-                    "loss_router": loss_router.item(),
-                    "policy_loss": policy_loss.item(),
-                    "entropy": -entropy.item(),  # entropy is -H; negate to log positive H
-                    "avg_reward": reward.mean().item(),
-                    "curriculum_strength": curriculum_strength,
-                    "temperature": current_temp,
-                    "lambda_ent": current_lambda_ent,
-                    "feat_time_ms": total_feat_time / cfg.log_every * 1000,
-                    **diversity.get_metrics(),
-                }
-                total_feat_time = 0.0
-
-                # Add coverage stats if enabled
-                if coverage_tracker is not None:
-                    log_data.update(coverage_tracker.get_coverage_stats())
-
-                metrics.log(**log_data)
-
-                print(
-                    f"[{cfg.training_algorithm.upper()}] Step {global_step} | "
-                    f"loss_lm={loss_lm.item():.4f} | "
-                    f"loss_router={loss_router.item():.4f} | "
-                    f"temp={current_temp:.3f}"
+                # get_metrics()/get_coverage_stats() themselves issue
+                # collectives (all_reduce/all_gather_object) when
+                # world_size > 1, so every rank must call them here, not
+                # just rank 0.
+                div_metrics = diversity.get_metrics(world_size=cfg.world_size)
+                coverage_stats = (
+                    coverage_tracker.get_coverage_stats(world_size=cfg.world_size)
+                    if coverage_tracker is not None else None
                 )
 
+                if cfg.rank == 0:
+                    curriculum_strength = 1.0 - progress
+
+                    log_data = {
+                        "epoch": epoch,
+                        "step": global_step,
+                        "loss_lm": agg_loss_lm,
+                        "loss_router": agg_loss_router,
+                        "policy_loss": agg_policy_loss,
+                        "entropy": -agg_entropy,  # entropy is -H; negate to log positive H
+                        "avg_reward": agg_avg_reward,
+                        "curriculum_strength": curriculum_strength,
+                        "tokens_seen": total_tokens_seen,
+                        "temperature": current_temp,
+                        "lambda_ent": current_lambda_ent,
+                        "select_k": select_k,
+                        "feat_time_ms": total_feat_time / cfg.log_every * 1000,
+                        **div_metrics,
+                    }
+                    total_feat_time = 0.0
+
+                    # Add coverage stats if enabled
+                    if coverage_stats is not None:
+                        log_data.update(coverage_stats)
+
+                    metrics.log(**log_data)
+
+                    print(
+                        f"[{cfg.training_algorithm.upper()}] Step {global_step} | "
+                        f"loss_lm={agg_loss_lm:.4f} | "
+                        f"loss_router={agg_loss_router:.4f} | "
+                        f"temp={current_temp:.3f} | "
+                    )
+
+            if budget_reached:
+                break
+
         # --- Validation ---
-        # Only rank 0 evaluates (val_ds is small and identical on every rank);
-        # other ranks wait so nobody starts the next epoch's DDP-synchronizing
-        # .backward() calls before rank 0 has finished its forward-only pass.
-        if cfg.rank == 0:
+        # val_ds is small and identical on every rank. Under DDP only rank 0
+        # evaluates and the others wait at the barrier below, so nobody starts
+        # the next epoch's DDP-synchronizing .backward() mid-eval; under FSDP
+        # every rank must evaluate (the forward all-gathers), and they all
+        # compute the same number, so logging still happens on rank 0 only.
+        if this_rank_evaluates:
             loss_fn = nn.CrossEntropyLoss()
-            val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
+            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
 
             epoch_time = time.perf_counter() - epoch_start
-            metrics.log(
-                epoch=epoch,
-                step=global_step,
-                val_loss=val_loss,
-                val_ppl=val_ppl,
-                epoch_time_s=epoch_time,
-            )
+            if cfg.rank == 0:
+                metrics.log(
+                    epoch=epoch,
+                    step=global_step,
+                    val_loss=val_loss,
+                    val_ppl=val_ppl,
+                    epoch_time_s=epoch_time,
+                )
 
-            print(
-                f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
-                f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
-                f"epoch_time={epoch_time:.1f}s"
-            )
+                print(
+                    f"[{cfg.training_algorithm.upper()}] Epoch {epoch + 1}/{cfg.epochs} | "
+                    f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f} | "
+                    f"epoch_time={epoch_time:.1f}s"
+                )
         if cfg.world_size > 1:
             dist.barrier()
 
-    if cfg.use_wandb and cfg.rank == 0:
-        import wandb
-        wandb.finish()
+        if budget_reached:
+            break
+
+    # --- Final per-domain perplexity, fully trained model ---
+    # Same rank gating as the per-epoch validation above.
+    if this_rank_evaluates:
+        loss_fn = nn.CrossEntropyLoss()
+        per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
+        if cfg.rank == 0:
+            metrics.log(
+                step=global_step,
+                **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+            )
+            print(
+                "[Final per-domain val perplexity] "
+                + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+            )
+
+    # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
+    # which logs a couple more summary metrics (e.g. total_time_s) into this
+    # same run before closing it.
 
     return model, router
 
@@ -1413,13 +1443,12 @@ def _avg_epoch_time(metrics: MetricsTracker) -> float | None:
     relevant = times[1:] if len(times) > 1 else times
     return sum(relevant) / len(relevant)
 
-
 def train_aux_baseline(
     cfg: ExperimentConfig,
     model: TinyGPT,
     aux_net: nn.Module,
-    train_ds: MixedLMDataset,
-    val_ds: MixedLMDataset,
+    train_ds: TokenizedCorpus,
+    val_ds: TokenizedCorpus,
     tokenizer,
     metrics: MetricsTracker,
     diversity: DiversityTracker,
@@ -1438,13 +1467,13 @@ def train_aux_baseline(
     same features, same top-k selection, same feature pipeline — only the
     training objective differs (MSE regression vs. REINFORCE).
     """
-    if cfg.use_wandb:
+    if cfg.use_wandb and cfg.rank == 0:
         import wandb
         wandb.init(
             project=cfg.wandb_project,
             entity=cfg.wandb_entity,
             config=vars(cfg),
-            name=f"{cfg.experiment_name}_aux_baseline",
+            name=cfg.experiment_name,
         )
         if cfg.config_path:
             wandb.save(cfg.config_path, policy="now")
@@ -1453,49 +1482,73 @@ def train_aux_baseline(
     aux_net.to(cfg.device)
     model.train()
     aux_net.train()
+    # DDP-replicated or FSDP2-sharded per cfg.distributed; aux_net is small
+    # enough to always replicate (see wrap_replica).
+    model = wrap_model(model, cfg)
+    aux_net = wrap_replica(aux_net, cfg)
+    eval_model, this_rank_evaluates = eval_handles(model, cfg)
 
     print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
     mse_fn  = nn.MSELoss()
-    opt_lm  = torch.optim.Adam(model.parameters(), lr=cfg.lr_lm)
-    opt_aux = torch.optim.Adam(aux_net.parameters(), lr=cfg.lr_router)
+    opt_lm  = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt_aux = torch.optim.AdamW(aux_net.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
-    total_steps = max(1, (len(train_ds) // cfg.pool) * cfg.epochs)
+    # // world_size before // per_rank_pool_size: under DDP each rank only
+    # sees its shard (make_pool_loader's DistributedSampler truncates to
+    # len(ds)//world_size candidates per rank, drop_last=True -- see data.py),
+    # then chunked into cfg.per_rank_pool_size-sized steps (cfg.pool split
+    # across ranks -- see Config.per_rank_pool_size), so this must match
+    # steps actually taken per rank per epoch, not the single-process count,
+    # or training_progress (used below) would never reach 1.0.
+    total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.per_rank_pool_size) * cfg.epochs)
     global_step = 0
+    total_tokens_seen = 0
 
+    pool_loader = make_pool_loader(
+        train_ds, cfg.per_rank_pool_size,
+        num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
+        rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
+    )
+
+    budget_reached = False
     for epoch in range(cfg.epochs):
+        if hasattr(pool_loader.sampler, "set_epoch"):
+            pool_loader.sampler.set_epoch(epoch)
+
         epoch_start = time.perf_counter()
-        idx_loader = make_index_loader(len(train_ds), cfg.pool)
 
-        for pool_indices in tqdm(idx_loader):
-            if len(pool_indices) < cfg.batch:
-                continue
-
-            batch = [train_ds[i] for i in pool_indices]
-            xs, ys, diffs = zip(*batch)
-
-            X = torch.stack(xs).to(cfg.device)  # [M, L]
-            Y = torch.stack(ys).to(cfg.device)  # [M, L]
+        for pool_idx, X, Y, diffs in tqdm(pool_loader, disable=(cfg.rank != 0)):
+            pool_indices = pool_idx.tolist()
+            diffs = diffs.tolist()
+            X = X.to(cfg.device, non_blocking=True)  # [M, L]
+            Y = Y.to(cfg.device, non_blocking=True)  # [M, L]
 
             # --- Feature extraction ---
+            external_embedding = None
+            if train_ds.embeddings is not None:
+                # .float() on read: TokenizedCorpus.embeddings is the fp16
+                # sentence-embedder cache (a storage format, chosen to halve
+                # its footprint), and everything downstream of it -- the
+                # router, and the feature-cache concat below -- is fp32. Same
+                # upcast-on-read the feature cache itself already does.
+                external_embedding = torch.stack(
+                    [train_ds.embeddings[i] for i in pool_indices]
+                ).to(cfg.device).float()
+
             feats = extract_router_features(
                 model=model,
                 X=X,
                 cfg=cfg,
                 pad_token_id=tokenizer.pad_token_id,
                 vocab_size=tokenizer.vocab_size,
+                external_embedding=external_embedding,
             )  # [M, F]
-            
-            if train_ds.embeddings is not None:
-                pool_embs = torch.stack(
-                    [train_ds.embeddings[i] for i in pool_indices]
-                ).to(cfg.device)
-                feats = torch.cat([feats, pool_embs], dim=1)
 
             # --- Selection: top-k by predicted improvement ---
             with torch.no_grad():
                 predicted_improvement = aux_net(feats.detach())  # [M]
-            topk = torch.topk(predicted_improvement, k=cfg.batch)
+            topk = torch.topk(predicted_improvement, k=cfg.per_rank_batch_size)
             sel_idx_local = topk.indices
 
             X_sel = X[sel_idx_local]
@@ -1503,13 +1556,20 @@ def train_aux_baseline(
             feats_sel = feats[sel_idx_local]
             selected_diffs   = [diffs[i] for i in sel_idx_local.tolist()]
             selected_indices = [pool_indices[i] for i in sel_idx_local.tolist()]
+            total_tokens_seen += X_sel.numel() * cfg.world_size
+            # Deterministic on every rank (fixed per-step increment, no data
+            # dependence), so checking/breaking here is DDP-safe without a
+            # broadcast -- every rank reaches the same verdict at the same point.
+            budget_reached = cfg.max_tokens is not None and total_tokens_seen >= cfg.max_tokens
 
             # --- Compute actual improvement ---
-            with torch.no_grad():
-                loss_before = compute_loss_per_sample_vectorized(model(X_sel), Y_sel)
+            with torch.no_grad(), autocast_ctx(cfg.device):
+                loss_before = compute_loss_per_sample_vectorized(model(X_sel).float(), Y_sel)
 
             opt_lm.zero_grad()
-            logits_sel = model(X_sel)
+            with autocast_ctx(cfg.device):
+                logits_sel = model(X_sel)
+            logits_sel = logits_sel.float()
             loss_lm = loss_fn(
                 logits_sel.view(-1, logits_sel.size(-1)),
                 Y_sel.view(-1),
@@ -1517,8 +1577,8 @@ def train_aux_baseline(
             loss_lm.backward()
             opt_lm.step()
 
-            with torch.no_grad():
-                loss_after = compute_loss_per_sample_vectorized(model(X_sel), Y_sel)
+            with torch.no_grad(), autocast_ctx(cfg.device):
+                loss_after = compute_loss_per_sample_vectorized(model(X_sel).float(), Y_sel)
 
             actual_improvement = (loss_before - loss_after).clamp(min=0.0).detach()
 
@@ -1533,40 +1593,75 @@ def train_aux_baseline(
 
             global_step += 1
             if global_step % cfg.log_every == 0:
-                training_progress = global_step / total_steps
-                div_metrics = diversity.get_metrics()
+                # loss_lm/loss_aux/avg_improvement are all this rank's own
+                # local-shard values; average across ranks before logging so
+                # world_size>1 runs plot the whole step, not just rank 0's
+                # 1/world_size sliver. Every rank hits this collective in
+                # lockstep (equal per-rank step counts, see make_pool_loader's
+                # DistributedSampler) -- only rank 0 then actually writes to
+                # wandb/prints below.
+                log_scalars = torch.stack([
+                    loss_lm.detach(), loss_aux.detach(), actual_improvement.mean().detach(),
+                ])
+                if cfg.world_size > 1:
+                    log_scalars = log_scalars.clone()
+                    dist.all_reduce(log_scalars, op=dist.ReduceOp.SUM)
+                    log_scalars /= cfg.world_size
+                agg_loss_lm, agg_loss_aux, agg_avg_improvement = log_scalars.tolist()
+
+                # get_metrics() itself issues collectives (all_reduce/
+                # all_gather_object) when world_size > 1, so every rank must
+                # call it here, not just rank 0.
+                div_metrics = diversity.get_metrics(world_size=cfg.world_size)
+
+                if cfg.rank == 0:
+                    training_progress = global_step / total_steps
+                    metrics.log(
+                        epoch=epoch,
+                        step=global_step,
+                        loss_lm=agg_loss_lm,
+                        loss_aux=agg_loss_aux,
+                        avg_improvement=agg_avg_improvement,
+                        curriculum_strength=1.0 - training_progress,
+                        tokens_seen=total_tokens_seen,
+                        **div_metrics,
+                    )
+                    print(
+                        f"[AuxNet] Step {global_step} | "
+                        f"loss_lm={agg_loss_lm:.4f} | "
+                        f"loss_aux={agg_loss_aux:.6f}"
+                    )
+
+            if budget_reached:
+                break
+
+        # DDP: rank 0 alone evaluates the unwrapped replica, others wait at
+        # the barrier below. FSDP: every rank must join the sharded forward's
+        # all-gathers. See utils/distributed_utils.eval_handles().
+        if this_rank_evaluates:
+            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
+            epoch_time = time.perf_counter() - epoch_start
+            if cfg.rank == 0:
                 metrics.log(
                     epoch=epoch,
                     step=global_step,
-                    loss_lm=loss_lm.item(),
-                    loss_aux=loss_aux.item(),
-                    avg_improvement=actual_improvement.mean().item(),
-                    curriculum_strength=1.0 - training_progress,
-                    **div_metrics,
+                    val_loss=val_loss,
+                    val_ppl=val_ppl,
+                    epoch_time_s=epoch_time,
                 )
                 print(
-                    f"[AuxNet] Step {global_step} | "
-                    f"loss_lm={loss_lm.item():.4f} | "
-                    f"loss_aux={loss_aux.item():.6f}"
+                    f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
+                    f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
                 )
+        if cfg.world_size > 1:
+            dist.barrier()
 
-        val_loss, val_ppl = evaluate(model, val_ds, loss_fn, cfg)
-        epoch_time = time.perf_counter() - epoch_start
-        metrics.log(
-            epoch=epoch,
-            step=global_step,
-            val_loss=val_loss,
-            val_ppl=val_ppl,
-            epoch_time_s=epoch_time,
-        )
-        print(
-            f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "
-            f"val_loss={val_loss:.4f} | val_ppl={val_ppl:.1f}"
-        )
+        if budget_reached:
+            break
 
-    if cfg.use_wandb:
-        import wandb
-        wandb.finish()
+    # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
+    # which logs a couple more summary metrics (e.g. total_time_s) into this
+    # same run before closing it.
 
     return model, aux_net
 
@@ -1602,3 +1697,17 @@ def compare_runs_experiments(
         print("\n=== Speed (avg epoch time, excl. epoch 0) ===")
         print(f"Router     : {router_time:.1f}s / epoch")
         print(f"Experiment : {experiment_time:.1f}s / epoch  ({speedup:.2f}x speedup, {time_saved:.1f}% faster)")
+
+    base_total_time = baseline_metrics.get_total_time()
+    router_total_time = router_metrics.get_total_time()
+    experiment_total_time = experiment_metrics.get_total_time()
+
+    if base_total_time is not None or router_total_time is not None or experiment_total_time is not None:
+        print("\n=== Total run time ===")
+        for label, total_time in (
+            ("Baseline", base_total_time),
+            ("Router", router_total_time),
+            ("Experiment", experiment_total_time),
+        ):
+            if total_time is not None:
+                print(f"{label:<10} : {total_time:.1f}s ({total_time / 3600:.2f}h)")

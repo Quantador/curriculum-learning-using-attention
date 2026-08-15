@@ -1,31 +1,55 @@
 # distributed_utils.py
 """
-Single-node PyTorch DDP setup helpers for train_ddp.py.
+PyTorch process-group lifecycle and model-parallelization for
+parallel_experiments.py.
 
-setup_distributed() / cleanup_distributed() wrap torch.distributed process
+setup_distributed() / cleanup_distributed() wrap torch.distributed's process
 group lifecycle, falling back to a single-process no-op when launched
-without torchrun so every other entry point (compare.py, experiments.py,
-smoke_test.py) is unaffected.
+without torchrun so every other entry point is unaffected.
 
-build_and_cache_chunks() / shard_and_truncate() implement the dataset
-pattern used by train_ddp.py: rank 0 streams + tokenizes the HuggingFace
-dataset once and caches it to disk, all ranks then load the identical
-cached chunk list and take a disjoint strided slice. This avoids N ranks
-redundantly re-streaming the same data, and guarantees every rank's local
-shard length is an exact multiple of cfg.pool -- required so that every
-rank issues the same number of pool-steps (and therefore the same number
-of DDP-synchronizing .backward() calls) per epoch.
+wrap_model() / wrap_replica() / eval_handles() are the single place that
+knows about cfg.distributed ('DDP' vs 'FSDP'). All three training loops
+(training.train_baseline, rl_training.train_router_experiments,
+rl_training.train_aux_baseline) go through them rather than each
+hand-rolling `DDP(model, ...)` plus its own `model.module if isinstance(...)`
+unwrapping -- those hand-rolled forms silently did the wrong thing the moment
+a second parallelization strategy existed.
+
+Unlike the older DDP prototype this replaces, there is no dataset-chunk
+broadcasting here: utils.shared_dataset.load_dataset_cache() already reads a
+pre-tokenized, mmap-backed on-disk cache, which every rank can load
+independently and identically -- no rank-0-builds-then-broadcasts dance
+needed.
 """
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.distributed as dist
 
-from config import Config
-from data import make_mixed_chunks, make_single_chunks
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# FSDP2's public home is torch.distributed.fsdp only from torch 2.6 on; in
+# 2.5 (what the current image ships) the same objects live under the private
+# _composable path. Import failure is NOT fatal here on purpose: FSDP is one
+# optional cfg.distributed value, and a module-level ImportError for it would
+# take down every training entry point that merely imports this file --
+# including all the single-GPU and DDP runs that never touch FSDP at all.
+try:  # torch >= 2.6
+    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+    _FSDP_IMPORT_ERROR = None
+except ImportError:
+    try:  # torch 2.5
+        from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+        _FSDP_IMPORT_ERROR = None
+    except ImportError as exc:
+        fully_shard = MixedPrecisionPolicy = None
+        _FSDP_IMPORT_ERROR = exc
+
+_MP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "none": None}
 
 
 def setup_distributed() -> Tuple[int, int, int]:
@@ -47,8 +71,9 @@ def setup_distributed() -> Tuple[int, int, int]:
         torch.cuda.set_device(local_rank)
         backend = "nccl"
     else:
-        # No GPUs visible (e.g. a local dry run) -- gloo lets the same
-        # control flow be exercised on CPU before a real NCCL/H100 run.
+        # No GPUs visible (e.g. a local dry run, or this module's own CPU
+        # smoke tests) -- gloo lets the same control flow be exercised
+        # without real GPU hardware.
         backend = "gloo"
 
     dist.init_process_group(backend=backend, init_method="env://")
@@ -60,90 +85,103 @@ def cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
-def is_main_process(rank: int) -> bool:
-    return rank == 0
+def _ddp(module: nn.Module, cfg) -> nn.Module:
+    # device_ids must be None for CPU modules (only single/multi-GPU modules
+    # accept it) -- only relevant for the gloo/CPU smoke-test path, since real
+    # DDP training always runs on CUDA.
+    return DDP(module, device_ids=[cfg.local_rank] if torch.cuda.is_available() else None)
 
 
-def build_and_cache_chunks(
-    cfg: Config,
-    tokenizer,
-    cache_path: str,
-    rank: int,
-    world_size: int,
-) -> Tuple[
-    List[Tuple[List[int], int]],
-    List[Tuple[List[int], int]],
-    Optional[List[torch.Tensor]],
-    Optional[List[torch.Tensor]],
-]:
+def wrap_model(model: nn.Module, cfg) -> nn.Module:
+    """Parallelize the LM across ranks per cfg.distributed. No-op at world_size 1.
+
+    'DDP' replicates; 'FSDP' shards with FSDP2's fully_shard. The FSDP path
+    shards each transformer block first and then the root module, which is
+    the documented FSDP2 pattern: per-block sharding is what lets the
+    all-gather for block N+1 overlap with block N's compute, and the root
+    call is what covers the embeddings / lm_head left outside the blocks.
+
+    Note FSDP2 mutates in place and returns the SAME object -- there is no
+    wrapper and no `.module`. That is precisely why eval_handles() exists.
     """
-    Build (train_chunks, val_chunks, train_embs, val_embs) once on rank 0
-    and cache to cache_path; every other rank loads the same file.
+    if cfg.world_size <= 1:
+        return model
 
-    Uses the same make_single_chunks()/make_mixed_chunks() calls as
-    compare.py -- the tokenization/chunking logic itself is untouched,
-    only which process runs it and how the result is shared.
+    if cfg.distributed == "DDP":
+        return _ddp(model, cfg)
+
+    if cfg.distributed == "FSDP":
+        if fully_shard is None:
+            raise RuntimeError(
+                "cfg.distributed='FSDP' needs FSDP2 (fully_shard), which this "
+                f"torch ({torch.__version__}) does not provide under either "
+                f"torch.distributed.fsdp or torch.distributed._composable.fsdp: "
+                f"{_FSDP_IMPORT_ERROR}"
+            )
+        mp_dtype = _MP_DTYPES[cfg.fsdp_mixed_precision]
+        kwargs = {}
+        if mp_dtype is not None:
+            # reduce_dtype stays fp32: gradient reduction is where low-precision
+            # accumulation actually costs you accuracy, and it is cheap to keep
+            # wide relative to the param all-gathers.
+            kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=mp_dtype, reduce_dtype=torch.float32
+            )
+        for block in transformer_blocks(model):
+            fully_shard(block, **kwargs)
+        fully_shard(model, **kwargs)
+        return model
+
+    raise NotImplementedError(f"There is no distributed training with {cfg.distributed!r}")
+
+
+def wrap_replica(module: nn.Module, cfg) -> nn.Module:
+    """Parallelize a SMALL module (router, aux net) -- always by replication.
+
+    Sharding these would be a pessimization, not a saving: the routers are a
+    few thousand parameters (LinearRouter is a single Linear(d_input, 1)), so
+    FSDP2 would add an all-gather and a reduce-scatter per step to distribute
+    a tensor that already fits everywhere. Replicate them even when the LM
+    itself is sharded.
     """
-    if rank == 0:
-        if cfg.use_single_dataset:
-            train_chunks, val_chunks, train_embs, val_embs = make_single_chunks(cfg, tokenizer)
-        else:
-            train_chunks = make_mixed_chunks("train", cfg, tokenizer)
-            val_chunks = make_mixed_chunks("validation", cfg, tokenizer)
-            train_embs = val_embs = None
-
-        payload = {
-            "train_chunks": train_chunks,
-            "val_chunks": val_chunks,
-            "train_embs": train_embs,
-            "val_embs": val_embs,
-        }
-        if world_size > 1:
-            os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-            torch.save(payload, cache_path)
-
-    if world_size > 1:
-        dist.barrier()  # ranks != 0 block here until rank 0's torch.save() above completes
-        if rank != 0:
-            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-
-    return (
-        payload["train_chunks"],
-        payload["val_chunks"],
-        payload["train_embs"],
-        payload["val_embs"],
-    )
+    return _ddp(module, cfg) if cfg.world_size > 1 else module
 
 
-def shard_and_truncate(
-    chunks: List[Tuple[List[int], int]],
-    embeddings: Optional[List[torch.Tensor]],
-    pool: int,
-    world_size: int,
-    rank: int,
-) -> Tuple[List[Tuple[List[int], int]], Optional[List[torch.Tensor]]]:
+def transformer_blocks(model: nn.Module) -> nn.ModuleList:
+    """The model's repeated transformer blocks, for per-block FSDP sharding.
+
+    Delegates to the model's own accessor (TinyGPT and HFCausalLM keep their
+    blocks in different places -- `self.tr.layers` vs the HF backbone's `.h`
+    or `.layers`) rather than reaching into either layout from here.
     """
-    Truncate chunks to a multiple of pool * world_size, then return this
-    rank's disjoint strided slice (chunks[rank::world_size]).
-
-    The truncation is what guarantees every rank's local shard length is
-    itself an exact multiple of pool -- so make_index_loader() yields the
-    same number of pool-steps per epoch on every rank. Without this, a
-    ragged last pool on some ranks but not others would desync the
-    .backward()-triggered DDP all-reduces across ranks and hang NCCL.
-    """
-    n = len(chunks)
-    unit = pool * world_size
-    n_trunc = (n // unit) * unit
-    if n_trunc == 0:
-        raise ValueError(
-            f"Not enough chunks ({n}) to give every one of {world_size} ranks "
-            f"a full pool of {pool} samples."
+    accessor = getattr(model, "transformer_blocks", None)
+    if accessor is None:
+        raise AttributeError(
+            f"{type(model).__name__} does not expose transformer_blocks(); add one "
+            f"(see TinyGPT/HFCausalLM in models/model.py) before sharding it with FSDP."
         )
+    return accessor()
 
-    chunks = chunks[:n_trunc]
-    embeddings = embeddings[:n_trunc] if embeddings is not None else None
 
-    local_chunks = chunks[rank::world_size]
-    local_embeddings = embeddings[rank::world_size] if embeddings is not None else None
-    return local_chunks, local_embeddings
+def eval_handles(model: nn.Module, cfg) -> Tuple[nn.Module, bool]:
+    """Returns (module to call evaluate() on, whether THIS rank must call it).
+
+    The two strategies need opposite answers, which is the subtle part:
+
+    DDP  -> (unwrapped module, rank == 0). DDP's forward() broadcasts module
+            buffers whenever the last grad-enabled forward left
+            require_forward_param_sync set (true for HF models with
+            registered buffers, e.g. GPT-2's attn.bias) -- a collective the
+            other ranks aren't there to join. Evaluating `.module` sidesteps
+            DDP's forward entirely, so rank 0 can evaluate alone.
+
+    FSDP -> (the sharded module, every rank). There is no unwrapped module to
+            escape to: no rank holds a complete copy of the parameters, so
+            the forward MUST all-gather and every rank must participate or
+            NCCL hangs until timeout. val_ds is identical and evaluate() is
+            deterministic, so all ranks compute the same number and callers
+            can keep logging only rank 0's copy without a reduction.
+    """
+    if cfg.world_size > 1 and cfg.distributed == "FSDP":
+        return model, True
+    return (model.module if isinstance(model, DDP) else model), cfg.rank == 0
