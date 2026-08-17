@@ -185,3 +185,34 @@ def eval_handles(model: nn.Module, cfg) -> Tuple[nn.Module, bool]:
     if cfg.world_size > 1 and cfg.distributed == "FSDP":
         return model, True
     return (model.module if isinstance(model, DDP) else model), cfg.rank == 0
+
+
+def full_state_dict(module: nn.Module, cfg) -> dict:
+    """Gather module's full, unsharded state dict for checkpointing.
+
+    Branches on how THIS module is actually wrapped, not on cfg.distributed:
+    wrap_replica() always DDP-wraps (routers/aux nets are replicated even
+    when cfg.distributed == 'FSDP' shards the LM, see its docstring), so a
+    router passed in under an FSDP run must still take the DDP branch below,
+    not the FSDP one.
+
+    DDP/unwrapped: every rank already holds an identical full replica, so
+    this just reads it locally off `.module` -- no collective needed.
+
+    FSDP (mutates in place, no wrapper -- see wrap_model()'s docstring):
+    gathering the sharded DTensor params is a collective all-gather, so this
+    branch must be called on EVERY rank; the assembled dict then only lands
+    on rank 0 (get_model_state_dict's documented behavior for
+    full_state_dict=True) -- other ranks' return value is not meant to be
+    used.
+    """
+    if isinstance(module, DDP):
+        return {k: v.detach().cpu() for k, v in module.module.state_dict().items()}
+    if cfg.world_size > 1 and cfg.distributed == "FSDP":
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions, get_model_state_dict,
+        )
+        return get_model_state_dict(
+            module, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        )
+    return {k: v.detach().cpu() for k, v in module.state_dict().items()}

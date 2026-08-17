@@ -1,0 +1,39 @@
+experiment_name: gptxl_oe_slimpajama_full
+epochs: 1
+global_batch_size: 512
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: -1
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+
+# The reference this arm is judged against: uniform random cfg.global_batch_size
+# selection, no router at all (training.train_baseline(), see
+# utils/experiment_worker.py's run_random_batch_baseline branch). Split out so
+# it can be launched with --single as its own sbatch job instead of only
+# riding along inside a full --profile sweep.
+run_random_batch_baseline: true
+
+# training_algorithm/reward_signal are irrelevant here -- train_baseline()
+# never builds a router, so nothing reads them -- but set to match the PPO
+# arm's values anyway for a clean side-by-side config diff against
+# configs/own_embeddings_ppo_loss_improvement.yaml.
+training_algorithm: ppo
+reward_signal: loss_improvement
+
+# Router-input fields are likewise inert under run_random_batch_baseline
+# (no router is built to read them), kept only for the config diff and in
+# case this file is later repurposed for a different reference run.
+router_feature_source: own_embeddings
+enable_text_hierarchical: false
+enable_text_stat: false
+use_original_sequence: false
+feature_cache_epochs: 0
+
+# Same corpus/signature as configs/own_embeddings_rl_ablation.yaml -- keep
+# these three verbatim so dataset_signature() still resolves to the existing
+# cache instead of demanding a rebuild.
+split_dataset: true
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

@@ -17,6 +17,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import load_config_from_yaml
@@ -30,13 +32,19 @@ from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
 from utils.general_utils import resolve_device, safe_name, set_seed
 from utils import memory_snapshot, run_status
+from utils.distributed_utils import full_state_dict
 
-def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics):
+def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics,
+                          save_dir: Path | None = None):
     """Run a single experiment with the given configuration.
 
     Shared by the bare in-process run_experiment() below and by
     utils/experiment_worker.py, which calls this once per config inside its
     own subprocess when running a sweep via run_scheduler().
+
+    save_dir: where to write a checkpoint when cfg.save_model_at_end is set
+    (<scratch_dir>/checkpoints -- None disables saving regardless of the cfg
+    flag, e.g. gpu_memory_probe.py's throwaway probe runs never pass one).
     """
     # Every rank runs this function identically under DDP (cfg.world_size >
     # 1); gate the purely informational prints to rank 0 so a multi-GPU job
@@ -80,6 +88,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     # the NEXT config's wandb.init() call just reattaches to that still-open
     # run instead of starting its own -- so its metrics silently land under
     # the failed run's name instead of its own.
+    router_trained = None
     try:
         if cfg.run_aux_baseline:
             # Supervised MSE alternative to the policy-gradient router (ablation
@@ -90,7 +99,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 arch="auxnet",
                 d_hidden=cfg.aux_net_hidden,
             )
-            model_router, _ = train_aux_baseline(
+            model_router, router_trained = train_aux_baseline(
                 cfg=cfg,
                 model=model_router,
                 aux_net=aux_net,
@@ -128,7 +137,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 sequence_size=model_router.block,
                 vocab_size=tokenizer.vocab_size,
             )
-            model_router, router = train_router_experiments(
+            model_router, router_trained = train_router_experiments(
                 cfg=cfg,
                 model=model_router,
                 router=router,
@@ -143,6 +152,21 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
         if cfg.rank == 0:
             experiment_metrics.log(total_time_s=total_time_s)
             print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
+
+        if cfg.save_model_at_end and save_dir is not None:
+            # Collective on every rank under FSDP (full_state_dict() gathers
+            # sharded params), so this must run outside any `rank == 0` gate
+            # even though only rank 0 goes on to write the file.
+            lm_state = full_state_dict(model_router, cfg)
+            router_state = full_state_dict(router_trained, cfg) if router_trained is not None else None
+            if cfg.rank == 0:
+                save_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = save_dir / f"{safe_name(cfg.experiment_name)}.pt"
+                torch.save(
+                    {"experiment_name": cfg.experiment_name, "model": lm_state, "router": router_state},
+                    ckpt_path,
+                )
+                print(f"\n=== Saved checkpoint: {ckpt_path} ===")
     finally:
         # The training loops above intentionally leave their wandb run open so
         # total_time_s lands in it too; this closes it once everything's logged
@@ -206,6 +230,7 @@ def main() -> None:
     # happens before run_status records the exception -- the inner context
     # exits first, and the snapshot is only meaningful before unwinding.
     snapshot_dir = (Path(args.status_dir).parent / "snapshots") if args.status_dir else Path("snapshots")
+    save_dir = (Path(args.status_dir).parent / "checkpoints") if args.status_dir else Path("checkpoints")
     with tracker:
         with memory_snapshot.record(snapshot_dir, name, rank=cfg.rank):
             run_single_experiment(
@@ -215,6 +240,7 @@ def main() -> None:
                 val_ds=val_ds,
                 base_metrics=base_metrics,
                 router_metrics=router_metrics,
+                save_dir=save_dir,
             )
 
 

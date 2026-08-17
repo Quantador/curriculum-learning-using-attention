@@ -43,6 +43,7 @@ import json
 import math
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -278,6 +279,31 @@ def eos_token_for(tokenizer_name: str) -> str:
     return eos
 
 
+def _progress_heartbeat(data, rank: int, world_size: int):
+    """Pipeline step that logs a document count every ~60s while it passes through.
+
+    Without this, a task's log file gets exactly two lines -- one when
+    tokenization starts, one when the whole shard has been read -- often
+    20-30+ minutes apart for a single large streamed shard (e.g. a
+    fineweb-100BT task): DocumentTokenizer.write_unshuffled() only tracks
+    counts internally (self.stat_update) and reports them once, at the very
+    end. HuggingFaceDatasetReader's own doc_progress tqdm bar doesn't fill
+    that gap either -- it writes '\\r'-updates straight to stderr, bypassing
+    add_task_logger's per-task file sink (logs/task_NNNNN.log) entirely.
+    """
+    from datatrove.utils.logging import logger
+
+    n = 0
+    last = time.monotonic()
+    for document in data:
+        n += 1
+        now = time.monotonic()
+        if now - last >= 60:
+            logger.info(f"{n:,} documents read so far")
+            last = now
+        yield document
+
+
 def _domain_stats(folder: Path, token_size: int) -> dict:
     files = sorted(folder.glob("*.ds")) if folder.is_dir() else []
     return {
@@ -367,7 +393,8 @@ def build_tokenized_cache(
                     streaming=True,
                     limit=limit,
                     adapter=make_adapter(job["text_col"], job["split_column"]),
-                )
+                ),
+                _progress_heartbeat,
             ]
             if job["split_column"]:
                 pipeline.append(make_domain_filter(domain))

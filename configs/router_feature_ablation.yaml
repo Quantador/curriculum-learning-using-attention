@@ -1,4 +1,4 @@
-experiment_name: gptxl_router_feature_ablation_actual_xl
+experiment_name: gptxl_feature_ablation_slimpajama
 epochs: 10
 global_batch_size: 128
 pool_mult: 10
@@ -18,5 +18,6 @@ hierarchical_layer_index: 6
 # because the baseline here is explicitly false.
 use_original_sequence: false
 sentence_embedder_dim: 768
-dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
-dataset_proportions: [0.7, 0.3]
+split_dataset: true 
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

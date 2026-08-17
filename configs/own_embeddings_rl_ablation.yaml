@@ -1,0 +1,49 @@
+experiment_name: gptxl_oe_rl_ablation_slimpajama_long
+epochs: 1
+global_batch_size: 128
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: 20000000
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+
+# Router input is FIXED here -- this sweep varies only how the router learns
+# (training_algorithm) and what it learns from (reward_signal); see
+# OWN_EMBEDDINGS_RL_ABLATION in consts.py. own_embeddings won the
+# router_feature_ablation sweep, so it is the base every arm shares rather
+# than another axis to vary.
+#
+# The router owns its token+positional embedding tables and learns them from
+# the routing objective alone, never reading the LM's hidden states
+# (models/router.py EmbeddingRouter). Two consequences worth knowing when
+# reading the results:
+#   - extract_router_features() returns the raw ids (models/router.py:124),
+#     so scoring the pool costs an embedding lookup over pool_mult*batch rows
+#     instead of a GPT2-XL forward over them. That is why this config fits at
+#     global_batch_size=128 with room to spare where hierarchical_representation
+#     variants did not.
+#   - the router's own signal is the ONLY thing separating these arms from
+#     random_batch_baseline: the LM training step is identical. Any win is
+#     attributable to selection, not to extra LM compute.
+router_feature_source: own_embeddings
+# Required by config validation: the router's tables replace every other
+# feature group, so leaving these on would describe a router input that is
+# never built.
+enable_text_hierarchical: false
+enable_text_stat: false
+# Both rejected alongside own_embeddings in Config.__post_init__ -- the
+# learned tables change every step (uncacheable), and use_original_sequence
+# would claim the router's input for raw float ids instead.
+use_original_sequence: false
+feature_cache_epochs: 0
+
+# Same corpus as configs/router_feature_ablation.yaml, so this sweep reads the
+# already-built cache (signature f53a436c53edb38d) rather than needing a
+# rebuild -- dataset_signature() covers exactly these three fields plus
+# tokenizer_name/max_documents, so they must match that config verbatim.
+# Domain-split SlimPajama is also the setup DoGE reports on, which makes these
+# runs directly comparable to it.
+split_dataset: true
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

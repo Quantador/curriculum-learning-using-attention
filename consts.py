@@ -238,6 +238,50 @@ ROUTER_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
     ]),
 }
 
+# How the router learns (training_algorithm) and what it learns from
+# (reward_signal), with the router's INPUT held fixed at own_embeddings by
+# configs/own_embeddings_rl_ablation.yaml -- that input won the
+# router_feature_ablation sweep, so this sweep stops varying it and asks the
+# next question instead: given the best features, which objective actually
+# beats uniform random selection?
+#
+# random_batch_baseline is the reference every arm here is judged against and
+# rides along automatically (see generate_experiment_configs) -- it trains the
+# same LM on the same per-step batch size with no router at all, so the only
+# difference is which samples were picked.
+#
+# reward_signal alternatives are the ones with a mechanism for beating random,
+# rather than the full list from EXPERIMENTAL_FIELDS:
+#   gradient_norm      -- prefer batches with large ||grad||, i.e. where the LM
+#                         still has something to learn
+#   gradient_alignment -- <g_t, g_ema>: prefer batches pulling in the same
+#                         direction as recent progress
+#   greats_score       -- GREATS ghost gradient-dot-product against a val batch
+#                         (influence-function style; the only arm here whose
+#                         reward references held-out data)
+#   neg_loss           -- prefer easy samples; included as the directional
+#                         opposite of gradient_norm, so a win either way is
+#                         informative about what the router should chase
+OWN_EMBEDDINGS_RL_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
+    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "reinforce"]),
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], [
+        "gradient_norm",
+        "gradient_alignment",
+        "neg_loss",
+        {
+            # greats_score hands every sample in the batch the SAME scalar, so
+            # the default baseline_type='batch_mean' subtracts the reward from
+            # itself and every advantage is identically zero -- the router
+            # would train on no signal at all and silently look like a null
+            # result. moving_avg is the baseline that survives a constant
+            # reward (see reward_signal's docstring in config.py).
+            "_name": "greats_score",
+            "reward_signal": "greats_score",
+            "baseline_type": "moving_avg",
+        },
+    ]),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -259,7 +303,9 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "compare-router-freeze": COMPARE_ROUTER_FREEZE,  # alias
     "compare_router_update_every": COMPARE_ROUTER_UPDATE_EVERY,
     "compare-router-update-every": COMPARE_ROUTER_UPDATE_EVERY,  # alias
-    "check_greats": CHECK_GREATS
+    "check_greats": CHECK_GREATS,
+    "own_embeddings_rl_ablation": OWN_EMBEDDINGS_RL_ABLATION,
+    "own-embeddings-rl-ablation": OWN_EMBEDDINGS_RL_ABLATION,  # alias
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")
