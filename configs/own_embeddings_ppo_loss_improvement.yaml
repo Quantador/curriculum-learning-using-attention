@@ -1,5 +1,5 @@
 experiment_name: gptxl_oe_slimpajama_full
-epochs: 1
+epochs: 10
 global_batch_size: 512
 pool_mult: 10
 lr_lm: 0.0003

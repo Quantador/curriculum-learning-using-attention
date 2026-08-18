@@ -282,6 +282,36 @@ OWN_EMBEDDINGS_RL_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
     ]),
 }
 
+# Narrow 3-arm cut of OWN_EMBEDDINGS_RL_ABLATION: does greats_score's ghost
+# gradient-dot-product reward (plus its second-order diversity term) beat
+# plain loss_improvement, both under PPO with own_embeddings features? Run
+# with --profile own_embeddings_loss_vs_greats_diversity --no-baseline against
+# configs/own_embeddings_rl_ablation.yaml (unchanged) to get exactly:
+#   - experiment_baseline:     ppo, loss_improvement, own_embeddings
+#   - random_batch_baseline:   same, uniform random selection, no router
+#   - greats_score_diversity:  ppo, greats_score+diversity, own_embeddings
+# training_algorithm is pinned to "ppo" with an EMPTY alternatives list
+# (unlike OWN_EMBEDDINGS_RL_ABLATION above, which sweeps it) -- baseline_values
+# still picks up "ppo" for every reference/arm config, but the empty list
+# means the one-factor-at-a-time loop contributes zero grpo/reinforce arms.
+OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY: Dict[str, tuple[Any, List[Any]]] = {
+    "training_algorithm": ("ppo", []),
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], [  # "loss_improvement"
+        {
+            # Same moving_avg rationale as OWN_EMBEDDINGS_RL_ABLATION's
+            # greats_score combo above, plus the redundancy penalty
+            # (config.py greats_diversity_term docstring), which needs
+            # greats_log_grad_norms=True for the per-sample gradient norms it
+            # sums.
+            "_name": "greats_score_diversity",
+            "reward_signal": "greats_score",
+            "baseline_type": "moving_avg",
+            "greats_diversity_term": True,
+            "greats_log_grad_norms": True,
+        },
+    ]),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -306,6 +336,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "check_greats": CHECK_GREATS,
     "own_embeddings_rl_ablation": OWN_EMBEDDINGS_RL_ABLATION,
     "own-embeddings-rl-ablation": OWN_EMBEDDINGS_RL_ABLATION,  # alias
+    "own_embeddings_loss_vs_greats_diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,
+    "own-embeddings-loss-vs-greats-diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,  # alias
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

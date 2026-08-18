@@ -49,7 +49,7 @@ from config import ExperimentConfig
 from data import make_pool_loader, TokenizedCorpus
 from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
 from utils.metrics import MetricsTracker, DiversityTracker
-from training import evaluate, evaluate_per_domain  # keep using your existing evaluate()
+from training import evaluate_per_domain
 from models.router import extract_router_features
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 from utils.rl_utils import grpo_update, ppo_update, reinforce_update
@@ -1313,7 +1313,7 @@ def train_router_experiments(
             if coverage_tracker is not None:
                 coverage_tracker.update(selected_indices, loss_after)
 
-            diversity.update(selected_indices, selected_domains)
+            diversity.update(selected_indices, selected_domains, loss_before.tolist())
 
             # --- Logging ---
             global_step += 1
@@ -1382,6 +1382,11 @@ def train_router_experiments(
             if budget_reached:
                 break
 
+        # Collective (all_gather_object under world_size>1) -- every rank must
+        # reach this the same number of times, so it's called here, before the
+        # this_rank_evaluates gate below (which excludes non-zero DDP ranks).
+        train_ppl_domain = diversity.get_train_ppl_domain(world_size=cfg.world_size)
+
         # --- Validation ---
         # val_ds is small and identical on every rank. Under DDP only rank 0
         # evaluates and the others wait at the barrier below, so nobody starts
@@ -1390,7 +1395,7 @@ def train_router_experiments(
         # compute the same number, so logging still happens on rank 0 only.
         if this_rank_evaluates:
             loss_fn = nn.CrossEntropyLoss()
-            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
+            (val_loss, val_ppl), per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
 
             epoch_time = time.perf_counter() - epoch_start
             if cfg.rank == 0:
@@ -1400,6 +1405,8 @@ def train_router_experiments(
                     val_loss=val_loss,
                     val_ppl=val_ppl,
                     epoch_time_s=epoch_time,
+                    **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+                    **train_ppl_domain,
                 )
 
                 print(
@@ -1413,20 +1420,14 @@ def train_router_experiments(
         if budget_reached:
             break
 
-    # --- Final per-domain perplexity, fully trained model ---
-    # Same rank gating as the per-epoch validation above.
-    if this_rank_evaluates:
-        loss_fn = nn.CrossEntropyLoss()
-        per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
-        if cfg.rank == 0:
-            metrics.log(
-                step=global_step,
-                **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
-            )
-            print(
-                "[Final per-domain val perplexity] "
-                + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
-            )
+    # per_domain_ppl is left over from the last epoch's evaluate_per_domain()
+    # call above -- already logged there, so this is just the human-readable
+    # summary of the fully trained model, with no extra forward pass.
+    if this_rank_evaluates and cfg.rank == 0:
+        print(
+            "[Final per-domain val perplexity] "
+            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+        )
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this
@@ -1589,7 +1590,7 @@ def train_aux_baseline(
             loss_aux.backward()
             opt_aux.step()
 
-            diversity.update(selected_indices, selected_diffs)
+            diversity.update(selected_indices, selected_diffs, loss_before.tolist())
 
             global_step += 1
             if global_step % cfg.log_every == 0:
@@ -1638,8 +1639,13 @@ def train_aux_baseline(
         # DDP: rank 0 alone evaluates the unwrapped replica, others wait at
         # the barrier below. FSDP: every rank must join the sharded forward's
         # all-gathers. See utils/distributed_utils.eval_handles().
+        # Collective (all_gather_object under world_size>1) -- every rank must
+        # reach this the same number of times, so it's called here, before the
+        # this_rank_evaluates gate below (which excludes non-zero DDP ranks).
+        train_ppl_domain = diversity.get_train_ppl_domain(world_size=cfg.world_size)
+
         if this_rank_evaluates:
-            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
+            (val_loss, val_ppl), per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
             epoch_time = time.perf_counter() - epoch_start
             if cfg.rank == 0:
                 metrics.log(
@@ -1648,6 +1654,8 @@ def train_aux_baseline(
                     val_loss=val_loss,
                     val_ppl=val_ppl,
                     epoch_time_s=epoch_time,
+                    **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+                    **train_ppl_domain,
                 )
                 print(
                     f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "

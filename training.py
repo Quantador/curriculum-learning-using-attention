@@ -8,7 +8,9 @@ Reference training loop used for the baseline comparison.
 For the full experiment-grade loop with configurable algorithms (REINFORCE/GRPO/PPO),
 reward signals, entropy formulations, and feature caching, see rl_training.py.
 
-evaluate() is shared by train_baseline() and rl_training.py.
+evaluate_per_domain() (which also gives the aggregate) is shared by
+train_baseline() and rl_training.py; evaluate() is the plain aggregate-only
+building block it's defined against.
 """
 from __future__ import annotations
 
@@ -85,15 +87,14 @@ def evaluate_per_domain(
     loss_fn: nn.Module,
     cfg: Config,
     batch_size: int = 64,
-) -> Dict[str, Tuple[float, float]]:
+) -> Tuple[Tuple[float, float], Dict[str, Tuple[float, float]]]:
     """
-    Like evaluate(), but broken out per domain: one (avg_loss, perplexity)
-    pair per distinct domain in ds, computed in a single pass over ds.
-
-    Meant for a one-off "final perplexity per domain" report on the fully
-    trained model (e.g. at the end of training), not per-epoch logging --
-    call evaluate() for the cheap aggregate val_loss/val_ppl tracked every
-    epoch instead.
+    Like evaluate(), but also broken out per domain: one (avg_loss, perplexity)
+    pair per distinct domain in ds, computed in the SAME single pass over ds
+    that produces the aggregate -- so this is safe to call every epoch in
+    place of evaluate() instead of only as a one-off final report; the
+    per-domain bookkeeping adds no extra pass, just a per-sample loss and a
+    dict update per batch.
 
     Batched like evaluate() via the same kind of sequential DataLoader (same
     no-padding argument), but needs a per-sample loss to split by domain, so
@@ -104,6 +105,11 @@ def evaluate_per_domain(
     Keyed by domain name (ds.domain_names[domain_id]) when ds carries one,
     falling back to str(domain_id) otherwise -- matches DiversityTracker's
     domain_ratio/{name} convention so the two line up in W&B.
+
+    Returns ((agg_avg_loss, agg_ppl), {domain_name: (avg_loss, ppl)}) -- the
+    aggregate is the exact same token-weighted average evaluate() computes
+    over the same ds, just derived from the same per-domain sums instead of
+    a second pass.
     """
     model.eval()
     domain_loss: Dict[int, float] = defaultdict(float)
@@ -138,10 +144,15 @@ def evaluate_per_domain(
         return str(domain_id)
 
     results = {}
+    total_loss, total_tok = 0.0, 0
     for domain_id, loss_sum in domain_loss.items():
-        avg_loss = loss_sum / max(1, domain_tok[domain_id])
+        tok = domain_tok[domain_id]
+        avg_loss = loss_sum / max(1, tok)
         results[label(domain_id)] = (avg_loss, math.exp(avg_loss))
-    return results
+        total_loss += loss_sum
+        total_tok += tok
+    agg_avg_loss = total_loss / max(1, total_tok)
+    return (agg_avg_loss, math.exp(agg_avg_loss)), results
 
 
 def train_baseline(
@@ -223,7 +234,15 @@ def train_baseline(
             loss.backward()
             opt.step()
 
-            diversity.update(selected_indices, diffs)
+            # Per-sample loss for diversity's train_ppl_domain/* tracking --
+            # reuses this step's already-computed logits (detached, no extra
+            # forward pass), just a differently-reduced view of the same CE.
+            with torch.no_grad():
+                B, L, V = logits.shape
+                per_sample_loss = F.cross_entropy(
+                    logits.detach().view(B * L, V), Y.view(B * L), reduction="none"
+                ).view(B, L).mean(dim=1)
+            diversity.update(selected_indices, diffs, per_sample_loss.tolist())
 
             global_step += 1
             if global_step % cfg.log_every == 0:
@@ -260,19 +279,26 @@ def train_baseline(
             if budget_reached:
                 break
 
+        # Collective (all_gather_object under world_size>1) -- every rank must
+        # reach this the same number of times, so it's called here, before the
+        # this_rank_evaluates gate below (which excludes non-zero DDP ranks).
+        train_ppl_domain = diversity.get_train_ppl_domain(world_size=cfg.world_size)
+
         # DDP: rank 0 alone evaluates the unwrapped replica, others wait at
         # the barrier below so nobody starts the next epoch's synchronizing
         # .backward() mid-eval. FSDP: every rank must join the sharded
         # forward's all-gathers, and all compute the same number, so only
         # rank 0 logs. See utils/distributed_utils.eval_handles().
         if this_rank_evaluates:
-            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
+            (val_loss, val_ppl), per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
             if cfg.rank == 0:
                 metrics.log(
                     epoch=epoch,
                     step=global_step,
                     val_loss=val_loss,
                     val_ppl=val_ppl,
+                    **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+                    **train_ppl_domain,
                 )
                 print(
                     f"[Baseline] Epoch {epoch+1}/{cfg.epochs} "
@@ -284,19 +310,14 @@ def train_baseline(
         if budget_reached:
             break
 
-    # --- Final per-domain perplexity, fully trained model ---
-    # Same rank gating as the per-epoch validation above.
-    if this_rank_evaluates:
-        per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
-        if cfg.rank == 0:
-            metrics.log(
-                step=global_step,
-                **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
-            )
-            print(
-                "[Final per-domain val perplexity] "
-                + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
-            )
+    # per_domain_ppl is left over from the last epoch's evaluate_per_domain()
+    # call above -- already logged there, so this is just the human-readable
+    # summary of the fully trained model, with no extra forward pass.
+    if this_rank_evaluates and cfg.rank == 0:
+        print(
+            "[Final per-domain val perplexity] "
+            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+        )
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this

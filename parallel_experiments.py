@@ -724,7 +724,7 @@ def main() -> None:
     parser.add_argument("--single", action="store_true", help="Run exactly the config given by --config, with no ablation generation. What each --submit job invokes")
     parser.add_argument("--submit", action="store_true", help="Submit one sbatch job per experiment instead of running them here; each job runs its config DDP across one node's GPUs")
     parser.add_argument("--submit-dry-run", action="store_true", help="With --submit: write the job scripts but do not call sbatch")
-    parser.add_argument("--submit-time", type=str, default="04:30:00", help="Wall clock per submitted job (default 03:00:00)")
+    parser.add_argument("--submit-time", type=str, default="08:00:00", help="Wall clock per submitted job (default 03:00:00)")
     parser.add_argument("--submit-partition", type=str, default="normal", help="Partition for submitted jobs (default normal)")
     parser.add_argument("--submit-account", type=str, default="infra01", help="Account for submitted jobs (default infra01)")
     parser.add_argument("--submit-nodes", type=int, default=1, help="Nodes per submitted job (default 1)")

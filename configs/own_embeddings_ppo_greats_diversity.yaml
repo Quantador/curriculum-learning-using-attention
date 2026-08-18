@@ -1,0 +1,45 @@
+experiment_name: gptxl_oe_ppo_greats_diversity_slimpajama_full
+epochs: 1
+global_batch_size: 512
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: -1
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+
+# Second arm of the loss_improvement-vs-greats_score comparison, paired with
+# configs/own_embeddings_ppo_loss_improvement.yaml. training_algorithm is
+# explicit for the same reason as that file: the ExperimentConfig dataclass
+# default is 'reinforce', not 'ppo' (config.py), and this is meant to run
+# directly via --single rather than through generate_experiment_configs()'s
+# baseline-injection.
+training_algorithm: ppo
+reward_signal: greats_score
+# greats_score hands every sample in the batch the SAME scalar (sum of ghost
+# gradient-dot-product scores against a val batch, config.py reward_signal
+# docstring) -- batch_mean would subtract the reward from itself and every
+# advantage would be identically zero. moving_avg is the baseline that
+# survives a constant reward (see OWN_EMBEDDINGS_RL_ABLATION's greats_score
+# combo in consts.py, which this mirrors).
+baseline_type: moving_avg
+# Second-order redundancy penalty on top of the first-order greats_score
+# reward (config.py greats_diversity_term docstring); requires
+# greats_log_grad_norms=True for the per-sample gradient norms it needs.
+greats_diversity_term: true
+greats_log_grad_norms: true
+
+# Router input is FIXED to own_embeddings -- see the matching comment block in
+# configs/own_embeddings_rl_ablation.yaml for the full rationale.
+router_feature_source: own_embeddings
+enable_text_hierarchical: false
+enable_text_stat: false
+use_original_sequence: false
+feature_cache_epochs: 0
+
+# Same corpus/signature as configs/own_embeddings_rl_ablation.yaml -- keep
+# these three verbatim so dataset_signature() still resolves to the existing
+# cache instead of demanding a rebuild.
+split_dataset: true
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]
