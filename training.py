@@ -29,6 +29,7 @@ from models.model import TinyGPT
 from utils.general_utils import autocast_ctx
 from utils.distributed_utils import eval_handles, wrap_model
 from utils.metrics import MetricsTracker, DiversityTracker
+from utils.muon_optimizer import build_optimizer
 
 
 def evaluate(
@@ -186,7 +187,7 @@ def train_baseline(
     eval_model, this_rank_evaluates = eval_handles(model, cfg)
 
     loss_fn = nn.CrossEntropyLoss()
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt = build_optimizer(model, cfg)
 
     global_step = 0
     total_tokens_seen = 0
@@ -221,6 +222,8 @@ def train_baseline(
                     Y.view(-1),
                 )
             loss.backward()
+            if cfg.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             opt.step()
 
             diversity.update(selected_indices, diffs)

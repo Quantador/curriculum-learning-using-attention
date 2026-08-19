@@ -1,0 +1,22 @@
+# Custom MMLU task matching OPUS's evaluation protocol (arXiv:2602.05400, Section 6.1):
+# zero-shot, scoring each choice's FULL ANSWER TEXT via log-likelihood (output_type:
+# multiple_choice with doc_to_choice returning the choice strings themselves), not the
+# default letter-label (A/B/C/D) scoring -- the paper notes the letter-label version gives
+# near-random results on non-instruction-tuned base models, which is what this project
+# trains.
+task: mmlu_full_answer
+dataset_path: cais/mmlu
+dataset_name: all
+test_split: test
+fewshot_split: dev
+output_type: multiple_choice
+doc_to_text: "{{question.strip()}}\nAnswer:"
+doc_to_choice: "{{choices}}"
+doc_to_target: answer
+num_fewshot: 0
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
