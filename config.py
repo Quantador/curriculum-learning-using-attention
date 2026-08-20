@@ -61,6 +61,15 @@ class Config:
     # as before.
     max_tokens: int | None = None
     lr_lm: float = 3e-4
+    # LM optimizer: 'adamw' (default, current behavior) or 'muon' (OPUS-style hybrid --
+    # Muon on 2D matrix weights inside model.transformer_blocks(), AdamW on everything else;
+    # see utils/muon_optimizer.py). lr_lm is reused as the AdamW sub-group's LR when
+    # lm_optimizer='muon'; lr_muon is the Muon sub-group's LR (unused otherwise).
+    lm_optimizer: str = "adamw"
+    lr_muon: float = 0.02
+    # Global gradient-norm clip applied to the LM's parameters before opt_lm.step(), for any
+    # lm_optimizer. None = no clipping (current behavior).
+    grad_clip_norm: float | None = None
     lr_router: float = 1e-3
     temp: float = 1.0
     lambda_ent: float = 0.005
@@ -143,6 +152,20 @@ class Config:
                 f"supported (expected 'bf16', 'fp16' or 'none')."
             )
 
+        if self.lm_optimizer not in ("adamw", "muon"):
+            raise ValueError(
+                f"lm_optimizer={self.lm_optimizer!r} is not supported (expected 'adamw' or 'muon')."
+            )
+
+        if self.lm_optimizer == "muon" and self.distributed == "FSDP":
+            raise ValueError(
+                "lm_optimizer='muon' is not supported with distributed='FSDP': FSDP2 shards "
+                "parameters/gradients as DTensors, and Muon's Newton-Schulz orthogonalization "
+                "(X @ X.T over a row-shard) is not equivalent to the same operation on the full "
+                "matrix. checkpoint saving (_save_checkpoint) also has no FSDP2 unwrap path. Use "
+                "distributed='DDP', or implement FSDP2-aware support for both before lifting this."
+            )
+
         if self.hierarchical_representation == "layer":
             if self.hierarchical_layer_index is None:
                 raise ValueError(
@@ -156,7 +179,7 @@ class Config:
                     f"{self.n_layers})."
                 )
 
-        if self.use_curriculum_ratio_schedule:
+        if getattr(self, "use_curriculum_ratio_schedule", False):
             if not (0.0 < self.curriculum_ratio_min <= self.curriculum_ratio_initial <= 1.0):
                 raise ValueError(
                     "use_curriculum_ratio_schedule requires "
