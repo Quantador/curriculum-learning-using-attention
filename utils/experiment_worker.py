@@ -21,6 +21,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from config import load_config_from_yaml
 from data import get_tokenizer
 from utils.shared_dataset import load_dataset_cache
@@ -33,6 +36,83 @@ from config import ExperimentConfig, load_config_from_yaml
 from utils.general_utils import resolve_device, safe_name, set_seed
 from utils import memory_snapshot, run_status
 from utils.distributed_utils import full_state_dict
+
+def _save_checkpoint(cfg, model, router_or_aux, save_dir: Path) -> Path:
+    """Save the trained LM (and router/aux_net, if any) to <save_dir>/<name>.pt, per
+    cfg.save_model_at_end's docstring in config.py. DDP wraps are unwrapped first so the
+    saved state_dict's keys match a plain (unwrapped) model -- DDP otherwise prefixes every
+    key with "module.", which a later model.load_state_dict(...) on an unwrapped model
+    would reject."""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    path = save_dir / f"{safe_name(cfg.experiment_name)}.pt"
+
+    raw_model = model.module if isinstance(model, DDP) else model
+    state = {"model": raw_model.state_dict()}
+    if router_or_aux is not None:
+        raw_router = router_or_aux.module if isinstance(router_or_aux, DDP) else router_or_aux
+        state["router"] = raw_router.state_dict()
+
+    torch.save(state, path)
+    return path
+
+
+def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
+    """Best-effort OPUS-comparable benchmark eval at the end of a training run.
+
+    NEVER raises. The checkpoint written by _save_checkpoint() just before this call is
+    already on disk and is a complete, independent recovery path (evaluate_checkpoint.py),
+    so a failure here -- a transient HF Hub error, an OOM from running eval on the GPU
+    training just finished on, an lm-eval registry skew -- must not mark a multi-day
+    training run as failed, nor skip the caller's total_time_s logging.
+
+    Called on rank 0 only (see run_single_experiment); `model` may still be the
+    DDP-wrapped object every training loop returns when cfg.world_size > 1.
+    """
+    try:
+        from utils.eval_harness import run_eval_suite, suite_averages
+        import json
+
+        # Unwrap DDP *before* asking for .hf: all three training loops return the
+        # DDP-wrapped model when cfg.world_size > 1 (the real --submit Slurm path), and DDP
+        # defines no __getattr__ passthrough, so hasattr(wrapper, "hf") is always False --
+        # the raw DistributedDataParallel object would otherwise be handed to lm-eval's
+        # HFLM, which reads self._model.device and raises AttributeError.
+        raw_model = model.module if isinstance(model, DDP) else model
+        hf_model = getattr(raw_model, "hf", None)
+        if hf_model is None:
+            # Not an error: run_eval_suite drives lm-eval's HFLM, which needs a real
+            # transformers.PreTrainedModel. TinyGPT (the default model_type) has no .hf to
+            # hand it, so there is simply nothing here for this harness to evaluate.
+            print(
+                "[eval] skipping OPUS-comparable eval suite: needs model_type='hf_pretrained' "
+                f"(got {cfg.model_type!r})"
+            )
+            return
+
+        print("\n=== Running OPUS-comparable eval suite ===")
+        scores = run_eval_suite(hf_model, tokenizer, cfg)
+        averages = suite_averages(scores)
+        experiment_metrics.log(**{f"eval/{k}": v for k, v in scores.items()}, **averages)
+
+        # Raw cfg.experiment_name (NOT safe_name): rl_training.py already writes into
+        # results/<cfg.experiment_name>/ with the raw name, and both evaluate_checkpoint.py
+        # and compare_to_opus.py assume that same directory shape. safe_name() is
+        # deliberately scoped to the checkpoint .pt filename only.
+        eval_out_dir = Path("results") / cfg.experiment_name
+        eval_out_dir.mkdir(parents=True, exist_ok=True)
+        (eval_out_dir / "eval_scores.json").write_text(
+            json.dumps({**scores, **averages}, indent=2)
+        )
+        print(json.dumps(averages, indent=2))
+    except Exception:
+        import traceback
+
+        print(
+            "[eval] OPUS-comparable eval suite failed; continuing without it (the checkpoint "
+            "is already saved and independently evaluable via evaluate_checkpoint.py)."
+        )
+        traceback.print_exc()
 
 def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics,
                           save_dir: Path | None = None):
@@ -148,6 +228,19 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 diversity=router_div,
             )
 
+        if cfg.save_model_at_end and save_dir is not None and cfg.rank == 0:
+            router_obj = None
+            if cfg.run_aux_baseline:
+                router_obj = aux_net
+            elif not (cfg.run_random_batch_baseline or cfg.run_random_pool_baseline):
+                router_obj = router
+            ckpt_path = _save_checkpoint(cfg, model_router, router_obj, save_dir)
+            print(f"[checkpoint] saved to {ckpt_path}")
+
+            # Best-effort, never raises -- see _end_of_training_eval's docstring. The
+            # total_time_s logging below must happen even if the eval suite falls over.
+            _end_of_training_eval(cfg, model_router, tokenizer, experiment_metrics)
+
         total_time_s = time.perf_counter() - run_start
         if cfg.rank == 0:
             experiment_metrics.log(total_time_s=total_time_s)
@@ -196,6 +289,11 @@ def main() -> None:
              "Omitted when running this worker by hand; parallel_experiments.py "
              "always passes the sweep's status dir.",
     )
+    parser.add_argument(
+        "--save-dir", default=None,
+        help="Directory to checkpoint the trained model into when cfg.save_model_at_end is "
+             "set (omitted when running this worker by hand without --save-model).",
+    )
     args = parser.parse_args()
 
     cfg = load_config_from_yaml(args.config)
@@ -240,7 +338,7 @@ def main() -> None:
                 val_ds=val_ds,
                 base_metrics=base_metrics,
                 router_metrics=router_metrics,
-                save_dir=save_dir,
+                save_dir=Path(args.save_dir) if args.save_dir else None,
             )
 
 

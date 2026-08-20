@@ -343,6 +343,7 @@ def run_scheduler(
                 "--config", str(cfg_path),
                 "--dataset-cache", str(dataset_cache_by_name[cfg.experiment_name]),
                 "--status-dir", str(status_dir),
+                "--save-dir", str(scratch_dir / "checkpoints"),
             ],
             stdout=log_f, stderr=subprocess.STDOUT, env=env,
         )

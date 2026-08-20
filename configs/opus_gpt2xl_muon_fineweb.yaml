@@ -1,0 +1,40 @@
+experiment_name: opus_gpt2xl_muon_fineweb
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+lm_optimizer: muon
+# OPUS's paper (Section 6.1) gives base LR values for GPT-2 XL + Muon (lr_lm/lr_muon below)
+# and Muon's own momentum warmup, but doesn't fully specify a warmup/decay schedule for the
+# GPT-2 runs specifically (only for the separate Qwen3 CPT setting). This codebase currently
+# has no LR-scheduler infrastructure at all (every training loop uses a flat cfg.lr_lm for
+# the whole run) -- adding one is real new scope beyond what this comparison plan covers, so
+# lr_lm/lr_muon are used as constant values here. This is a known limitation versus OPUS's
+# (unspecified) actual schedule; revisit if a warmup/decay schedule turns out to matter for
+# closing the gap to their number.
+lr_lm: 0.002
+lr_muon: 0.01
+grad_clip_norm: 1.0
+epochs: 1
+block: 256
+global_batch_size: 640
+pool_mult: 10
+max_chunks: 130000000
+max_tokens: 30000000000
+dataset_list: ["HuggingFaceFW/fineweb-100BT"]
+dataset_proportions: [1]
+save_model_at_end: true
+use_wandb: true
+# Documented-baseline router (see consts.py's EXPERIMENTAL_FIELDS baseline_values) --
+# written out explicitly even though these match ExperimentConfig's own defaults, so this
+# file is self-describing.
+router_architecture: attention
+training_algorithm: ppo
+reward_signal: loss_improvement
+selection_strategy: topk
+baseline_type: batch_mean
+temp_schedule: fixed
+entropy_schedule: fixed
+entropy_type: shannon
+use_entropy_targeting: false
+use_coverage_regularization: false
+feature_cache_epochs: 0
+use_original_sequence: false

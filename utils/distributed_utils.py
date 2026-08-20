@@ -23,6 +23,7 @@ needed.
 """
 from __future__ import annotations
 
+import datetime
 import os
 from typing import Tuple
 
@@ -51,6 +52,19 @@ except ImportError:
 
 _MP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "none": None}
 
+# Process-group collective timeout. Torch's default is 10 minutes (NCCL) / 30 minutes (gloo),
+# which is far too tight for this codebase's actual rank-skew: parallel_experiments.py's
+# run_ddp_sweep() holds every rank at a dist.barrier() at each config boundary while rank 0
+# alone runs the end-of-training OPUS eval suite. That suite was measured at ~30-90 minutes on
+# a CPU dev machine; a GPU node should be faster, but 22 benchmark tasks against a 1.5B model
+# is comfortably a multi-ten-minute job either way.
+# With the default timeout the non-zero ranks' barrier wait expires and NCCL's watchdog aborts
+# the whole job -- destroying a possibly multi-day training run that already finished
+# successfully. 3 hours leaves real margin above that worst case. A long timeout costs nothing
+# for a research training job with no SLA: it only delays how quickly a genuine hang is
+# reported as one.
+_PG_TIMEOUT = datetime.timedelta(hours=3)
+
 
 def setup_distributed() -> Tuple[int, int, int]:
     """
@@ -76,7 +90,9 @@ def setup_distributed() -> Tuple[int, int, int]:
         # without real GPU hardware.
         backend = "gloo"
 
-    dist.init_process_group(backend=backend, init_method="env://")
+    # timeout: see _PG_TIMEOUT above -- rank 0 can legitimately be up to ~90 minutes behind
+    # the other ranks at a barrier while it runs the end-of-training eval suite.
+    dist.init_process_group(backend=backend, init_method="env://", timeout=_PG_TIMEOUT)
     return rank, local_rank, world_size
 
 

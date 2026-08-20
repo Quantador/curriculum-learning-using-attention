@@ -55,6 +55,7 @@ from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 from utils.rl_utils import grpo_update, ppo_update, reinforce_update
 from utils.general_utils import autocast_ctx
 from utils.distributed_utils import eval_handles, wrap_model, wrap_replica
+from utils.muon_optimizer import build_optimizer
 
 @torch.no_grad()
 def compute_loss_per_sample_vectorized(
@@ -788,7 +789,7 @@ def train_router_experiments(
     # utils/distributed_utils.eval_handles().
     eval_model, this_rank_evaluates = eval_handles(model, cfg)
 
-    opt_lm = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt_lm = build_optimizer(model, cfg)
     opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
     grad_params = [p for p in model.parameters() if p.requires_grad]
@@ -1169,6 +1170,8 @@ def train_router_experiments(
                         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                         p.grad.div_(cfg.world_size)
 
+            if cfg.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             opt_lm.step()
 
             # Skip it on steps that won't perform a router update (router_update_due is
@@ -1492,7 +1495,7 @@ def train_aux_baseline(
     print(f"{aux_net=}")
     loss_fn = nn.CrossEntropyLoss()
     mse_fn  = nn.MSELoss()
-    opt_lm  = torch.optim.AdamW(model.parameters(), lr=cfg.lr_lm, weight_decay=0.0)
+    opt_lm  = build_optimizer(model, cfg)
     opt_aux = torch.optim.AdamW(aux_net.parameters(), lr=cfg.lr_router, weight_decay=0.0)
 
     # // world_size before // per_rank_pool_size: under DDP each rank only
@@ -1576,6 +1579,8 @@ def train_aux_baseline(
                 Y_sel.view(-1),
             )
             loss_lm.backward()
+            if cfg.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             opt_lm.step()
 
             with torch.no_grad(), autocast_ctx(cfg.device):
