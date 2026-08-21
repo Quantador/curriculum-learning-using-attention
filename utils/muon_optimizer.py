@@ -180,6 +180,13 @@ class MultiOptimizer:
     def __init__(self, optimizers: list[torch.optim.Optimizer]):
         self.optimizers = optimizers
 
+    @property
+    def param_groups(self) -> list[dict]:
+        """Flattened param groups across all wrapped optimizers, so callers (e.g. the WSD
+        scheduler in utils/lr_scheduler.py) can read/scale each group's lr without knowing
+        whether cfg.lm_optimizer split the model across more than one underlying optimizer."""
+        return [group for opt in self.optimizers for group in opt.param_groups]
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=set_to_none)

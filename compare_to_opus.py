@@ -2,9 +2,14 @@
 published Table 3 (GPT-2 XL + Muon + FineWeb, in-domain) and Table 5 (out-of-distribution)
 numbers, arXiv:2602.05400.
 
-Usage:
-    python compare_to_opus.py results/opus_gpt2xl_muon_fineweb \
-        [results/opus_gpt2xl_muon_fineweb_random_baseline]
+Usage: pass each run's own timestamped directory (the one holding its configs/, logs/ and
+checkpoints/); this reads <dir>/eval_scores.json from each.
+
+    python compare_to_opus.py results/_parallel_run/<timestamp>_experiment_baseline \
+        [results/_parallel_run/<timestamp>_random_batch_baseline]
+
+Any directory containing an eval_scores.json works -- these are positional paths, not
+names looked up under a fixed root.
 
 Scale: eval_scores.json stores fractions in [0, 1] (lm-evaluation-harness's native accuracy
 scale -- see utils/eval_harness.py), while the OPUS tables below are percentages on a 0-100
