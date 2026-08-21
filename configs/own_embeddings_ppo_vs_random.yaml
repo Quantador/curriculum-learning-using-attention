@@ -1,0 +1,70 @@
+experiment_name: gptxl_oe_ppo_vs_random_slimpajama
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+lr_lm: 0.0003 # Make this smaller 
+block: 256
+global_batch_size: 512
+pool_mult: 10
+use_wandb: true
+
+# One `epochs` iteration = ~1/10 of SlimPajama-6B, NOT a full pass over it.
+#
+# PooledBatchSampler / make_pool_loader define an epoch as
+# len(train_ds) // pool_size steps, where pool_size = pool_mult *
+# global_batch_size -- each step scores a 5120-sample pool and trains on the
+# 512 the router (or random) picks, DISCARDING the other 9/10. So with
+# pool_mult=10 a single epoch touches only ~1/10 of the corpus; seeing all of
+# it would take epochs: 10 (pools reshuffle per epoch via set_epoch()).
+#
+# Measured against the built cache (results/dataset_cache/f53a436c53edb38d,
+# 5,827,933,027 train tokens -> 22,676,782 windows at block=256):
+#   4,429 steps/epoch x 512 x 256 = 581M tokens/epoch (of the 5.83B corpus)
+# (4,429 is exactly the step count the earlier gptxl_oe_slimpajama_full runs
+# reported, which is what confirms this arithmetic against a real run.)
+#
+# epochs: 1 is also what keeps this inside the `debug` partition's 1:30 wall
+# clock -- those same 16-GPU runs took 59min (router) and 41min (random) for
+# one epoch, so epochs: 10 would need `normal`/`low` instead.
+epochs: 1
+max_chunks: -1
+
+# Both arms checkpoint to <scratch_dir>/checkpoints/<experiment_name>.pt so the
+# two trained models can be compared directly afterwards, not just via their
+# logged curves. Safe here because the two arms get DISTINCT experiment_names
+# from the profile (experiment_baseline / random_batch_baseline) -- two configs
+# sharing one experiment_name would silently overwrite each other's checkpoint
+# (utils/experiment_worker.py's _save_checkpoint names the file after it).
+save_model_at_end: true
+
+# Router input is FIXED to own_embeddings for the router arm; the profile
+# (OWN_EMBEDDINGS_PPO_VS_RANDOM in consts.py) varies nothing about it and only
+# pins ppo/loss_improvement, so the ONLY difference between the two generated
+# arms is whether a router selects the batch at all.
+#
+# The router owns its token+positional embedding tables and learns them from
+# the routing objective alone, never reading the LM's hidden states
+# (models/router.py EmbeddingRouter) -- so scoring the pool costs an embedding
+# lookup over pool_mult*batch rows instead of a GPT2-XL forward over them.
+# These fields are inert in the random_batch_baseline arm (train_baseline()
+# builds no router), and are kept identical across both purely so the two
+# dumped configs diff down to run_random_batch_baseline alone.
+router_feature_source: own_embeddings
+# Required by config validation: the router's learned tables replace every
+# other feature group, so leaving these on would describe a router input that
+# is never built.
+enable_text_hierarchical: false
+enable_text_stat: false
+# Both rejected alongside own_embeddings in Config.__post_init__ -- the learned
+# tables change every step (uncacheable), and use_original_sequence would claim
+# the router's input for raw float ids instead.
+use_original_sequence: false
+feature_cache_epochs: 0
+
+# Same corpus as configs/own_embeddings_rl_ablation.yaml, so this reads the
+# already-built cache (signature f53a436c53edb38d) rather than needing a
+# rebuild -- dataset_signature() covers exactly these three fields plus
+# tokenizer_name/max_documents, so they must match that config verbatim.
+# Domain-split SlimPajama is also the setup DoGE reports on.
+split_dataset: true
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

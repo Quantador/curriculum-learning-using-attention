@@ -1,0 +1,23 @@
+# SuperGLUE AX-g (Winogender gender-bias diagnostic), part of OPUS's Table 5 OOD suite.
+#
+# Same situation as super_glue_axb.yaml: unregistered in lm-eval-harness 0.4.12, but
+# `aps/super_glue` config axg carries a labelled 356-row test split
+# (ClassLabel(entailment/not_entailment), no hidden -1), so it is scorable locally.
+#
+# AX-g already names its fields premise/hypothesis, exactly as lm-eval's
+# super_glue/rte/default.yaml does, so this is that config with the dataset_name and
+# split swapped -- label encoding is identical (0 = entailment -> 'True').
+task: super_glue_axg
+dataset_path: aps/super_glue
+dataset_name: axg
+output_type: multiple_choice
+test_split: test
+doc_to_text: "{{premise}}\nQuestion: {{hypothesis}} True or False?\nAnswer:"
+doc_to_target: label
+doc_to_choice: ['True', 'False']
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
