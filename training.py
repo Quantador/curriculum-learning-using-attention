@@ -245,7 +245,7 @@ def train_baseline(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             if cfg.lr_schedule == "wsd":
                 lr_mult = wsd_multiplier(
-                    global_step / total_steps, cfg.lr_warmup_frac, cfg.lr_decay_frac, cfg.lr_min_ratio,
+                    global_step / total_steps, global_step, cfg.lr_warmup_steps, cfg.lr_decay_frac, cfg.lr_min_ratio,
                 )
                 for group, peak in zip(opt.param_groups, peak_lrs):
                     group["lr"] = peak * lr_mult

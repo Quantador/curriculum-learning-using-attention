@@ -31,7 +31,8 @@ import math
 
 def wsd_multiplier(
     progress: float,
-    warmup_frac: float = 0.0,
+    current_step: int, 
+    warmup_steps: int,
     decay_frac: float = 0.2,
     min_lr_ratio: float = 0.0,
 ) -> float:
@@ -43,8 +44,8 @@ def wsd_multiplier(
     lr_lm in utils/muon_optimizer.build_optimizer()) scaled proportionally to
     their own configured peak instead of sharing one.
     """
-    if warmup_frac > 0.0 and progress < warmup_frac:
-        return progress / warmup_frac
+    if warmup_steps > 0.0 and current_step < warmup_steps:
+        return current_step / warmup_steps
 
     stable_end = 1.0 - decay_frac
     if decay_frac <= 0.0 or progress <= stable_end:

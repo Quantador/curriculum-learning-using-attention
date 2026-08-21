@@ -959,7 +959,7 @@ def train_router_experiments(
             # here, before this step's opt_lm.step() and before the GREATS reward's Taylor
             # expansion below (which needs the LR actually used this step, not the static peak).
             lr_mult = (
-                wsd_multiplier(progress, cfg.lr_warmup_frac, cfg.lr_decay_frac, cfg.lr_min_ratio)
+                wsd_multiplier(progress, global_step, cfg.lr_warmup_steps, cfg.lr_decay_frac, cfg.lr_min_ratio)
                 if cfg.lr_schedule == "wsd" else 1.0
             )
             for group, peak in zip(opt_lm.param_groups, lm_peak_lrs):
@@ -1608,7 +1608,7 @@ def train_aux_baseline(
             # LM learning-rate schedule (cfg.lr_schedule -- see utils/lr_scheduler.py).
             progress = global_step / total_steps
             lr_mult = (
-                wsd_multiplier(progress, cfg.lr_warmup_frac, cfg.lr_decay_frac, cfg.lr_min_ratio)
+                wsd_multiplier(progress, global_step, cfg.lr_warmup_steps, cfg.lr_decay_frac, cfg.lr_min_ratio)
                 if cfg.lr_schedule == "wsd" else 1.0
             )
             for group, peak in zip(opt_lm.param_groups, lm_peak_lrs):

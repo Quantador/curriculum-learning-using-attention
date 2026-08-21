@@ -75,7 +75,7 @@ class Config:
     #              held at peak through the stable phase, then their (1-sqrt) cooldown down to
     #              lr_min_ratio * peak. See utils/lr_scheduler.py.
     lr_schedule: str = "fixed"
-    lr_warmup_frac: float = 0.0  # fraction of total steps spent on linear warmup
+    lr_warmup_steps: float = 300  # number of steps spent on linear warmup
     lr_decay_frac: float = 0.2   # fraction of total steps spent cooling down; the paper finds
     # the benefit plateaus here, though 0.05 with the (1-sqrt) shape still nearly matches a
     # length-matched cosine schedule if the cooldown's own compute cost needs to stay small.
@@ -175,11 +175,11 @@ class Config:
                 f"lr_schedule={self.lr_schedule!r} is not supported (expected 'fixed' or 'wsd')."
             )
 
-        if self.lr_schedule == "wsd" and not (0.0 <= self.lr_warmup_frac and 0.0 < self.lr_decay_frac
-                                               and self.lr_warmup_frac + self.lr_decay_frac <= 1.0):
+        if self.lr_schedule == "wsd" and not (0.0 <= self.lr_warmup_steps and 0.0 < self.lr_decay_frac
+                                               and self.lr_decay_frac < 1.0):
             raise ValueError(
                 "lr_schedule='wsd' requires 0 <= lr_warmup_frac, 0 < lr_decay_frac, and "
-                f"lr_warmup_frac + lr_decay_frac <= 1 (got warmup_frac={self.lr_warmup_frac}, "
+                f"lr_decay_frac < 1.0 (got warmup_frac={self.lr_warmup_steps}, "
                 f"decay_frac={self.lr_decay_frac})."
             )
 
