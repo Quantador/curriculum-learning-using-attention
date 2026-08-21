@@ -56,6 +56,7 @@ from utils.rl_utils import grpo_update, ppo_update, reinforce_update
 from utils.general_utils import autocast_ctx
 from utils.distributed_utils import eval_handles, wrap_model, wrap_replica
 from utils.muon_optimizer import build_optimizer
+from utils.lr_scheduler import wsd_multiplier
 
 @torch.no_grad()
 def compute_loss_per_sample_vectorized(
@@ -791,6 +792,10 @@ def train_router_experiments(
 
     opt_lm = build_optimizer(model, cfg)
     opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router, weight_decay=0.0)
+    # Captured once, before any scheduling touches opt_lm.param_groups -- wsd_multiplier()
+    # scales each group's own peak (lr_lm's AdamW group and, under lm_optimizer='muon',
+    # lr_muon's Muon group) rather than overwriting both with one shared value.
+    lm_peak_lrs = [g["lr"] for g in opt_lm.param_groups]
 
     grad_params = [p for p in model.parameters() if p.requires_grad]
     grad_param_count = sum(p.numel() for p in grad_params)
@@ -949,6 +954,16 @@ def train_router_experiments(
             # (fixed per-step counter, no data dependence), so this is
             # DDP-safe without a broadcast, same as router_frozen above.
             router_update_due = global_step % cfg.router_update_every == 0
+
+            # LM learning-rate schedule (cfg.lr_schedule -- see utils/lr_scheduler.py). Applied
+            # here, before this step's opt_lm.step() and before the GREATS reward's Taylor
+            # expansion below (which needs the LR actually used this step, not the static peak).
+            lr_mult = (
+                wsd_multiplier(progress, cfg.lr_warmup_frac, cfg.lr_decay_frac, cfg.lr_min_ratio)
+                if cfg.lr_schedule == "wsd" else 1.0
+            )
+            for group, peak in zip(opt_lm.param_groups, lm_peak_lrs):
+                group["lr"] = peak * lr_mult
 
             # Get scheduled values
             current_temp = get_scheduled_value(
@@ -1157,7 +1172,11 @@ def train_router_experiments(
                     agg_grad_norm_sq_native = (train_bs / total_bs) ** 2 * agg_grad_norm_sq
                     sum_sq_norms_native = greats_train_norms.to(cfg.device).float().pow(2).sum()
                     redundancy = (agg_grad_norm_sq_native - sum_sq_norms_native) / 2.0
-                    greats_reward = cfg.lr_lm * greats_reward - (cfg.lr_lm ** 2) * redundancy
+                    # Uses this step's actual LR (cfg.lr_lm * lr_mult), not the static peak --
+                    # under cfg.lr_schedule='wsd' those diverge during warmup/decay, and this
+                    # Taylor expansion approximates the loss change from the real optimizer step.
+                    current_lr_lm = cfg.lr_lm * lr_mult
+                    greats_reward = current_lr_lm * greats_reward - (current_lr_lm ** 2) * redundancy
 
             if local_grad_reward:
                 # no_sync() above skipped DDP's automatic averaging, so
@@ -1363,6 +1382,7 @@ def train_router_experiments(
                         "tokens_seen": total_tokens_seen,
                         "temperature": current_temp,
                         "lambda_ent": current_lambda_ent,
+                        "lr_lm": cfg.lr_lm * lr_mult,
                         "select_k": select_k,
                         "feat_time_ms": total_feat_time / cfg.log_every * 1000,
                         **div_metrics,
@@ -1497,6 +1517,10 @@ def train_aux_baseline(
     mse_fn  = nn.MSELoss()
     opt_lm  = build_optimizer(model, cfg)
     opt_aux = torch.optim.AdamW(aux_net.parameters(), lr=cfg.lr_router, weight_decay=0.0)
+    # Captured once, before any scheduling touches opt_lm.param_groups -- wsd_multiplier()
+    # scales each group's own peak (lr_lm's AdamW group and, under lm_optimizer='muon',
+    # lr_muon's Muon group) rather than overwriting both with one shared value.
+    lm_peak_lrs = [g["lr"] for g in opt_lm.param_groups]
 
     # // world_size before // per_rank_pool_size: under DDP each rank only
     # sees its shard (make_pool_loader's DistributedSampler truncates to
@@ -1504,7 +1528,7 @@ def train_aux_baseline(
     # then chunked into cfg.per_rank_pool_size-sized steps (cfg.pool split
     # across ranks -- see Config.per_rank_pool_size), so this must match
     # steps actually taken per rank per epoch, not the single-process count,
-    # or training_progress (used below) would never reach 1.0.
+    # or progress (used below to drive the LR schedule) would never reach 1.0.
     total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.per_rank_pool_size) * cfg.epochs)
     global_step = 0
     total_tokens_seen = 0
@@ -1581,6 +1605,14 @@ def train_aux_baseline(
             loss_lm.backward()
             if cfg.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
+            # LM learning-rate schedule (cfg.lr_schedule -- see utils/lr_scheduler.py).
+            progress = global_step / total_steps
+            lr_mult = (
+                wsd_multiplier(progress, cfg.lr_warmup_frac, cfg.lr_decay_frac, cfg.lr_min_ratio)
+                if cfg.lr_schedule == "wsd" else 1.0
+            )
+            for group, peak in zip(opt_lm.param_groups, lm_peak_lrs):
+                group["lr"] = peak * lr_mult
             opt_lm.step()
 
             with torch.no_grad(), autocast_ctx(cfg.device):
@@ -1621,14 +1653,14 @@ def train_aux_baseline(
                 div_metrics = diversity.get_metrics(world_size=cfg.world_size)
 
                 if cfg.rank == 0:
-                    training_progress = global_step / total_steps
                     metrics.log(
                         epoch=epoch,
                         step=global_step,
                         loss_lm=agg_loss_lm,
                         loss_aux=agg_loss_aux,
                         avg_improvement=agg_avg_improvement,
-                        curriculum_strength=1.0 - training_progress,
+                        curriculum_strength=1.0 - progress,
+                        lr_lm=cfg.lr_lm * lr_mult,
                         tokens_seen=total_tokens_seen,
                         **div_metrics,
                     )

@@ -57,7 +57,7 @@ def _save_checkpoint(cfg, model, router_or_aux, save_dir: Path) -> Path:
     return path
 
 
-def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
+def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics, run_dir: Path) -> None:
     """Best-effort OPUS-comparable benchmark eval at the end of a training run.
 
     NEVER raises. The checkpoint written by _save_checkpoint() just before this call is
@@ -68,6 +68,10 @@ def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
 
     Called on rank 0 only (see run_single_experiment); `model` may still be the
     DDP-wrapped object every training loop returns when cfg.world_size > 1.
+
+    run_dir: this run's own timestamped scratch dir (<timestamp>_<label>, the parent of
+    save_dir) -- eval_scores.json goes there, alongside that run's configs/, logs/,
+    status/ and checkpoints/.
     """
     try:
         from utils.eval_harness import run_eval_suite, suite_averages
@@ -95,15 +99,10 @@ def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
         averages = suite_averages(scores)
         experiment_metrics.log(**{f"eval/{k}": v for k, v in scores.items()}, **averages)
 
-        # Raw cfg.experiment_name (NOT safe_name): rl_training.py already writes into
-        # results/<cfg.experiment_name>/ with the raw name, and both evaluate_checkpoint.py
-        # and compare_to_opus.py assume that same directory shape. safe_name() is
-        # deliberately scoped to the checkpoint .pt filename only.
-        eval_out_dir = Path("results") / cfg.experiment_name
-        eval_out_dir.mkdir(parents=True, exist_ok=True)
-        (eval_out_dir / "eval_scores.json").write_text(
-            json.dumps({**scores, **averages}, indent=2)
-        )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        out_path = run_dir / "eval_scores.json"
+        out_path.write_text(json.dumps({**scores, **averages}, indent=2))
+        print(f"[eval] wrote {out_path}")
         print(json.dumps(averages, indent=2))
     except Exception:
         import traceback
@@ -239,7 +238,11 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
 
             # Best-effort, never raises -- see _end_of_training_eval's docstring. The
             # total_time_s logging below must happen even if the eval suite falls over.
-            _end_of_training_eval(cfg, model_router, tokenizer, experiment_metrics)
+            # save_dir is <scratch_dir>/checkpoints, so its parent is this run's own
+            # timestamped dir -- which is where eval_scores.json belongs.
+            _end_of_training_eval(
+                cfg, model_router, tokenizer, experiment_metrics, save_dir.parent
+            )
 
         total_time_s = time.perf_counter() - run_start
         if cfg.rank == 0:

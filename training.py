@@ -32,6 +32,7 @@ from utils.general_utils import autocast_ctx
 from utils.distributed_utils import eval_handles, wrap_model
 from utils.metrics import MetricsTracker, DiversityTracker
 from utils.muon_optimizer import build_optimizer
+from utils.lr_scheduler import wsd_multiplier
 
 
 def evaluate(
@@ -199,6 +200,10 @@ def train_baseline(
 
     loss_fn = nn.CrossEntropyLoss()
     opt = build_optimizer(model, cfg)
+    # Captured once, before any scheduling touches opt.param_groups -- wsd_multiplier()
+    # scales each group's own peak (lr_lm's AdamW group and, under lm_optimizer='muon',
+    # lr_muon's Muon group) rather than overwriting both with one shared value.
+    peak_lrs = [g["lr"] for g in opt.param_groups]
 
     global_step = 0
     total_tokens_seen = 0
@@ -207,6 +212,9 @@ def train_baseline(
         num_workers=cfg.dataloader_num_workers, pin_memory=(cfg.device != "cpu"),
         rank=cfg.rank, world_size=cfg.world_size, seed=cfg.seed,
     )
+    # Same convention as rl_training.py's total_steps: steps actually taken per rank per
+    # epoch (len(baseline_loader) == PooledBatchSampler's per-rank pool count) times epochs.
+    total_steps = max(1, len(baseline_loader) * cfg.epochs)
     budget_reached = False
     for epoch in range(cfg.epochs):
         # See PooledBatchSampler.set_epoch(): required under DDP so pools
@@ -235,6 +243,12 @@ def train_baseline(
             loss.backward()
             if cfg.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
+            if cfg.lr_schedule == "wsd":
+                lr_mult = wsd_multiplier(
+                    global_step / total_steps, cfg.lr_warmup_frac, cfg.lr_decay_frac, cfg.lr_min_ratio,
+                )
+                for group, peak in zip(opt.param_groups, peak_lrs):
+                    group["lr"] = peak * lr_mult
             opt.step()
 
             # Per-sample loss for diversity's train_ppl_domain/* tracking --
@@ -274,6 +288,7 @@ def train_baseline(
                         loss_lm=log_loss.item(),
                         entropy=math.log(cfg.per_rank_batch_size),
                         tokens_seen=total_tokens_seen,
+                        lr_lm=opt.param_groups[0]["lr"],
                         **div_metrics,
                     )
 

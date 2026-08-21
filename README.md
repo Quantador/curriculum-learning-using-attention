@@ -96,11 +96,19 @@ launching each experiment as its own subprocess (see `EXPERIMENTS.md`).
 
 ## Setup
 
-**Requirements:** Python 3.10+, CUDA optional but recommended for training.
+**Requirements:** Python 3.12 (pinned by `pyproject.toml`'s `requires-python`),
+CUDA optional but recommended for training.
+
+Dependencies live in `pyproject.toml`, resolved through `uv.lock`:
 
 ```bash
-pip install -r requirement.txt
+uv sync
 ```
+
+`uv sync` installs the locked versions exactly. After editing `pyproject.toml`'s
+dependency list, run `uv lock` to refresh `uv.lock` -- `uv lock --check` fails if
+the two have drifted, which is what catches a dependency that was declared but
+never locked (`lm-eval` was in exactly that state until it was locked in).
 
 The first run will stream dataset shards from HuggingFace Hub. Subsequent runs
 use the local HuggingFace cache (`~/.cache/huggingface/`).

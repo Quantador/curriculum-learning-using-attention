@@ -22,25 +22,31 @@ ALL_TASKS against your installed version with:
 and adjust names below if any don't match -- this list was written against lm-eval-harness's
 standard task registry as of this project's pyproject.toml pin (lm-eval>=0.4.5).
 
-Verified against the installed lm-eval-harness 0.4.12 (2026-08-18); two names below needed
-adjusting for that version:
+Verified against the installed lm-eval-harness 0.4.12 (2026-08-18):
   - `import lm_eval.tasks` is required explicitly -- 0.4.12's `lm_eval/__init__.py` only
     lazy-loads `evaluate`/`simple_evaluate` via `__getattr__`, so `lm_eval.tasks` is not
     auto-exposed as a package attribute the way older versions did.
   - "story_cloze_2016" -> "storycloze_2016" (no underscore between "story" and "cloze") --
     that's the name actually registered by lm_eval/tasks/storycloze/storycloze_2016.yaml.
-    Its dataset (`LSDSem/story_cloze`) is still gated on the HF Hub, so this task is still
-    expected to degrade to nan without manual dataset access approval; only the *name* changed.
-  - "super_glue_axb" / "super_glue_axg" are kept as-is even though lm-eval-harness 0.4.12 does
-    not register any AX-b/AX-g task at all (checked: no task name containing "ax" resembling
-    AX-b/AX-g anywhere in `TaskManager().all_tasks`, and `lm_eval/tasks/super_glue/` on disk has
-    no axb/axg subdirectory -- SuperGLUE's diagnostic sets were dropped from the bundled
-    registry, likely because their HF dataset config still relies on a script-based loader that
-    modern `datasets` versions no longer support). There is no equivalent task elsewhere in the
-    registry to substitute, so these two names are left as documented placeholders that will hit
-    the "unknown task" branch below and score nan -- functionally identical to the gated-dataset
-    case, just for a different underlying reason. Revisit if a future lm-eval-harness release
-    restores them.
+
+A first full run (2026-08-20, GPT-2 XL) scored 11 of the 22 tasks nan. Three unrelated causes,
+and what was done about each:
+
+  1. datasets >= 4.0 removed dataset-script support entirely ("RuntimeError: Dataset scripts
+     are no longer supported"), and this project pins datasets==4.4.2. That killed social_iqa
+     (allenai/social_i_qa -> social_i_qa.py), wsc273 (winograd_wsc -> winograd_wsc.py) and
+     storycloze_2016 (LSDSem/story_cloze -> story_cloze.py). The first two are FIXED by the
+     script-free mirrors in eval_tasks/social_iqa_parquet.yaml and eval_tasks/wsc273_parquet.yaml
+     (identical schemas and row counts; see those files). storycloze_2016 has no script-free
+     mirror -- LSDSem/story_cloze is also gated -- so it is still expected to score nan until
+     someone requests Hub access AND a non-script copy exists. It is the one task here with no
+     code-side fix.
+  2. All 6 BBH tasks hit "requested max tokens to generate (1024) must be less than model's
+     maximum sequence length (1024)". FIXED via _BBH_MAX_GEN_TOKS below -- see that constant.
+  3. super_glue_axb / super_glue_axg are registered by no lm-eval 0.4.12 task (its
+     lm_eval/tasks/super_glue/ has no axb/axg directory). FIXED by defining them locally in
+     eval_tasks/super_glue_ax{b,g}.yaml -- `aps/super_glue` still serves both configs, script
+     free and with real (non-hidden) entailment labels, so they are scorable after all.
 """
 from __future__ import annotations
 
@@ -59,12 +65,12 @@ IN_DOMAIN_TASKS = [
     "anli_r1", "anli_r2", "anli_r3",
     "hellaswag",
     "piqa",
-    "social_iqa",
+    "social_iqa_parquet",  # custom task; stock `social_iqa` is script-loaded, see module docstring
     "winogrande",
     "arc_easy",
     "arc_challenge",
     "commonsense_qa",
-    "wsc273",
+    "wsc273_parquet",  # custom task; stock `wsc273` is script-loaded, see module docstring
 ]
 
 # OPUS Table 5 out-of-distribution suite. BBH subset matches the paper's own curated list
@@ -78,14 +84,42 @@ OOD_TASKS = [
     "bbh_cot_fewshot_penguins_in_a_table",
     "bbh_cot_fewshot_sports_understanding",
     "race",
-    "super_glue_axb",  # AX-b -- unregistered in lm-eval-harness 0.4.12, see module docstring
-    "super_glue_axg",  # AX-g -- unregistered in lm-eval-harness 0.4.12, see module docstring
-    "storycloze_2016",  # gated dataset -- may be unavailable, see run_eval_suite() docstring
+    "super_glue_axb",  # custom task, eval_tasks/super_glue_axb.yaml -- see module docstring
+    "super_glue_axg",  # custom task, eval_tasks/super_glue_axg.yaml -- see module docstring
+    "storycloze_2016",  # gated AND script-loaded; no fix available, see module docstring
 ]
 
 ALL_TASKS = IN_DOMAIN_TASKS + OOD_TASKS
 
 _BBH_FEWSHOT = 3  # OPUS: BBH is evaluated 3-shot; everything else is zero-shot.
+
+# Generation budget for the BBH tasks, which are the suite's only generate_until tasks.
+#
+# lm-eval splits a model's context window between prompt and generation:
+#     max_ctx_len = model.max_length - max_gen_toks
+# and asserts max_ctx_len > 0. BBH's _cot_fewshot_template_yaml hardcodes
+# generation_kwargs.max_gen_toks = 1024, which on a GPT-2-family model (max_length =
+# 1024 exactly) leaves 0 tokens of context and fails that assertion -- every BBH task
+# scored nan. Overriding it here is what makes them scorable at all.
+#
+# 128 is a deliberate compromise, not a tuned value. Measured 3-shot CoT prompt lengths
+# under the GPT-2 tokenizer (p50/max tokens): sports_understanding 240/246,
+# logical_deduction 797/809, tracking_shuffled_objects 857/867, colored_objects 917/937,
+# penguins_in_a_table 889/952, disambiguation_qa 993/1006. Leaving 1024-128 = 896 for
+# context therefore fits four of the six subsets outright and left-truncates the other
+# two by roughly 40-110 tokens, which costs part of the FIRST few-shot exemplar while
+# preserving the actual question (it sits at the end of the prompt).
+#
+# Raising this is counterproductive: every extra generated token comes straight out of
+# the prompt. At the degenerate end, max_gen_toks=1023 satisfies the assertion but
+# leaves a 1-token prompt, so the model generates unconditioned text and scores ~0.
+# Lowering it buys prompt room but eventually truncates the chain-of-thought answer
+# before it can emit "the answer is X", which is the string BBH's regex filter extracts.
+#
+# Caveat worth carrying into any comparison: BBH 3-shot CoT does not really fit a
+# 1024-token window, so these scores are NOT strictly protocol-identical to OPUS's,
+# which evaluated the same benchmark without this constraint.
+_BBH_MAX_GEN_TOKS = 128
 
 # Preference order for picking a task's headline metric out of lm-eval-harness's per-task
 # results dict. Keys look like "<metric>,<filter>" (e.g. "acc,none", "acc_norm,none") -- the
@@ -148,10 +182,18 @@ def run_eval_suite(
 
     scores: dict[str, float] = {}
     for task in tasks:
-        num_fewshot = _BBH_FEWSHOT if task.startswith("bbh_") else 0
+        is_bbh = task.startswith("bbh_")
+        num_fewshot = _BBH_FEWSHOT if is_bbh else 0
+        # simple_evaluate merges gen_kwargs into the task's own generation_kwargs
+        # (set_config(..., update=True)), so this replaces only max_gen_toks and leaves
+        # BBH's `until`/`do_sample`/`temperature` intact. Passed for BBH alone: it is the
+        # only generate_until task group here, and generation_kwargs is inert for the
+        # multiple_choice tasks anyway.
+        gen_kwargs = {"max_gen_toks": _BBH_MAX_GEN_TOKS} if is_bbh else None
         try:
             results = lm_eval.simple_evaluate(
                 model=lm, tasks=[task], num_fewshot=num_fewshot, task_manager=task_manager,
+                gen_kwargs=gen_kwargs,
             )
             task_results = results["results"][task]
             metric_key = _pick_metric_key(task_results)
