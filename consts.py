@@ -312,6 +312,25 @@ OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY: Dict[str, tuple[Any, List[Any]]] = {
     ]),
 }
 
+# The minimal 2-arm question: with the router's input fixed at own_embeddings
+# (by the config, not this profile), does a PPO router trained on
+# loss_improvement beat picking the same number of samples at random? Run with
+# --profile own_embeddings_ppo_vs_random --no-baseline against
+# configs/own_embeddings_ppo_vs_random.yaml to get exactly:
+#   - experiment_baseline:   ppo, loss_improvement, own_embeddings (the router)
+#   - random_batch_baseline: same LM/data/batch size, uniform random selection,
+#                            no router at all (training.train_baseline())
+# BOTH fields are pinned with EMPTY alternatives lists, so the
+# one-factor-at-a-time loop in generate_experiment_configs() contributes zero
+# arms of its own and only the two unconditional reference runs are generated
+# (see _reference_configs). Pinning them here rather than relying on
+# ExperimentConfig's dataclass defaults matters: training_algorithm defaults to
+# "reinforce", not "ppo".
+OWN_EMBEDDINGS_PPO_VS_RANDOM: Dict[str, tuple[Any, List[Any]]] = {
+    "training_algorithm": ("ppo", []),
+    "reward_signal": ("loss_improvement", []),
+}
+
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -338,6 +357,8 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "own-embeddings-rl-ablation": OWN_EMBEDDINGS_RL_ABLATION,  # alias
     "own_embeddings_loss_vs_greats_diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,
     "own-embeddings-loss-vs-greats-diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,  # alias
+    "own_embeddings_ppo_vs_random": OWN_EMBEDDINGS_PPO_VS_RANDOM,
+    "own-embeddings-ppo-vs-random": OWN_EMBEDDINGS_PPO_VS_RANDOM,  # alias
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")
