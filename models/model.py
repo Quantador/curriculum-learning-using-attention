@@ -261,49 +261,6 @@ def build_model(vocab_size: int, cfg: Config) -> nn.Module:
     else:
         raise ValueError(f"Unknown model_type: {model_type!r}. Expected 'tiny_gpt' or 'hf_pretrained'.")
 
-
-class AttentionRouter(nn.Module):
-    def __init__(self, d_input, d_k=128, n_layers=6, n_heads=4):
-        super().__init__()
-        self.proj = nn.Linear(d_input, d_k) # Transform d_input into d_k 
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=d_k, nhead=n_heads, dim_feedforward=4 * d_k,
-                batch_first=True, norm_first=True,
-            ),
-            num_layers=n_layers,
-        )
-        self.norm = nn.LayerNorm(d_k)
-        self.head = nn.Linear(d_k, 1)
-
-    def forward(self, feats):           # [B, d_input]
-        x = self.proj(feats).unsqueeze(0)   # [1, B, d_k]
-        x = self.encoder(x)                 # [1, B, d_k]
-        return self.head(self.norm(x)).squeeze(0).squeeze(-1)   # [B]
-
-
-class MultiHeadAttentionRouter(nn.Module):
-    """
-    n_heads independent (projection, query) pairs whose scores are averaged.
-    Each head attends to a different linear subspace of the feature vector,
-    letting the router vote on sample quality from multiple perspectives.
-    """
-    def __init__(self, d_input: int, d_k: int = 128, n_heads: int = 4):
-        super().__init__()
-        self.heads = nn.ModuleList([
-            nn.Linear(d_input, d_k, bias=False) for _ in range(n_heads)
-        ])
-        self.queries = nn.ParameterList([
-            nn.Parameter(torch.randn(d_k)) for _ in range(n_heads)
-        ])
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        scores = torch.stack(
-            [(h(feats) @ q) for h, q in zip(self.heads, self.queries)], dim=1
-        )  # [B, n_heads]
-        return scores.mean(dim=1)  # [B]
-
-
 def compute_text_statistics(
     X: torch.Tensor,
     pad_token_id: int,

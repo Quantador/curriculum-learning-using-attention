@@ -1,12 +1,12 @@
 experiment_name: gpt_slimpajama_f_router_feature_ablation_wsd
 epochs: 1
-global_batch_size: 128
+global_batch_size: 512
 pool_mult: 10
 lr_lm: 0.00005
 use_wandb: true
-max_chunks: 1024
+max_chunks: -1
 model_type: hf_pretrained
-hf_model_name: openai-community/gpt2
+hf_model_name: openai-community/gpt2-xl
 lr_schedule: "wsd"
 # Baseline stays "full"; pinning the layer index here (valid for gpt2's 12
 # layers) lets the hierarchical_representation="layer" alternative in the
@@ -19,6 +19,8 @@ hierarchical_layer_index: 6
 # because the baseline here is explicitly false.
 use_original_sequence: false
 sentence_embedder_dim: 768
+router_n_heads: 4 
+router_n_layers: 6 
 split_dataset: true 
 split_column: "meta"
 dataset_list: ["DKYoon/SlimPajama-6B"]

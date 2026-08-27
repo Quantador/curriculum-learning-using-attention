@@ -4,7 +4,8 @@ from typing import Tuple
 import torch 
 
 from config import ExperimentConfig
-from models.model import TinyGPT, AttentionRouter
+from models.model import TinyGPT
+from models.router import AttentionRouter
 from utils.entropy_utils import compute_entropy
 
 def reinforce_update(

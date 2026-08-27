@@ -47,7 +47,8 @@ from tqdm import tqdm
 
 from config import ExperimentConfig
 from data import make_pool_loader, TokenizedCorpus
-from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
+from models.model import TinyGPT, extract_hierarchical_hidden, compute_text_statistics
+from models.router import AttentionRouter
 from utils.metrics import MetricsTracker, DiversityTracker
 from training import evaluate_per_domain
 from models.router import extract_router_features
