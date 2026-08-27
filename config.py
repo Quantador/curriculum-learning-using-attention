@@ -488,7 +488,8 @@ class ExperimentConfig(Config):
     # Router architecture
     router_architecture: str = "attention"  # options: attention, linear, mlp
     router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter
-
+    router_n_layers: int = 1 # 1 -> Only one attention layer to catch correlations inbetween the batch. 
+    
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
@@ -511,9 +512,7 @@ class ExperimentConfig(Config):
     # Width of the router's own embedding tables. Only read when
     # router_feature_source='own_embeddings'. The router head then sees
     # n_chunks * router_embed_dim inputs.
-    router_embed_dim: int = 256 # Increase embedding and router architecture in proportion to the model , keep the fraction of parameters the same. + 
-                                # Add sentence embedding / own embeddings combinations.
-
+    router_embed_dim: int = 256
 
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo

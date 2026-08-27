@@ -219,6 +219,7 @@ def build_router(
     d_k: int = 128,
     d_hidden: int = 256,
     n_heads: int = 1,
+    n_layers: int = 1 # One attention layer 
 ) -> nn.Module | None:
     """
     Factory for all router architectures.
@@ -240,7 +241,7 @@ def build_router(
     """
     if arch == "attention":
         if n_heads == 1:
-            return AttentionRouter(d_input=d_input, d_k=d_k)
+            return AttentionRouter(d_input=d_input, d_k=d_k, n_layers = n_layers, n_heads = n_heads)
         return MultiHeadAttentionRouter(d_input=d_input, d_k=d_k, n_heads=n_heads)
     if arch == "linear":
         return LinearRouter(d_input=d_input)
@@ -287,6 +288,7 @@ class EmbeddingRouter(nn.Module):
         d_k: int = 128,
         d_hidden: int = 256,
         n_heads: int = 1,
+        n_layers: int = 1,
     ):
         super().__init__()
         if block % n_chunks != 0:
@@ -299,6 +301,7 @@ class EmbeddingRouter(nn.Module):
             d_k=d_k,
             d_hidden=d_hidden,
             n_heads=n_heads,
+            n_layers = n_layers
         )
         if head is None:
             raise ValueError(
@@ -343,10 +346,12 @@ def build_router_for_cfg(
             arch=cfg.router_architecture,
             d_k=128,
             n_heads=getattr(cfg, "router_n_heads", 1),
+            n_layers = getattr(cfg, "router_n_layers",1)
         )
     return build_router(
         d_input=get_router_feature_dim(cfg, sequence_size),
         arch=cfg.router_architecture,
         d_k=128,
         n_heads=getattr(cfg, "router_n_heads", 1),
+        n_layers = getattr(cfg, "router_n_layers",1)
     )

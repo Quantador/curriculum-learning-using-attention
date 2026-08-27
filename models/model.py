@@ -263,24 +263,23 @@ def build_model(vocab_size: int, cfg: Config) -> nn.Module:
 
 
 class AttentionRouter(nn.Module):
-    """
-    Single-head attention-based sample scorer.
-
-    Learns a linear projection W ∈ R^{d_input × d_k} and a query vector
-    q ∈ R^{d_k}. For a batch of feature vectors F ∈ R^{B × d_input}:
-        scores = (F @ W^T) @ q  ∈ R^B
-
-    Equivalent to a single-head cross-attention where F are the keys and q
-    is the query. This is the default/baseline router architecture.
-    """
-    def __init__(self, d_input: int, d_k: int = 128):
+    def __init__(self, d_input, d_k=128, n_layers=6, n_heads=4):
         super().__init__()
-        self.proj = nn.Linear(d_input, d_k, bias=False)
-        self.q = nn.Parameter(torch.randn(d_k))
+        self.proj = nn.Linear(d_input, d_k) # Transform d_input into d_k 
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_k, nhead=n_heads, dim_feedforward=4 * d_k,
+                batch_first=True, norm_first=True,
+            ),
+            num_layers=n_layers,
+        )
+        self.norm = nn.LayerNorm(d_k)
+        self.head = nn.Linear(d_k, 1)
 
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        keys = self.proj(feats)  # [B, d_k]
-        return keys @ self.q     # [B]
+    def forward(self, feats):           # [B, d_input]
+        x = self.proj(feats).unsqueeze(0)   # [1, B, d_k]
+        x = self.encoder(x)                 # [1, B, d_k]
+        return self.head(self.norm(x)).squeeze(0).squeeze(-1)   # [B]
 
 
 class MultiHeadAttentionRouter(nn.Module):

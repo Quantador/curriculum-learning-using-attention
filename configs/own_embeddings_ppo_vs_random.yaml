@@ -1,9 +1,9 @@
-experiment_name: gptxl_oe_ppo_vs_random_slimpajama
+experiment_name: gptxl_wsd_trial_run_full_1e4
 model_type: hf_pretrained
 hf_model_name: openai-community/gpt2-xl
-lr_lm: 0.00003 # Make this smaller 
+lr_lm: 0.0001 # Make this smaller 
 block: 256
-global_batch_size: 512
+global_batch_size: 128
 pool_mult: 10
 use_wandb: true
 lr_schedule: "wsd"
@@ -34,7 +34,7 @@ max_chunks: -1
 # from the profile (experiment_baseline / random_batch_baseline) -- two configs
 # sharing one experiment_name would silently overwrite each other's checkpoint
 # (utils/experiment_worker.py's _save_checkpoint names the file after it).
-save_model_at_end: true
+save_model_at_end: false 
 
 # Router input is FIXED to own_embeddings for the router arm; the profile
 # (OWN_EMBEDDINGS_PPO_VS_RANDOM in consts.py) varies nothing about it and only
