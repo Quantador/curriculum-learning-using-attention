@@ -240,9 +240,7 @@ def build_router(
     Returns an nn.Module or None (for arch='random').
     """
     if arch == "attention":
-        if n_heads == 1:
-            return AttentionRouter(d_input=d_input, d_k=d_k, n_layers = n_layers, n_heads = n_heads)
-        return MultiHeadAttentionRouter(d_input=d_input, d_k=d_k, n_heads=n_heads)
+        return AttentionRouter(d_input=d_input, d_k=d_k, n_layers = n_layers, n_heads = n_heads)
     if arch == "linear":
         return LinearRouter(d_input=d_input)
     if arch == "mlp":

@@ -1,10 +1,10 @@
 experiment_name: gpt_slimpajama_f_router_feature_ablation_wsd
-epochs: 10
+epochs: 1
 global_batch_size: 128
 pool_mult: 10
 lr_lm: 0.00005
 use_wandb: true
-max_chunks: -1
+max_chunks: 1024
 model_type: hf_pretrained
 hf_model_name: openai-community/gpt2
 lr_schedule: "wsd"
