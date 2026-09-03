@@ -20,6 +20,7 @@ DiversityTracker:
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -104,13 +105,20 @@ class DiversityTracker:
         self.selection_counts = torch.zeros(dataset_size, dtype=torch.long)
         self.step_selections: List[List[int]] = []
         self.domain_counts = {}
+        # Cumulative sum of per-sample training loss (mean CE over that
+        # sample's sequence), keyed by domain id -- paired with domain_counts
+        # as the denominator to get a running training-loss/perplexity per
+        # domain. Populated only when update() is called with `losses`; train
+        # loops that don't pass it simply never populate this dict, so
+        # get_train_ppl_domain() emits no keys for them.
+        self.domain_loss_sum: Dict[int, float] = {}
 
     def _domain_label(self, domain_id: int) -> str:
         if self.domain_names is not None and 0 <= domain_id < len(self.domain_names):
             return self.domain_names[domain_id]
         return str(domain_id)
 
-    def update(self, indices: List[int], domains) -> None:
+    def update(self, indices: List[int], domains, losses: Optional[List[float]] = None) -> None:
         if not indices:
             return
 
@@ -121,10 +129,12 @@ class DiversityTracker:
         if len(self.step_selections) > self.window:
             self.step_selections.pop(0)
 
-        for d in domains:
+        for i, d in enumerate(domains):
             if d not in self.domain_counts:
                 self.domain_counts[d] = 0
             self.domain_counts[d] += 1
+            if losses is not None:
+                self.domain_loss_sum[d] = self.domain_loss_sum.get(d, 0.0) + losses[i]
 
     def get_metrics(self, world_size: int = 1) -> Dict[str, float]:
         """
@@ -139,6 +149,10 @@ class DiversityTracker:
                               far. Sharing the "domain_ratio/" prefix across
                               domains groups them into one section/panel in
                               the W&B UI automatically.
+
+        See get_train_ppl_domain() for cumulative per-domain training
+        perplexity -- a separate method/collective, meant to be called once
+        per epoch rather than at this method's cfg.log_every cadence.
 
         world_size > 1: each rank only ever calls update() with its own
         DistributedSampler-sharded slice of the dataset (see data.py), so
@@ -209,4 +223,50 @@ class DiversityTracker:
             "unique_ratio": unique_ratio,
             **domain_ratios,
         }
-        
+
+    def get_train_ppl_domain(self, world_size: int = 1) -> Dict[str, float]:
+        """
+        Cumulative training perplexity per domain -- the samples the model
+        actually trained on, bucketed by domain, as opposed to a held-out
+        val_ppl_domain (evaluate_per_domain in training.py), which needs a
+        validation split for that domain to mean anything (this project's
+        SlimPajama val split only ever has wikitext windows).
+
+        Deliberately a SEPARATE collective from get_metrics(), not folded
+        into its return dict: callers want this once per epoch (matching
+        val_ppl's cadence), not every cfg.log_every steps, and a collective
+        must be called by every rank the same number of times -- mixing the
+        two cadences into one method would force one or the other to change.
+        Only domains update() was ever called with `losses` for appear here.
+
+        world_size > 1: same all_gather_object merge as get_metrics()'s
+        domain_counts, for the same reason (each rank only has its own
+        partial view) -- every rank must call this the same number of times
+        with the same world_size.
+        """
+        domain_counts = self.domain_counts
+        domain_loss_sum = self.domain_loss_sum
+
+        if world_size > 1:
+            gathered_domain_counts: List[Optional[dict]] = [None] * world_size
+            dist.all_gather_object(gathered_domain_counts, self.domain_counts)
+            merged_domain_counts: Dict[int, int] = defaultdict(int)
+            for dc in gathered_domain_counts:
+                for domain_id, count in dc.items():
+                    merged_domain_counts[domain_id] += count
+            domain_counts = merged_domain_counts
+
+            gathered_domain_loss_sum: List[Optional[dict]] = [None] * world_size
+            dist.all_gather_object(gathered_domain_loss_sum, self.domain_loss_sum)
+            merged_domain_loss_sum: Dict[int, float] = defaultdict(float)
+            for dl in gathered_domain_loss_sum:
+                for domain_id, loss_sum in dl.items():
+                    merged_domain_loss_sum[domain_id] += loss_sum
+            domain_loss_sum = merged_domain_loss_sum
+
+        return {
+            f"train_ppl_domain/{self._domain_label(domain_id)}": math.exp(loss_sum / domain_counts[domain_id])
+            for domain_id, loss_sum in sorted(domain_loss_sum.items())
+            if domain_counts.get(domain_id, 0) > 0
+        }
+

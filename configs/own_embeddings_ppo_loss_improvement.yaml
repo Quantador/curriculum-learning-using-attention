@@ -1,0 +1,37 @@
+experiment_name: gptxl_oe_slimpajama_full
+epochs: 10
+global_batch_size: 512
+pool_mult: 10
+lr_lm: 0.0003
+use_wandb: true
+max_chunks: -1
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+
+# Single arm split out of configs/own_embeddings_rl_ablation.yaml's sweep
+# (OWN_EMBEDDINGS_RL_ABLATION in consts.py): PPO + loss_improvement, both the
+# EXPERIMENTAL_FIELDS baseline values, is never generated as its own combo by
+# that profile since the profile only sweeps *away* from that baseline
+# (training_algorithm -> grpo/reinforce, reward_signal -> gradient_norm/etc.).
+# Meant to be run directly with --single, not through the sweep, so both
+# fields are set explicitly here rather than left to ExperimentConfig's
+# dataclass defaults -- training_algorithm defaults to 'reinforce', not
+# 'ppo' (config.py), so leaving it unset would silently run the wrong
+# algorithm outside the sweep machinery that normally injects these.
+training_algorithm: ppo
+reward_signal: loss_improvement
+
+# Router input is FIXED to own_embeddings -- see the matching comment block in
+# configs/own_embeddings_rl_ablation.yaml for the full rationale.
+router_feature_source: own_embeddings
+enable_text_hierarchical: false
+enable_text_stat: false
+use_original_sequence: false
+feature_cache_epochs: 0
+
+# Same corpus/signature as configs/own_embeddings_rl_ablation.yaml -- keep
+# these three verbatim so dataset_signature() still resolves to the existing
+# cache instead of demanding a rebuild.
+split_dataset: true
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

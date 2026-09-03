@@ -17,6 +17,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
@@ -31,9 +33,9 @@ from training import train_baseline
 from models.model import build_model
 from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
-from utils.general_utils import resolve_device, safe_name, set_seed
+from utils.general_utils import log_parameter_counts, resolve_device, safe_name, set_seed
 from utils import memory_snapshot, run_status
-
+from utils.distributed_utils import full_state_dict
 
 def _save_checkpoint(cfg, model, router_or_aux, save_dir: Path) -> Path:
     """Save the trained LM (and router/aux_net, if any) to <save_dir>/<name>.pt, per
@@ -55,7 +57,7 @@ def _save_checkpoint(cfg, model, router_or_aux, save_dir: Path) -> Path:
     return path
 
 
-def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
+def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics, run_dir: Path) -> None:
     """Best-effort OPUS-comparable benchmark eval at the end of a training run.
 
     NEVER raises. The checkpoint written by _save_checkpoint() just before this call is
@@ -66,6 +68,10 @@ def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
 
     Called on rank 0 only (see run_single_experiment); `model` may still be the
     DDP-wrapped object every training loop returns when cfg.world_size > 1.
+
+    run_dir: this run's own timestamped scratch dir (<timestamp>_<label>, the parent of
+    save_dir) -- eval_scores.json goes there, alongside that run's configs/, logs/,
+    status/ and checkpoints/.
     """
     try:
         from utils.eval_harness import run_eval_suite, suite_averages
@@ -93,15 +99,10 @@ def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
         averages = suite_averages(scores)
         experiment_metrics.log(**{f"eval/{k}": v for k, v in scores.items()}, **averages)
 
-        # Raw cfg.experiment_name (NOT safe_name): rl_training.py already writes into
-        # results/<cfg.experiment_name>/ with the raw name, and both evaluate_checkpoint.py
-        # and compare_to_opus.py assume that same directory shape. safe_name() is
-        # deliberately scoped to the checkpoint .pt filename only.
-        eval_out_dir = Path("results") / cfg.experiment_name
-        eval_out_dir.mkdir(parents=True, exist_ok=True)
-        (eval_out_dir / "eval_scores.json").write_text(
-            json.dumps({**scores, **averages}, indent=2)
-        )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        out_path = run_dir / "eval_scores.json"
+        out_path.write_text(json.dumps({**scores, **averages}, indent=2))
+        print(f"[eval] wrote {out_path}")
         print(json.dumps(averages, indent=2))
     except Exception:
         import traceback
@@ -112,13 +113,17 @@ def _end_of_training_eval(cfg, model, tokenizer, experiment_metrics) -> None:
         )
         traceback.print_exc()
 
-
-def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics, save_dir: Path | None = None):
+def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, base_metrics, router_metrics,
+                          save_dir: Path | None = None):
     """Run a single experiment with the given configuration.
 
     Shared by the bare in-process run_experiment() below and by
     utils/experiment_worker.py, which calls this once per config inside its
     own subprocess when running a sweep via run_scheduler().
+
+    save_dir: where to write a checkpoint when cfg.save_model_at_end is set
+    (<scratch_dir>/checkpoints -- None disables saving regardless of the cfg
+    flag, e.g. gpu_memory_probe.py's throwaway probe runs never pass one).
     """
     # Every rank runs this function identically under DDP (cfg.world_size >
     # 1); gate the purely informational prints to rank 0 so a multi-GPU job
@@ -162,6 +167,7 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
     # the NEXT config's wandb.init() call just reattaches to that still-open
     # run instead of starting its own -- so its metrics silently land under
     # the failed run's name instead of its own.
+    router_trained = None
     try:
         if cfg.run_aux_baseline:
             # Supervised MSE alternative to the policy-gradient router (ablation
@@ -172,7 +178,9 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 arch="auxnet",
                 d_hidden=cfg.aux_net_hidden,
             )
-            model_router, _ = train_aux_baseline(
+            if cfg.rank == 0:
+                log_parameter_counts(model_router, aux_net, selector_label="aux_net")
+            model_router, router_trained = train_aux_baseline(
                 cfg=cfg,
                 model=model_router,
                 aux_net=aux_net,
@@ -196,6 +204,8 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
             # the dataset and making train_baseline's random.sample(window, batch)
             # discard most of each window instead of training on all of it.
             random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, global_batch_size=cfg.pool, pool_mult=1)
+            if cfg.rank == 0:
+                log_parameter_counts(model_router, None)
             model_router = train_baseline(
                 cfg=random_cfg,
                 model=model_router,
@@ -210,7 +220,9 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 sequence_size=model_router.block,
                 vocab_size=tokenizer.vocab_size,
             )
-            model_router, router = train_router_experiments(
+            if cfg.rank == 0:
+                log_parameter_counts(model_router, router)
+            model_router, router_trained = train_router_experiments(
                 cfg=cfg,
                 model=model_router,
                 router=router,
@@ -232,12 +244,31 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
 
             # Best-effort, never raises -- see _end_of_training_eval's docstring. The
             # total_time_s logging below must happen even if the eval suite falls over.
-            _end_of_training_eval(cfg, model_router, tokenizer, experiment_metrics)
+            # save_dir is <scratch_dir>/checkpoints, so its parent is this run's own
+            # timestamped dir -- which is where eval_scores.json belongs.
+            _end_of_training_eval(
+                cfg, model_router, tokenizer, experiment_metrics, save_dir.parent
+            )
 
         total_time_s = time.perf_counter() - run_start
         if cfg.rank == 0:
             experiment_metrics.log(total_time_s=total_time_s)
             print(f"\n=== Total run time: {total_time_s:.1f}s ({total_time_s / 3600:.2f}h) ===")
+
+        if cfg.save_model_at_end and save_dir is not None:
+            # Collective on every rank under FSDP (full_state_dict() gathers
+            # sharded params), so this must run outside any `rank == 0` gate
+            # even though only rank 0 goes on to write the file.
+            lm_state = full_state_dict(model_router, cfg)
+            router_state = full_state_dict(router_trained, cfg) if router_trained is not None else None
+            if cfg.rank == 0:
+                save_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = save_dir / f"{safe_name(cfg.experiment_name)}.pt"
+                torch.save(
+                    {"experiment_name": cfg.experiment_name, "model": lm_state, "router": router_state},
+                    ckpt_path,
+                )
+                print(f"\n=== Saved checkpoint: {ckpt_path} ===")
     finally:
         # The training loops above intentionally leave their wandb run open so
         # total_time_s lands in it too; this closes it once everything's logged
@@ -306,6 +337,7 @@ def main() -> None:
     # happens before run_status records the exception -- the inner context
     # exits first, and the snapshot is only meaningful before unwinding.
     snapshot_dir = (Path(args.status_dir).parent / "snapshots") if args.status_dir else Path("snapshots")
+    save_dir = (Path(args.status_dir).parent / "checkpoints") if args.status_dir else Path("checkpoints")
     with tracker:
         with memory_snapshot.record(snapshot_dir, name, rank=cfg.rank):
             run_single_experiment(

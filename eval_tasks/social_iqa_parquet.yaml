@@ -1,0 +1,32 @@
+# SocialIQA, sourced from a mirror that needs no dataset loading script.
+#
+# lm-eval's own `social_iqa` task points at `allenai/social_i_qa`, which ships a
+# `social_i_qa.py` loading script. datasets >= 4.0 removed script support entirely
+# ("RuntimeError: Dataset scripts are no longer supported"), and this project pins
+# datasets==4.4.2, so the stock task can only ever score nan here.
+#
+# `lighteval/siqa` is a script-free mirror with the IDENTICAL column schema
+# (context, question, answerA/answerB/answerC, label as a 1-indexed string) and the
+# same 1954-row validation split, so every field below except dataset_path/name is
+# copied verbatim from lm-eval's siqa/siqa.yaml -- including the `(label|int) - 1`
+# target, which already handles the string, 1-indexed label.
+#
+# Registered under a distinct task name rather than shadowing `social_iqa`: two
+# configs claiming one name would make which of them wins depend on TaskManager's
+# include-path precedence, which is not something to rely on silently.
+task: social_iqa_parquet
+dataset_path: lighteval/siqa
+dataset_name: null
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+doc_to_text: "Q: {{context}} {{question}}\nA:"
+target_delimiter: " "
+doc_to_choice: "{{[answerA, answerB, answerC]}}"
+doc_to_target: "{{ (label|int) - 1 }}"
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

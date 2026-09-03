@@ -60,13 +60,26 @@ class Config:
     # terminating step/epoch). None = unlimited, bounded only by cfg.epochs
     # as before.
     max_tokens: int | None = None
-    lr_lm: float = 3e-4
+    lr_lm: float = 3e-4 # Peak LR for the LM optimizer -- see lr_schedule below.
     # LM optimizer: 'adamw' (default, current behavior) or 'muon' (OPUS-style hybrid --
     # Muon on 2D matrix weights inside model.transformer_blocks(), AdamW on everything else;
     # see utils/muon_optimizer.py). lr_lm is reused as the AdamW sub-group's LR when
     # lm_optimizer='muon'; lr_muon is the Muon sub-group's LR (unused otherwise).
     lm_optimizer: str = "adamw"
     lr_muon: float = 0.02
+    # LM learning-rate schedule, applied as a multiplier on lr_lm (and lr_muon's sub-group
+    # when lm_optimizer='muon'; lr_router is unaffected):
+    #   'fixed' -- constant at the configured peak throughout training (current behavior).
+    #   'wsd'   -- Warmup-Stable-Decay (Hägele et al., NeurIPS 2024 "Scaling Laws and
+    #              Compute-Optimal Training Beyond Fixed Training Durations"): linear warmup,
+    #              held at peak through the stable phase, then their (1-sqrt) cooldown down to
+    #              lr_min_ratio * peak. See utils/lr_scheduler.py.
+    lr_schedule: str = "fixed"
+    lr_warmup_steps: float = 300  # number of steps spent on linear warmup
+    lr_decay_frac: float = 0.2   # fraction of total steps spent cooling down; the paper finds
+    # the benefit plateaus here, though 0.05 with the (1-sqrt) shape still nearly matches a
+    # length-matched cosine schedule if the cooldown's own compute cost needs to stay small.
+    lr_min_ratio: float = 0.0    # floor as a fraction of peak lr at the end of decay
     # Global gradient-norm clip applied to the LM's parameters before opt_lm.step(), for any
     # lm_optimizer. None = no clipping (current behavior).
     grad_clip_norm: float | None = None
@@ -155,6 +168,19 @@ class Config:
         if self.lm_optimizer not in ("adamw", "muon"):
             raise ValueError(
                 f"lm_optimizer={self.lm_optimizer!r} is not supported (expected 'adamw' or 'muon')."
+            )
+
+        if self.lr_schedule not in ("fixed", "wsd"):
+            raise ValueError(
+                f"lr_schedule={self.lr_schedule!r} is not supported (expected 'fixed' or 'wsd')."
+            )
+
+        if self.lr_schedule == "wsd" and not (0.0 <= self.lr_warmup_steps and 0.0 < self.lr_decay_frac
+                                               and self.lr_decay_frac < 1.0):
+            raise ValueError(
+                "lr_schedule='wsd' requires 0 <= lr_warmup_frac, 0 < lr_decay_frac, and "
+                f"lr_decay_frac < 1.0 (got warmup_frac={self.lr_warmup_steps}, "
+                f"decay_frac={self.lr_decay_frac})."
             )
 
         if self.lm_optimizer == "muon" and self.distributed == "FSDP":
@@ -462,7 +488,8 @@ class ExperimentConfig(Config):
     # Router architecture
     router_architecture: str = "attention"  # options: attention, linear, mlp
     router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter
-
+    router_n_layers: int = 1 # 1 -> Only one attention layer to catch correlations inbetween the batch. 
+    router_d_k: int = 128
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
@@ -486,7 +513,6 @@ class ExperimentConfig(Config):
     # router_feature_source='own_embeddings'. The router head then sees
     # n_chunks * router_embed_dim inputs.
     router_embed_dim: int = 256
-
 
     # Training algorithm
     training_algorithm: str = "reinforce"  # options: reinforce, grpo, ppo
@@ -522,11 +548,17 @@ class ExperimentConfig(Config):
     #   - gradient_norm: ||∇θ L_LM(S_t)|| - batch gradient magnitude
     #   - gradient_alignment: <g_t, g_ema> - alignment with EMA gradient
     #   - combined: weighted sum of multiple signals
-    #   - greats_score: sum of ghost gradient-dot-product scores <g_i, g_val> over
-    #     the selected batch (one scalar shared by every sample) - GPT-2-family HF
-    #     checkpoint only (validated in __post_init__). A constant reward across
-    #     the batch makes baseline_type='batch_mean' always cancel to zero
-    #     advantage; use baseline_type='moving_avg' instead.
+    #   - greats_score: per-sample ghost gradient-dot-product score <g_i, g_val>,
+    #     one per selected sample - GPT-2-family HF checkpoint only (validated in
+    #     __post_init__). To first order an LM step with lr eta moves the val loss
+    #     by -eta/B * sum_i <g_i, g_val>, so each sample is credited with its own
+    #     share of the validation improvement and every baseline_type works.
+    #     EXCEPT with greats_diversity_term=True: that adds a set-level redundancy
+    #     penalty with no per-sample decomposition, which collapses the reward to
+    #     one scalar shared by every sample. A constant reward makes
+    #     baseline_type='batch_mean' cancel to exactly zero advantage (and grpo's
+    #     (r_i - group_mean)/group_std likewise), so that combination requires
+    #     baseline_type='moving_avg'.
     reward_signal: str = "loss_improvement"
 
     # GhostSuite/ghostEngines scoring knobs, used only when reward_signal='greats_score'.

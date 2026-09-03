@@ -205,3 +205,40 @@ def compute_costs(
         + CONTEXT_OVERHEAD_BYTES
         for cfg in configs
     }
+
+def log_parameter_counts(model, selector=None, selector_label: str = "router",
+                         model_label: str = "LM") -> None:
+    """Print LM / selector parameter counts and the selector:LM ratio.
+
+    Call before wrap_model()/wrap_replica(): under FSDP the wrapped module
+    holds only this rank's shard, so counting afterwards would report roughly
+    1/world_size of the real total. Callers gate this on rank 0 themselves,
+    matching the other informational prints in run_single_experiment().
+
+    selector is the router (or aux_net); None for the non-learned random
+    baselines, which train no selector at all -- those print the LM row and a
+    line saying so, rather than a ratio against zero.
+    """
+    def counts(module) -> Tuple[int, int]:
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+    m_total, m_train = counts(model)
+    width = len(f"{m_total:,}")
+
+    print(f"\n=== Parameter counts ===")
+    print(f"  {model_label:<22}: {m_total:>{width},} total | {m_train:>{width},} trainable")
+
+    if selector is None:
+        print(f"  {'selector':<22}: none (non-learned random baseline)")
+        return
+
+    s_total, s_train = counts(selector)
+    print(f"  {selector_label:<22}: {s_total:>{width},} total | {s_train:>{width},} trainable")
+
+    # Guard the divide: a selector built entirely from buffers (no Parameters)
+    # would make the "1 : N" form divide by zero.
+    if m_total and s_total:
+        pct = 100.0 * s_total / m_total
+        print(f"  {selector_label + ' / ' + model_label:<22}: {pct:.4f}%  (1 : {m_total / s_total:,.1f})")

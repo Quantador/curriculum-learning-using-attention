@@ -238,6 +238,121 @@ ROUTER_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
     ]),
 }
 
+# How the router learns (training_algorithm) and what it learns from
+# (reward_signal), with the router's INPUT held fixed at own_embeddings by
+# configs/own_embeddings_rl_ablation.yaml -- that input won the
+# router_feature_ablation sweep, so this sweep stops varying it and asks the
+# next question instead: given the best features, which objective actually
+# beats uniform random selection?
+#
+# random_batch_baseline is the reference every arm here is judged against and
+# rides along automatically (see generate_experiment_configs) -- it trains the
+# same LM on the same per-step batch size with no router at all, so the only
+# difference is which samples were picked.
+#
+# reward_signal alternatives are the ones with a mechanism for beating random,
+# rather than the full list from EXPERIMENTAL_FIELDS:
+#   gradient_norm      -- prefer batches with large ||grad||, i.e. where the LM
+#                         still has something to learn
+#   gradient_alignment -- <g_t, g_ema>: prefer batches pulling in the same
+#                         direction as recent progress
+#   greats_score       -- GREATS ghost gradient-dot-product against a val batch
+#                         (influence-function style; the only arm here whose
+#                         reward references held-out data)
+#   neg_loss           -- prefer easy samples; included as the directional
+#                         opposite of gradient_norm, so a win either way is
+#                         informative about what the router should chase
+OWN_EMBEDDINGS_RL_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
+    "training_algorithm": (EXPERIMENTAL_FIELDS["training_algorithm"][0], ["grpo", "reinforce"]),
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], [
+        "gradient_norm",
+        "gradient_alignment",
+        "neg_loss",
+        {
+            # Retained from when greats_score was collapsed to one scalar per
+            # step, which made the default baseline_type='batch_mean' subtract
+            # the reward from itself for an identically-zero advantage.
+            # greats_score is per-sample now (rl_training.py sums it only under
+            # greats_diversity_term, which this arm does not set), so batch_mean
+            # would work here too -- moving_avg is kept so this arm stays
+            # comparable to the runs already collected under it.
+            "_name": "greats_score",
+            "reward_signal": "greats_score",
+            "baseline_type": "moving_avg",
+        },
+    ]),
+}
+
+# Narrow 3-arm cut of OWN_EMBEDDINGS_RL_ABLATION: does greats_score's ghost
+# gradient-dot-product reward (plus its second-order diversity term) beat
+# plain loss_improvement, both under PPO with own_embeddings features? Run
+# with --profile own_embeddings_loss_vs_greats_diversity --no-baseline against
+# configs/own_embeddings_rl_ablation.yaml (unchanged) to get exactly:
+#   - experiment_baseline:     ppo, loss_improvement, own_embeddings
+#   - random_batch_baseline:   same, uniform random selection, no router
+#   - greats_score_diversity:  ppo, greats_score+diversity, own_embeddings
+# training_algorithm is pinned to "ppo" with an EMPTY alternatives list
+# (unlike OWN_EMBEDDINGS_RL_ABLATION above, which sweeps it) -- baseline_values
+# still picks up "ppo" for every reference/arm config, but the empty list
+# means the one-factor-at-a-time loop contributes zero grpo/reinforce arms.
+OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY: Dict[str, tuple[Any, List[Any]]] = {
+    "training_algorithm": ("ppo", []),
+    "reward_signal": (EXPERIMENTAL_FIELDS["reward_signal"][0], [  # "loss_improvement"
+        {
+            # Same moving_avg rationale as OWN_EMBEDDINGS_RL_ABLATION's
+            # greats_score combo above, plus the redundancy penalty
+            # (config.py greats_diversity_term docstring), which needs
+            # greats_log_grad_norms=True for the per-sample gradient norms it
+            # sums.
+            "_name": "greats_score_diversity",
+            "reward_signal": "greats_score",
+            "baseline_type": "moving_avg",
+            "greats_diversity_term": True,
+            "greats_log_grad_norms": True,
+        },
+    ]),
+}
+
+# The minimal 2-arm question: with the router's input fixed at own_embeddings
+# (by the config, not this profile), does a PPO router trained on
+# loss_improvement beat picking the same number of samples at random? Run with
+# --profile own_embeddings_ppo_vs_random --no-baseline against
+# configs/own_embeddings_ppo_vs_random.yaml to get exactly:
+#   - experiment_baseline:   ppo, loss_improvement, own_embeddings (the router)
+#   - random_batch_baseline: same LM/data/batch size, uniform random selection,
+#                            no router at all (training.train_baseline())
+# BOTH fields are pinned with EMPTY alternatives lists, so the
+# one-factor-at-a-time loop in generate_experiment_configs() contributes zero
+# arms of its own and only the two unconditional reference runs are generated
+# (see _reference_configs). Pinning them here rather than relying on
+# ExperimentConfig's dataclass defaults matters: training_algorithm defaults to
+# "reinforce", not "ppo".
+OWN_EMBEDDINGS_PPO_VS_RANDOM: Dict[str, tuple[Any, List[Any]]] = {
+    "training_algorithm": ("ppo", []),
+    "reward_signal": ("loss_improvement", []),
+}
+
+SMALL_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = { 
+    "router_feature_source": ("features", [
+        {
+            "_name": "own_embeddings",
+            "router_feature_source": "own_embeddings",
+            # The router's own tables replace every other group, so the
+            # baseline's feature flags have to come off or config validation
+            # would be describing a router input that is never built.
+            "enable_text_hierarchical": False,
+            "enable_text_stat": False,
+        },
+    ]),
+    "sentence_embedder_model": ("", [
+        {
+            "_name": "sentence_embedder_alone",
+            "sentence_embedder_model": "intfloat/e5-base-v2",
+            "enable_text_hierarchical": False,
+            "enable_text_stat": False,
+        },
+    ]),
+}
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -259,7 +374,14 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "compare-router-freeze": COMPARE_ROUTER_FREEZE,  # alias
     "compare_router_update_every": COMPARE_ROUTER_UPDATE_EVERY,
     "compare-router-update-every": COMPARE_ROUTER_UPDATE_EVERY,  # alias
-    "check_greats": CHECK_GREATS
+    "check_greats": CHECK_GREATS,
+    "own_embeddings_rl_ablation": OWN_EMBEDDINGS_RL_ABLATION,
+    "own-embeddings-rl-ablation": OWN_EMBEDDINGS_RL_ABLATION,  # alias
+    "own_embeddings_loss_vs_greats_diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,
+    "own-embeddings-loss-vs-greats-diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,  # alias
+    "own_embeddings_ppo_vs_random": OWN_EMBEDDINGS_PPO_VS_RANDOM,
+    "own-embeddings-ppo-vs-random": OWN_EMBEDDINGS_PPO_VS_RANDOM,  # alias
+    "small_r_feature_ablation": SMALL_FEATURE_ABLATION
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

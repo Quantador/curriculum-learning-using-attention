@@ -1,11 +1,24 @@
 experiment_name: test_exp_speed
-epochs: 10
-global_batch_size: 16
+epochs: 1
+global_batch_size: 128
 pool_mult: 10
-lr_lm: 0.0003
+lr_lm: 0.00005
 use_wandb: true
-max_chunks: 200000
+max_chunks: -1
 model_type: hf_pretrained
 hf_model_name: openai-community/gpt2
-dataset_list: ["HuggingFaceFW/fineweb"]
-dataset_proportions: [1]
+lr_schedule: "wsd"
+# Baseline stays "full"; pinning the layer index here (valid for gpt2's 12
+# layers) lets the hierarchical_representation="layer" alternative in the
+# router_feature_ablation profile run without touching this field.
+hierarchical_representation: full
+hierarchical_layer_index: 6
+# Required: extract_router_features() returns the raw token sequence early
+# when this is true (its class default), bypassing every other feature group
+# -- so the ablation's use_original_sequence=True variant is meaningful only
+# because the baseline here is explicitly false.
+use_original_sequence: false
+sentence_embedder_dim: 768
+split_dataset: true 
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

@@ -1,0 +1,39 @@
+# Router sized so that (router params : gpt2-xl params) matches the proportion
+# a d_k=128 / 1-layer / 1-head AttentionRouter has against gpt2-small:
+#
+#   router(gpt2,    d_k=128, 1 layer) =        985,729 : 124,439,808 = 0.7921%
+#   router(gpt2-xl, d_k=272, 10 layers) =   12,397,217 : 1,557,611,200 = 0.7959%
+#
+# The ratio does not scale naively, because the router's input width tracks the
+# LM's hidden size (config.py __post_init__ sets d_model = hf_cfg.hidden_size):
+# d_input is 8*768+4 = 6,148 for gpt2 but 8*1600+4 = 12,804 for gpt2-xl.
+#
+# router_n_heads does NOT affect the parameter count -- nn.TransformerEncoderLayer
+# with d_model=d_k has the same in_proj/out_proj shapes at any nhead (heads are a
+# reshape). It is kept at 4 to match configs/router_feature_ablation.yaml; changing
+# it leaves the ratio above untouched. 272 = 16*17, so 1/2/4/8/16 heads all divide it.
+#
+# The 0.7959% figure holds for THIS feature set (hierarchical + stat -> d_input
+# 12,804). It does not carry across the router_feature_ablation profile: that sweep's
+# arms change d_input (use_original_sequence -> 256, own_embeddings -> 8*256), so each
+# arm would land at a different ratio. Run this as a single experiment.
+experiment_name: xl_SP_matched_ratio_k272_l10
+epochs: 1
+global_batch_size: 128
+pool_mult: 10
+lr_lm: 0.00005
+use_wandb: true
+max_chunks: -1
+model_type: hf_pretrained
+hf_model_name: openai-community/gpt2-xl
+lr_schedule: "wsd"
+hierarchical_representation: full
+hierarchical_layer_index: 6
+use_original_sequence: false
+sentence_embedder_dim: 768
+router_n_heads: 4
+router_n_layers: 10
+router_d_k: 272
+split_dataset: true
+split_column: "meta"
+dataset_list: ["DKYoon/SlimPajama-6B"]

@@ -1,9 +1,15 @@
 """Standalone entry point: evaluate a saved checkpoint on the OPUS-comparable benchmark suite.
 
 Usage:
-    python evaluate_checkpoint.py --checkpoint results/<name>/checkpoints/<name>.pt \\
-        --config configs/opus_gpt2xl_muon_fineweb.yaml [--out <path>] [--batch-size 16] \\
+    RUN=results/_parallel_run/<timestamp>_<name>
+    python evaluate_checkpoint.py --checkpoint $RUN/checkpoints/<name>.pt \\
+        --config configs/opus_gpt2xl_muon_fineweb.yaml --out $RUN/eval_scores.json \\
+        [--batch-size 16] \\
         [--tasks task1,task2]  # optional: restrict to a task subset (default: all of ALL_TASKS)
+
+Scores belong in the run's own <timestamp>_<name> directory, not a directory named after
+the experiment alone: experiment_name repeats across runs (every sweep emits an
+"experiment_baseline"), so a name-keyed path is a shared slot that later runs overwrite.
 
 Also used automatically by utils/experiment_worker.py at the end of a training run when
 cfg.save_model_at_end is set -- see run_single_experiment() in that file.
@@ -29,9 +35,11 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument(
         "--out", default=None,
-        help="Default: eval_scores.json next to --checkpoint. Note that is NOT where "
-             "compare_to_opus.py reads from -- pass --out results/<experiment_name>/eval_scores.json "
-             "(the same path the end-of-training eval writes) to update what it sees.",
+        help="Default: eval_scores.json next to --checkpoint, i.e. inside that run's "
+             "<timestamp>_<name>/checkpoints/ dir. To land it where the end-of-training "
+             "eval writes -- and where compare_to_opus.py expects a run directory -- pass "
+             "--out results/_parallel_run/<timestamp>_<name>/eval_scores.json (one level "
+             "up, beside that run's configs/ and logs/).",
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(

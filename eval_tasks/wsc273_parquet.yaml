@@ -1,0 +1,34 @@
+# WSC273, sourced from a mirror that needs no dataset loading script.
+#
+# Same root cause as social_iqa_parquet.yaml: lm-eval's `wsc273` points at
+# `winograd_wsc`, which ships a `winograd_wsc.py` loading script that datasets >= 4.0
+# refuses to run, so the stock task scores nan under this project's datasets==4.4.2.
+#
+# `coref-data/winograd_wsc_raw` (config wsc273) is script-free and exposes the
+# IDENTICAL schema -- text, pronoun, pronoun_loc, quote, quote_loc, options, label --
+# with the correct 273-row test split. Every field below other than dataset_path is a
+# verbatim copy of lm-eval's wsc273/default.yaml, deliberately including the unusual
+# doc_to_text/doc_to_choice pairing (this task scores by "partial evaluation":
+# doc_to_choice builds each candidate CONTEXT as prefix+option and doc_to_target is
+# the shared continuation after the pronoun). Those are copied rather than rewritten
+# precisely because that inversion is easy to get subtly wrong.
+#
+# process_docs resolves to eval_tasks/utils.py, which holds lm-eval's own
+# process_doc verbatim -- see that file's docstring.
+task: wsc273_parquet
+dataset_path: coref-data/winograd_wsc_raw
+dataset_name: wsc273
+output_type: multiple_choice
+test_split: test
+doc_to_text: label
+process_docs: !function utils.process_doc
+doc_to_target: "{% set index = pronoun_loc + pronoun | length %}{{text[index:]}}"
+doc_to_choice: "{% set template = text[:pronoun_loc] %}{{[template+options[0], template+options[1]]}}"
+should_decontaminate: true
+doc_to_decontamination_query: text
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

@@ -30,8 +30,6 @@ from config import ExperimentConfig
 
 from models.model import (
     TinyGPT,
-    AttentionRouter,
-    MultiHeadAttentionRouter,
     compute_text_statistics,
     extract_hierarchical_hidden,
 )
@@ -87,7 +85,25 @@ class AuxNetRouter(nn.Module):
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
         return self.net(feats).squeeze(-1)  # [B]
 
+class AttentionRouter(nn.Module):
+    def __init__(self, d_input, d_k=128, n_layers=6, n_heads=4):
+        super().__init__()
+        self.proj = nn.Linear(d_input, d_k) # Transform d_input into d_k 
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_k, nhead=n_heads, dim_feedforward=4 * d_k,
+                batch_first=True, norm_first=True,
+            ),
+            num_layers=n_layers,
+        )
+        self.norm = nn.LayerNorm(d_k)
+        self.head = nn.Linear(d_k, 1)
 
+    def forward(self, feats):           # [B, d_input]
+        x = self.proj(feats).unsqueeze(0)   # [1, B, d_k]
+        x = self.encoder(x)                 # [1, B, d_k]
+        return self.head(self.norm(x)).squeeze(0).squeeze(-1)   # [B]
+    
 def extract_router_features(
     model: TinyGPT,
     X: torch.Tensor,
@@ -219,6 +235,7 @@ def build_router(
     d_k: int = 128,
     d_hidden: int = 256,
     n_heads: int = 1,
+    n_layers: int = 1 # One attention layer 
 ) -> nn.Module | None:
     """
     Factory for all router architectures.
@@ -239,9 +256,7 @@ def build_router(
     Returns an nn.Module or None (for arch='random').
     """
     if arch == "attention":
-        if n_heads == 1:
-            return AttentionRouter(d_input=d_input, d_k=d_k)
-        return MultiHeadAttentionRouter(d_input=d_input, d_k=d_k, n_heads=n_heads)
+        return AttentionRouter(d_input=d_input, d_k=d_k, n_layers = n_layers, n_heads = n_heads)
     if arch == "linear":
         return LinearRouter(d_input=d_input)
     if arch == "mlp":
@@ -287,6 +302,7 @@ class EmbeddingRouter(nn.Module):
         d_k: int = 128,
         d_hidden: int = 256,
         n_heads: int = 1,
+        n_layers: int = 1,
     ):
         super().__init__()
         if block % n_chunks != 0:
@@ -299,6 +315,7 @@ class EmbeddingRouter(nn.Module):
             d_k=d_k,
             d_hidden=d_hidden,
             n_heads=n_heads,
+            n_layers = n_layers
         )
         if head is None:
             raise ValueError(
@@ -341,12 +358,14 @@ def build_router_for_cfg(
             n_chunks=cfg.n_chunks,
             d_embed=cfg.router_embed_dim,
             arch=cfg.router_architecture,
-            d_k=128,
+            d_k=cfg.router_d_k,
             n_heads=getattr(cfg, "router_n_heads", 1),
+            n_layers = getattr(cfg, "router_n_layers",1)
         )
     return build_router(
         d_input=get_router_feature_dim(cfg, sequence_size),
         arch=cfg.router_architecture,
-        d_k=128,
+        d_k=cfg.router_d_k,
         n_heads=getattr(cfg, "router_n_heads", 1),
+        n_layers = getattr(cfg, "router_n_layers",1)
     )

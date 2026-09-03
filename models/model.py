@@ -261,50 +261,6 @@ def build_model(vocab_size: int, cfg: Config) -> nn.Module:
     else:
         raise ValueError(f"Unknown model_type: {model_type!r}. Expected 'tiny_gpt' or 'hf_pretrained'.")
 
-
-class AttentionRouter(nn.Module):
-    """
-    Single-head attention-based sample scorer.
-
-    Learns a linear projection W ∈ R^{d_input × d_k} and a query vector
-    q ∈ R^{d_k}. For a batch of feature vectors F ∈ R^{B × d_input}:
-        scores = (F @ W^T) @ q  ∈ R^B
-
-    Equivalent to a single-head cross-attention where F are the keys and q
-    is the query. This is the default/baseline router architecture.
-    """
-    def __init__(self, d_input: int, d_k: int = 128):
-        super().__init__()
-        self.proj = nn.Linear(d_input, d_k, bias=False)
-        self.q = nn.Parameter(torch.randn(d_k))
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        keys = self.proj(feats)  # [B, d_k]
-        return keys @ self.q     # [B]
-
-
-class MultiHeadAttentionRouter(nn.Module):
-    """
-    n_heads independent (projection, query) pairs whose scores are averaged.
-    Each head attends to a different linear subspace of the feature vector,
-    letting the router vote on sample quality from multiple perspectives.
-    """
-    def __init__(self, d_input: int, d_k: int = 128, n_heads: int = 4):
-        super().__init__()
-        self.heads = nn.ModuleList([
-            nn.Linear(d_input, d_k, bias=False) for _ in range(n_heads)
-        ])
-        self.queries = nn.ParameterList([
-            nn.Parameter(torch.randn(d_k)) for _ in range(n_heads)
-        ])
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        scores = torch.stack(
-            [(h(feats) @ q) for h, q in zip(self.heads, self.queries)], dim=1
-        )  # [B, n_heads]
-        return scores.mean(dim=1)  # [B]
-
-
 def compute_text_statistics(
     X: torch.Tensor,
     pad_token_id: int,

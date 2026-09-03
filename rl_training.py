@@ -47,15 +47,17 @@ from tqdm import tqdm
 
 from config import ExperimentConfig
 from data import make_pool_loader, TokenizedCorpus
-from models.model import TinyGPT, AttentionRouter, extract_hierarchical_hidden, compute_text_statistics
+from models.model import TinyGPT, extract_hierarchical_hidden, compute_text_statistics
+from models.router import AttentionRouter
 from utils.metrics import MetricsTracker, DiversityTracker
-from training import evaluate, evaluate_per_domain  # keep using your existing evaluate()
+from training import evaluate_per_domain
 from models.router import extract_router_features
 from GhostSuite.ghostEngines.engine_manager import GhostEngineManager
 from utils.rl_utils import grpo_update, ppo_update, reinforce_update
 from utils.general_utils import autocast_ctx
 from utils.distributed_utils import eval_handles, wrap_model, wrap_replica
 from utils.muon_optimizer import build_optimizer
+from utils.lr_scheduler import wsd_multiplier
 
 @torch.no_grad()
 def compute_loss_per_sample_vectorized(
@@ -522,10 +524,12 @@ def compute_reward(
         entropy_before: Per-sample entropy before update [B] (optional)
         entropy_after: Per-sample entropy after update [B] (optional)
         gradient_reward: Scalar or per-sample gradient reward (optional)
-        greats_reward: Scalar GREATS ghost-gradient-dot-product score, summed over
-            the selected batch (optional; see reward_signal='greats_score' in Config).
-            When cfg.greats_diversity_term is set, the caller has already folded the
-            second-order redundancy penalty into this value before passing it in.
+        greats_reward: GREATS ghost-gradient-dot-product score (optional; see
+            reward_signal='greats_score' in Config). Per-sample [B] by default --
+            <g_i, g_val> for each selected sample. Collapsed to a scalar (summed
+            over the selected batch) only when cfg.greats_diversity_term is set,
+            in which case the caller has already folded the second-order redundancy
+            penalty into it and every sample shares one value.
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -569,9 +573,11 @@ def compute_reward(
         return gradient_reward
 
     elif reward_signal == "greats_score":
-        # A single scalar (sum of the ghost gradient-dot-product scores of the
-        # selected batch, against the fixed val batch) shared by every selected
-        # sample — the router's "action" is the joint selection, not per-sample.
+        # Per-sample [B] by default: <g_i, g_val> credits each selected sample
+        # with its own share of the validation-loss improvement. Falls back to a
+        # scalar shared by every sample (the router's "action" being the joint
+        # selection) only under cfg.greats_diversity_term, whose set-level
+        # redundancy penalty cannot be attributed per-sample.
         if greats_reward is None:
             return torch.zeros_like(loss_before)
         if greats_reward.dim() == 0:
@@ -791,6 +797,10 @@ def train_router_experiments(
 
     opt_lm = build_optimizer(model, cfg)
     opt_router = torch.optim.AdamW(router.parameters(), lr=cfg.lr_router, weight_decay=0.0)
+    # Captured once, before any scheduling touches opt_lm.param_groups -- wsd_multiplier()
+    # scales each group's own peak (lr_lm's AdamW group and, under lm_optimizer='muon',
+    # lr_muon's Muon group) rather than overwriting both with one shared value.
+    lm_peak_lrs = [g["lr"] for g in opt_lm.param_groups]
 
     grad_params = [p for p in model.parameters() if p.requires_grad]
     grad_param_count = sum(p.numel() for p in grad_params)
@@ -950,6 +960,16 @@ def train_router_experiments(
             # DDP-safe without a broadcast, same as router_frozen above.
             router_update_due = global_step % cfg.router_update_every == 0
 
+            # LM learning-rate schedule (cfg.lr_schedule -- see utils/lr_scheduler.py). Applied
+            # here, before this step's opt_lm.step() and before the GREATS reward's Taylor
+            # expansion below (which needs the LR actually used this step, not the static peak).
+            lr_mult = (
+                wsd_multiplier(progress, global_step, cfg.lr_warmup_steps, cfg.lr_decay_frac, cfg.lr_min_ratio)
+                if cfg.lr_schedule == "wsd" else 1.0
+            )
+            for group, peak in zip(opt_lm.param_groups, lm_peak_lrs):
+                group["lr"] = peak * lr_mult
+
             # Get scheduled values
             current_temp = get_scheduled_value(
                 cfg.temp_schedule, cfg.temp, cfg.temp_min, progress,
@@ -1058,9 +1078,25 @@ def train_router_experiments(
                     )
                     loss_score.backward()
                 ghost_engine.collect_microbatch()
+                # Per-sample <g_i, g_val> -- one score per SELECTED sample, not a
+                # scalar. To first order an LM step with lr eta changes the val loss
+                # by -eta/B * sum_i <g_i, g_val>, so <g_i, g_val> is sample i's own
+                # share of the validation improvement: the per-sample credit a
+                # val-batch loss_before/loss_after cannot produce (the val samples
+                # have no correspondence to the selected ones). Keeping it per-sample
+                # is what lets baseline_type='batch_mean' and grpo_update() see
+                # varying advantages instead of cancelling a constant to exactly zero.
                 greats_reward = ghost_engine.read_scores(
                     metric=cfg.greats_score_metric
-                ).to(cfg.device).sum()
+                ).to(cfg.device)
+                # The diversity term below is the only consumer that needs a scalar:
+                # its redundancy penalty sums <g_i,g_j> over PAIRS in the selected set
+                # and has no per-sample decomposition, and the scale it is derived
+                # against (see its comment) is that of the summed reward. Collapse
+                # only on that path; a constant reward there still requires
+                # baseline_type='moving_avg'.
+                if cfg.greats_diversity_term:
+                    greats_reward = greats_reward.sum()
                 # Per-sample ||g_i|| for the diversity term below (config.__post_init__
                 # guarantees greats_log_grad_norms=True whenever greats_diversity_term is set).
                 greats_train_norms = (
@@ -1157,7 +1193,11 @@ def train_router_experiments(
                     agg_grad_norm_sq_native = (train_bs / total_bs) ** 2 * agg_grad_norm_sq
                     sum_sq_norms_native = greats_train_norms.to(cfg.device).float().pow(2).sum()
                     redundancy = (agg_grad_norm_sq_native - sum_sq_norms_native) / 2.0
-                    greats_reward = cfg.lr_lm * greats_reward - (cfg.lr_lm ** 2) * redundancy
+                    # Uses this step's actual LR (cfg.lr_lm * lr_mult), not the static peak --
+                    # under cfg.lr_schedule='wsd' those diverge during warmup/decay, and this
+                    # Taylor expansion approximates the loss change from the real optimizer step.
+                    current_lr_lm = cfg.lr_lm * lr_mult
+                    greats_reward = current_lr_lm * greats_reward - (current_lr_lm ** 2) * redundancy
 
             if local_grad_reward:
                 # no_sync() above skipped DDP's automatic averaging, so
@@ -1316,7 +1356,7 @@ def train_router_experiments(
             if coverage_tracker is not None:
                 coverage_tracker.update(selected_indices, loss_after)
 
-            diversity.update(selected_indices, selected_domains)
+            diversity.update(selected_indices, selected_domains, loss_before.tolist())
 
             # --- Logging ---
             global_step += 1
@@ -1363,6 +1403,7 @@ def train_router_experiments(
                         "tokens_seen": total_tokens_seen,
                         "temperature": current_temp,
                         "lambda_ent": current_lambda_ent,
+                        "lr_lm": cfg.lr_lm * lr_mult,
                         "select_k": select_k,
                         "feat_time_ms": total_feat_time / cfg.log_every * 1000,
                         **div_metrics,
@@ -1385,6 +1426,11 @@ def train_router_experiments(
             if budget_reached:
                 break
 
+        # Collective (all_gather_object under world_size>1) -- every rank must
+        # reach this the same number of times, so it's called here, before the
+        # this_rank_evaluates gate below (which excludes non-zero DDP ranks).
+        train_ppl_domain = diversity.get_train_ppl_domain(world_size=cfg.world_size)
+
         # --- Validation ---
         # val_ds is small and identical on every rank. Under DDP only rank 0
         # evaluates and the others wait at the barrier below, so nobody starts
@@ -1393,7 +1439,7 @@ def train_router_experiments(
         # compute the same number, so logging still happens on rank 0 only.
         if this_rank_evaluates:
             loss_fn = nn.CrossEntropyLoss()
-            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
+            (val_loss, val_ppl), per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
 
             epoch_time = time.perf_counter() - epoch_start
             if cfg.rank == 0:
@@ -1403,6 +1449,8 @@ def train_router_experiments(
                     val_loss=val_loss,
                     val_ppl=val_ppl,
                     epoch_time_s=epoch_time,
+                    **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+                    **train_ppl_domain,
                 )
 
                 print(
@@ -1416,20 +1464,14 @@ def train_router_experiments(
         if budget_reached:
             break
 
-    # --- Final per-domain perplexity, fully trained model ---
-    # Same rank gating as the per-epoch validation above.
-    if this_rank_evaluates:
-        loss_fn = nn.CrossEntropyLoss()
-        per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
-        if cfg.rank == 0:
-            metrics.log(
-                step=global_step,
-                **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
-            )
-            print(
-                "[Final per-domain val perplexity] "
-                + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
-            )
+    # per_domain_ppl is left over from the last epoch's evaluate_per_domain()
+    # call above -- already logged there, so this is just the human-readable
+    # summary of the fully trained model, with no extra forward pass.
+    if this_rank_evaluates and cfg.rank == 0:
+        print(
+            "[Final per-domain val perplexity] "
+            + ", ".join(f"{name}={ppl:.1f}" for name, (_, ppl) in sorted(per_domain_ppl.items()))
+        )
 
     # wandb.finish() is deferred to the caller (utils/experiment_worker.py),
     # which logs a couple more summary metrics (e.g. total_time_s) into this
@@ -1496,6 +1538,10 @@ def train_aux_baseline(
     mse_fn  = nn.MSELoss()
     opt_lm  = build_optimizer(model, cfg)
     opt_aux = torch.optim.AdamW(aux_net.parameters(), lr=cfg.lr_router, weight_decay=0.0)
+    # Captured once, before any scheduling touches opt_lm.param_groups -- wsd_multiplier()
+    # scales each group's own peak (lr_lm's AdamW group and, under lm_optimizer='muon',
+    # lr_muon's Muon group) rather than overwriting both with one shared value.
+    lm_peak_lrs = [g["lr"] for g in opt_lm.param_groups]
 
     # // world_size before // per_rank_pool_size: under DDP each rank only
     # sees its shard (make_pool_loader's DistributedSampler truncates to
@@ -1503,7 +1549,7 @@ def train_aux_baseline(
     # then chunked into cfg.per_rank_pool_size-sized steps (cfg.pool split
     # across ranks -- see Config.per_rank_pool_size), so this must match
     # steps actually taken per rank per epoch, not the single-process count,
-    # or training_progress (used below) would never reach 1.0.
+    # or progress (used below to drive the LR schedule) would never reach 1.0.
     total_steps = max(1, (len(train_ds) // cfg.world_size // cfg.per_rank_pool_size) * cfg.epochs)
     global_step = 0
     total_tokens_seen = 0
@@ -1580,6 +1626,14 @@ def train_aux_baseline(
             loss_lm.backward()
             if cfg.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
+            # LM learning-rate schedule (cfg.lr_schedule -- see utils/lr_scheduler.py).
+            progress = global_step / total_steps
+            lr_mult = (
+                wsd_multiplier(progress, global_step, cfg.lr_warmup_steps, cfg.lr_decay_frac, cfg.lr_min_ratio)
+                if cfg.lr_schedule == "wsd" else 1.0
+            )
+            for group, peak in zip(opt_lm.param_groups, lm_peak_lrs):
+                group["lr"] = peak * lr_mult
             opt_lm.step()
 
             with torch.no_grad(), autocast_ctx(cfg.device):
@@ -1594,7 +1648,7 @@ def train_aux_baseline(
             loss_aux.backward()
             opt_aux.step()
 
-            diversity.update(selected_indices, selected_diffs)
+            diversity.update(selected_indices, selected_diffs, loss_before.tolist())
 
             global_step += 1
             if global_step % cfg.log_every == 0:
@@ -1620,14 +1674,14 @@ def train_aux_baseline(
                 div_metrics = diversity.get_metrics(world_size=cfg.world_size)
 
                 if cfg.rank == 0:
-                    training_progress = global_step / total_steps
                     metrics.log(
                         epoch=epoch,
                         step=global_step,
                         loss_lm=agg_loss_lm,
                         loss_aux=agg_loss_aux,
                         avg_improvement=agg_avg_improvement,
-                        curriculum_strength=1.0 - training_progress,
+                        curriculum_strength=1.0 - progress,
+                        lr_lm=cfg.lr_lm * lr_mult,
                         tokens_seen=total_tokens_seen,
                         **div_metrics,
                     )
@@ -1643,8 +1697,13 @@ def train_aux_baseline(
         # DDP: rank 0 alone evaluates the unwrapped replica, others wait at
         # the barrier below. FSDP: every rank must join the sharded forward's
         # all-gathers. See utils/distributed_utils.eval_handles().
+        # Collective (all_gather_object under world_size>1) -- every rank must
+        # reach this the same number of times, so it's called here, before the
+        # this_rank_evaluates gate below (which excludes non-zero DDP ranks).
+        train_ppl_domain = diversity.get_train_ppl_domain(world_size=cfg.world_size)
+
         if this_rank_evaluates:
-            val_loss, val_ppl = evaluate(eval_model, val_ds, loss_fn, cfg)
+            (val_loss, val_ppl), per_domain_ppl = evaluate_per_domain(eval_model, val_ds, loss_fn, cfg)
             epoch_time = time.perf_counter() - epoch_start
             if cfg.rank == 0:
                 metrics.log(
@@ -1653,6 +1712,8 @@ def train_aux_baseline(
                     val_loss=val_loss,
                     val_ppl=val_ppl,
                     epoch_time_s=epoch_time,
+                    **{f"val_ppl_domain/{name}": ppl for name, (_, ppl) in per_domain_ppl.items()},
+                    **train_ppl_domain,
                 )
                 print(
                     f"[AuxNet] Epoch {epoch + 1}/{cfg.epochs} | "

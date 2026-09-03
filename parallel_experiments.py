@@ -105,6 +105,52 @@ from consts import EXPERIMENTAL_FIELDS, SCRATCH_DIR
 from utils.general_utils import (get_profile_fields, safe_name,
                                  query_free_memory_bytes, compute_costs, dump_config, tee_stdio)
 
+def _expand_alternative(field_name: str, value: Any) -> Tuple[str, Dict[str, Any]]:
+    """Turn one declared alternative into (name fragment, field overrides).
+
+    A plain scalar changes only its own field and names itself
+    "<field>=<value>". A dict is a multi-field combo (see
+    generate_experiment_configs' docstring): its required "_name" key is the
+    name fragment, and every remaining key is an override applied together.
+
+    Shared by both generators on purpose -- a combo dict has to mean the same
+    thing in a one-factor-at-a-time sweep and in a --combinations grid. Only
+    the former used to understand them; the latter assigned the dict itself to
+    the field, so e.g. reward_signal became a dict instead of a string.
+    """
+    if isinstance(value, dict):
+        combo = dict(value)
+        return combo.pop("_name"), combo
+    return f"{field_name}={value}", {field_name: value}
+
+
+def _reference_configs(
+    base_cfg: ExperimentConfig,
+    baseline_values: Dict[str, Any],
+    include_baseline: bool,
+) -> List[ExperimentConfig]:
+    """The fixed reference runs a sweep is judged against, per include_baseline.
+
+    experiment_baseline (the sweep's own control) and random_batch_baseline
+    (uniform random selection, no router -- the thing any learned selection
+    has to beat to mean anything) always ride along, since a sweep without
+    them produces numbers with nothing to compare to. aux_baseline and
+    random_pool_baseline are secondary and gated behind include_baseline.
+    """
+    reference_overrides = {
+        "random_pool_baseline": {"run_random_pool_baseline": True},
+        "experiment_baseline": {},
+        "aux_baseline": {"run_aux_baseline": True},
+        "random_batch_baseline": {"run_random_batch_baseline": True},
+    }
+    unconditional_references = {"experiment_baseline", "random_batch_baseline"}
+    return [
+        replace(base_cfg, experiment_name=name, **baseline_values, **overrides)
+        for name, overrides in reference_overrides.items()
+        if include_baseline or name in unconditional_references
+    ]
+
+
 def generate_experiment_configs(
     base_cfg: ExperimentConfig | None = None,
     experimental_fields: Dict[str, tuple[Any, List[Any]]] | None = None,
@@ -166,25 +212,8 @@ def generate_experiment_configs(
 
     # Reference experiments (router baseline + non-router controls), each
     # identical to baseline_values except for the one flag that switches
-    # training loop. experiment_baseline and random_batch_baseline are the
-    # two every sweep is judged against, so they ride along unconditionally;
-    # aux_baseline and random_pool_baseline are secondary and gated behind
-    # include_baseline.
-    reference_overrides = {
-        "random_pool_baseline": {"run_random_pool_baseline": True},
-        "experiment_baseline": {},
-        "aux_baseline": {"run_aux_baseline": True},
-        "random_batch_baseline": {"run_random_batch_baseline": True},
-    }
-    unconditional_references = {"experiment_baseline", "random_batch_baseline"}
-    for name, overrides in reference_overrides.items():
-        if include_baseline or name in unconditional_references:
-            configs.append(replace(
-                base_cfg,
-                experiment_name=name,
-                **baseline_values,
-                **overrides,
-            ))
+    # training loop.
+    configs.extend(_reference_configs(base_cfg, baseline_values, include_baseline))
 
     # Generate one experiment per alternative value (one-factor-at-a-time)
     for field_name, (_, alternatives) in experimental_fields.items():
@@ -192,14 +221,9 @@ def generate_experiment_configs(
             # Start from baseline, change only this one field -- unless
             # alt_value is a multi-field combo dict (see docstring), which
             # applies all its overrides together under its own "_name".
+            experiment_name, alt_overrides = _expand_alternative(field_name, alt_value)
             overrides = baseline_values.copy()
-            if isinstance(alt_value, dict):
-                combo = dict(alt_value)
-                experiment_name = combo.pop("_name")
-                overrides.update(combo)
-            else:
-                overrides[field_name] = alt_value
-                experiment_name = f"{field_name}={alt_value}"
+            overrides.update(alt_overrides)
 
             new_cfg = replace(
                 base_cfg,
@@ -214,6 +238,7 @@ def generate_experiment_configs(
 def generate_combination_configs(
     base_cfg: ExperimentConfig | None = None,
     experimental_fields: Dict[str, List[Any]] | None = None,
+    include_baseline: bool = True,
 ) -> List[ExperimentConfig]:
     """
     Generate all combinations of experimental field values (full grid search).
@@ -222,9 +247,23 @@ def generate_combination_configs(
     3 fields × 3 values each = 27 experiments; 10 fields = potentially thousands.
     Only use this for small, targeted subsets of fields.
 
+    A value may be a multi-field combo dict instead of a scalar, exactly as in
+    generate_experiment_configs -- each combination merges the overrides of
+    every value it draws, so a combo dict composes with the other fields'
+    choices rather than being assigned to its own field verbatim.
+
+    Prepends the same fixed reference runs as generate_experiment_configs (see
+    _reference_configs): a grid is only interpretable next to the controls it
+    is supposed to beat, and the Cartesian product never produces them itself
+    -- random_batch_baseline is a training-loop switch, not a value of any
+    field under test.
+
     Args:
         base_cfg:            Starting config (defaults to ExperimentConfig()).
         experimental_fields: {field: [values]} mapping (flat lists, no baseline tuple).
+        include_baseline:    Whether to also include aux_baseline and
+                             random_pool_baseline (experiment_baseline and
+                             random_batch_baseline are always included).
 
     Returns a list of ExperimentConfig, one per combination.
     """
@@ -241,10 +280,22 @@ def generate_combination_configs(
     field_names = list(experimental_fields.keys())
     field_values = list(experimental_fields.values())
 
-    configs = []
+    # Element 0 of each flat list is that field's baseline value (callers
+    # build these as [baseline] + alternatives), so the reference runs are
+    # pinned exactly as they are in the one-factor-at-a-time path.
+    baseline_values: Dict[str, Any] = {}
+    for field_name, values in experimental_fields.items():
+        _, overrides = _expand_alternative(field_name, values[0])
+        baseline_values.update(overrides)
+
+    configs = _reference_configs(base_cfg, baseline_values, include_baseline)
     for combination in product(*field_values):
-        overrides = dict(zip(field_names, combination))
-        name_parts = [f"{k}={v}" for k, v in overrides.items()]
+        overrides: Dict[str, Any] = {}
+        name_parts = []
+        for field_name, value in zip(field_names, combination):
+            name_part, field_overrides = _expand_alternative(field_name, value)
+            name_parts.append(name_part)
+            overrides.update(field_overrides)
         experiment_name = "_".join(name_parts)
 
         new_cfg = replace(
@@ -645,7 +696,11 @@ def build_config_list(args: argparse.Namespace) -> List[ExperimentConfig]:
         flat_fields = {
             f: [b] + a for f, (b, a) in (selected_fields or EXPERIMENTAL_FIELDS).items()
         }
-        configs = generate_combination_configs(base_cfg=base_cfg, experimental_fields=flat_fields)
+        configs = generate_combination_configs(
+            base_cfg=base_cfg,
+            experimental_fields=flat_fields,
+            include_baseline=not args.no_baseline,
+        )
     else:
         configs = generate_experiment_configs(
             base_cfg=base_cfg,
@@ -670,7 +725,7 @@ def main() -> None:
     parser.add_argument("--single", action="store_true", help="Run exactly the config given by --config, with no ablation generation. What each --submit job invokes")
     parser.add_argument("--submit", action="store_true", help="Submit one sbatch job per experiment instead of running them here; each job runs its config DDP across one node's GPUs")
     parser.add_argument("--submit-dry-run", action="store_true", help="With --submit: write the job scripts but do not call sbatch")
-    parser.add_argument("--submit-time", type=str, default="04:30:00", help="Wall clock per submitted job (default 03:00:00)")
+    parser.add_argument("--submit-time", type=str, default="08:00:00", help="Wall clock per submitted job (default 03:00:00)")
     parser.add_argument("--submit-partition", type=str, default="normal", help="Partition for submitted jobs (default normal)")
     parser.add_argument("--submit-account", type=str, default="infra01", help="Account for submitted jobs (default infra01)")
     parser.add_argument("--submit-nodes", type=int, default=1, help="Nodes per submitted job (default 1)")
