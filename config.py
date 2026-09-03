@@ -489,7 +489,7 @@ class ExperimentConfig(Config):
     router_architecture: str = "attention"  # options: attention, linear, mlp
     router_n_heads: int = 1  # >1 enables MultiHeadAttentionRouter
     router_n_layers: int = 1 # 1 -> Only one attention layer to catch correlations inbetween the batch. 
-    
+    router_d_k: int = 128
     # Router features
     enable_text_stat: bool = True
     enable_text_hierarchical: bool = True
@@ -548,11 +548,17 @@ class ExperimentConfig(Config):
     #   - gradient_norm: ||∇θ L_LM(S_t)|| - batch gradient magnitude
     #   - gradient_alignment: <g_t, g_ema> - alignment with EMA gradient
     #   - combined: weighted sum of multiple signals
-    #   - greats_score: sum of ghost gradient-dot-product scores <g_i, g_val> over
-    #     the selected batch (one scalar shared by every sample) - GPT-2-family HF
-    #     checkpoint only (validated in __post_init__). A constant reward across
-    #     the batch makes baseline_type='batch_mean' always cancel to zero
-    #     advantage; use baseline_type='moving_avg' instead.
+    #   - greats_score: per-sample ghost gradient-dot-product score <g_i, g_val>,
+    #     one per selected sample - GPT-2-family HF checkpoint only (validated in
+    #     __post_init__). To first order an LM step with lr eta moves the val loss
+    #     by -eta/B * sum_i <g_i, g_val>, so each sample is credited with its own
+    #     share of the validation improvement and every baseline_type works.
+    #     EXCEPT with greats_diversity_term=True: that adds a set-level redundancy
+    #     penalty with no per-sample decomposition, which collapses the reward to
+    #     one scalar shared by every sample. A constant reward makes
+    #     baseline_type='batch_mean' cancel to exactly zero advantage (and grpo's
+    #     (r_i - group_mean)/group_std likewise), so that combination requires
+    #     baseline_type='moving_avg'.
     reward_signal: str = "loss_improvement"
 
     # GhostSuite/ghostEngines scoring knobs, used only when reward_signal='greats_score'.

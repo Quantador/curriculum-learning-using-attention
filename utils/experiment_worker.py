@@ -33,7 +33,7 @@ from training import train_baseline
 from models.model import build_model
 from utils.metrics import MetricsTracker, DiversityTracker
 from config import ExperimentConfig, load_config_from_yaml
-from utils.general_utils import resolve_device, safe_name, set_seed
+from utils.general_utils import log_parameter_counts, resolve_device, safe_name, set_seed
 from utils import memory_snapshot, run_status
 from utils.distributed_utils import full_state_dict
 
@@ -178,6 +178,8 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 arch="auxnet",
                 d_hidden=cfg.aux_net_hidden,
             )
+            if cfg.rank == 0:
+                log_parameter_counts(model_router, aux_net, selector_label="aux_net")
             model_router, router_trained = train_aux_baseline(
                 cfg=cfg,
                 model=model_router,
@@ -202,6 +204,8 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
             # the dataset and making train_baseline's random.sample(window, batch)
             # discard most of each window instead of training on all of it.
             random_cfg = cfg if cfg.run_random_batch_baseline else replace(cfg, global_batch_size=cfg.pool, pool_mult=1)
+            if cfg.rank == 0:
+                log_parameter_counts(model_router, None)
             model_router = train_baseline(
                 cfg=random_cfg,
                 model=model_router,
@@ -216,6 +220,8 @@ def run_single_experiment(cfg: ExperimentConfig, tokenizer, train_ds, val_ds, ba
                 sequence_size=model_router.block,
                 vocab_size=tokenizer.vocab_size,
             )
+            if cfg.rank == 0:
+                log_parameter_counts(model_router, router)
             model_router, router_trained = train_router_experiments(
                 cfg=cfg,
                 model=model_router,

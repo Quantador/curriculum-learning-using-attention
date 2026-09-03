@@ -269,12 +269,13 @@ OWN_EMBEDDINGS_RL_ABLATION: Dict[str, tuple[Any, List[Any]]] = {
         "gradient_alignment",
         "neg_loss",
         {
-            # greats_score hands every sample in the batch the SAME scalar, so
-            # the default baseline_type='batch_mean' subtracts the reward from
-            # itself and every advantage is identically zero -- the router
-            # would train on no signal at all and silently look like a null
-            # result. moving_avg is the baseline that survives a constant
-            # reward (see reward_signal's docstring in config.py).
+            # Retained from when greats_score was collapsed to one scalar per
+            # step, which made the default baseline_type='batch_mean' subtract
+            # the reward from itself for an identically-zero advantage.
+            # greats_score is per-sample now (rl_training.py sums it only under
+            # greats_diversity_term, which this arm does not set), so batch_mean
+            # would work here too -- moving_avg is kept so this arm stays
+            # comparable to the runs already collected under it.
             "_name": "greats_score",
             "reward_signal": "greats_score",
             "baseline_type": "moving_avg",
@@ -331,6 +332,27 @@ OWN_EMBEDDINGS_PPO_VS_RANDOM: Dict[str, tuple[Any, List[Any]]] = {
     "reward_signal": ("loss_improvement", []),
 }
 
+SMALL_FEATURE_ABLATION: Dict[str, tuple[Any, List[Any]]] = { 
+    "router_feature_source": ("features", [
+        {
+            "_name": "own_embeddings",
+            "router_feature_source": "own_embeddings",
+            # The router's own tables replace every other group, so the
+            # baseline's feature flags have to come off or config validation
+            # would be describing a router input that is never built.
+            "enable_text_hierarchical": False,
+            "enable_text_stat": False,
+        },
+    ]),
+    "sentence_embedder_model": ("", [
+        {
+            "_name": "sentence_embedder_alone",
+            "sentence_embedder_model": "intfloat/e5-base-v2",
+            "enable_text_hierarchical": False,
+            "enable_text_stat": False,
+        },
+    ]),
+}
 EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "final_presentation": FINAL_PRESENTATION_FIELDS,
     "final-presentation": FINAL_PRESENTATION_FIELDS,  # alias
@@ -359,6 +381,7 @@ EXPERIMENT_PROFILES: Dict[str, Dict[str, tuple[Any, List[Any]]]] = {
     "own-embeddings-loss-vs-greats-diversity": OWN_EMBEDDINGS_LOSS_VS_GREATS_DIVERSITY,  # alias
     "own_embeddings_ppo_vs_random": OWN_EMBEDDINGS_PPO_VS_RANDOM,
     "own-embeddings-ppo-vs-random": OWN_EMBEDDINGS_PPO_VS_RANDOM,  # alias
+    "small_r_feature_ablation": SMALL_FEATURE_ABLATION
 }
 
 SCRATCH_DIR = Path("results/_parallel_run")

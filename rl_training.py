@@ -524,10 +524,12 @@ def compute_reward(
         entropy_before: Per-sample entropy before update [B] (optional)
         entropy_after: Per-sample entropy after update [B] (optional)
         gradient_reward: Scalar or per-sample gradient reward (optional)
-        greats_reward: Scalar GREATS ghost-gradient-dot-product score, summed over
-            the selected batch (optional; see reward_signal='greats_score' in Config).
-            When cfg.greats_diversity_term is set, the caller has already folded the
-            second-order redundancy penalty into this value before passing it in.
+        greats_reward: GREATS ghost-gradient-dot-product score (optional; see
+            reward_signal='greats_score' in Config). Per-sample [B] by default --
+            <g_i, g_val> for each selected sample. Collapsed to a scalar (summed
+            over the selected batch) only when cfg.greats_diversity_term is set,
+            in which case the caller has already folded the second-order redundancy
+            penalty into it and every sample shares one value.
         cfg: Config for reward weights (optional, needed for 'combined')
 
     Returns:
@@ -571,9 +573,11 @@ def compute_reward(
         return gradient_reward
 
     elif reward_signal == "greats_score":
-        # A single scalar (sum of the ghost gradient-dot-product scores of the
-        # selected batch, against the fixed val batch) shared by every selected
-        # sample — the router's "action" is the joint selection, not per-sample.
+        # Per-sample [B] by default: <g_i, g_val> credits each selected sample
+        # with its own share of the validation-loss improvement. Falls back to a
+        # scalar shared by every sample (the router's "action" being the joint
+        # selection) only under cfg.greats_diversity_term, whose set-level
+        # redundancy penalty cannot be attributed per-sample.
         if greats_reward is None:
             return torch.zeros_like(loss_before)
         if greats_reward.dim() == 0:
@@ -1074,9 +1078,25 @@ def train_router_experiments(
                     )
                     loss_score.backward()
                 ghost_engine.collect_microbatch()
+                # Per-sample <g_i, g_val> -- one score per SELECTED sample, not a
+                # scalar. To first order an LM step with lr eta changes the val loss
+                # by -eta/B * sum_i <g_i, g_val>, so <g_i, g_val> is sample i's own
+                # share of the validation improvement: the per-sample credit a
+                # val-batch loss_before/loss_after cannot produce (the val samples
+                # have no correspondence to the selected ones). Keeping it per-sample
+                # is what lets baseline_type='batch_mean' and grpo_update() see
+                # varying advantages instead of cancelling a constant to exactly zero.
                 greats_reward = ghost_engine.read_scores(
                     metric=cfg.greats_score_metric
-                ).to(cfg.device).sum()
+                ).to(cfg.device)
+                # The diversity term below is the only consumer that needs a scalar:
+                # its redundancy penalty sums <g_i,g_j> over PAIRS in the selected set
+                # and has no per-sample decomposition, and the scale it is derived
+                # against (see its comment) is that of the summed reward. Collapse
+                # only on that path; a constant reward there still requires
+                # baseline_type='moving_avg'.
+                if cfg.greats_diversity_term:
+                    greats_reward = greats_reward.sum()
                 # Per-sample ||g_i|| for the diversity term below (config.__post_init__
                 # guarantees greats_log_grad_norms=True whenever greats_diversity_term is set).
                 greats_train_norms = (

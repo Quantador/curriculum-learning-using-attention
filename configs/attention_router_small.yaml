@@ -1,10 +1,10 @@
-experiment_name: xl_SP_rfa_k256
-epochs: 1
+experiment_name: attention_router_small_wsd_gptxl
+epochs: 2
 global_batch_size: 128
 pool_mult: 10
 lr_lm: 0.00005
 use_wandb: true
-max_chunks: -1
+max_chunks: 2000000
 model_type: hf_pretrained
 hf_model_name: openai-community/gpt2-xl
 lr_schedule: "wsd"
@@ -21,7 +21,5 @@ use_original_sequence: false
 sentence_embedder_dim: 768
 router_n_heads: 4 
 router_n_layers: 6 
-router_d_k: 256
-split_dataset: true 
-split_column: "meta"
-dataset_list: ["DKYoon/SlimPajama-6B"]
+dataset_list: ["roneneldan/TinyStories", "Geralt-Targaryen/openwebtext2"]
+dataset_proportions: [0.7 , 0.3]

@@ -358,14 +358,14 @@ def build_router_for_cfg(
             n_chunks=cfg.n_chunks,
             d_embed=cfg.router_embed_dim,
             arch=cfg.router_architecture,
-            d_k=128,
+            d_k=cfg.router_d_k,
             n_heads=getattr(cfg, "router_n_heads", 1),
             n_layers = getattr(cfg, "router_n_layers",1)
         )
     return build_router(
         d_input=get_router_feature_dim(cfg, sequence_size),
         arch=cfg.router_architecture,
-        d_k=128,
+        d_k=cfg.router_d_k,
         n_heads=getattr(cfg, "router_n_heads", 1),
         n_layers = getattr(cfg, "router_n_layers",1)
     )
